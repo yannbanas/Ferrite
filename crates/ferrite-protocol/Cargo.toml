@@ -1,0 +1,15 @@
+[package]
+name = "ferrite-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PostgreSQL wire protocol v3 server: framing, auth, TLS. Speaks the protocol so existing psql/JDBC/ODBC/sqlx/Diesel clients work unmodified. Owned by Agent 4, alongside ferrite-server."
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-exec.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio-rustls = "0.26"

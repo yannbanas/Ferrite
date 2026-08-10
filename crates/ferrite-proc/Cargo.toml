@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Triggers and stored procedures engine. Also where row-level access control lives: procedures receive the caller's Identity and decide access in code, rather than a separate declarative RLS policy language. Owned by Agent 3."
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-storage.workspace = true
+thiserror.workspace = true

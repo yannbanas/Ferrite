@@ -1,0 +1,24 @@
+[package]
+name = "ferrite-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Binary: wires storage + catalog + planner/exec/proc + protocol together and listens on 5432. Owned by Agent 4, alongside ferrite-protocol."
+
+[[bin]]
+name = "ferrite-server"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-storage.workspace = true
+ferrite-catalog.workspace = true
+ferrite-sql.workspace = true
+ferrite-planner.workspace = true
+ferrite-exec.workspace = true
+ferrite-proc.workspace = true
+ferrite-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

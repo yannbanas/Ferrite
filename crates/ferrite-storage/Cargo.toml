@@ -1,0 +1,15 @@
+[package]
+name = "ferrite-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Page-based storage engine: B-tree, MVCC row versions, crash-recovery journal. Implements ferrite_common::StorageEngine."
+
+[dependencies]
+ferrite-common.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

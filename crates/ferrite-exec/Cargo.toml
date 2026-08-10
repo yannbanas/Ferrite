@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Query executor: runs a ferrite-planner physical plan against a StorageEngine/Catalog, invoking ferrite-proc for triggers. Owned by Agent 3."
+
+[dependencies]
+ferrite-common.workspace = true
+ferrite-storage.workspace = true
+ferrite-catalog.workspace = true
+ferrite-planner.workspace = true
+ferrite-proc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

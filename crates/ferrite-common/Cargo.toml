@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared types and trait contracts between all Ferrite crates: values, rows, schema, identity, storage/catalog traits. No implementation, only the shared vocabulary other crates build against."
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
