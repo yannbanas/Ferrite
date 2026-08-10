@@ -22,6 +22,9 @@ use crate::metrics;
 /// bound stops a peer from making the server buffer without limit.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
+/// How long a peer has to finish sending its request head.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The Prometheus text exposition content type, as scrapers expect it.
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -99,7 +102,14 @@ impl Endpoint {
 }
 
 async fn serve_one(mut stream: TcpStream, probe: Arc<dyn HealthProbe>) -> std::io::Result<()> {
-    let Some(request) = read_head(&mut stream).await? else {
+    // A peer that connects and then says nothing must not hold a task
+    // forever: opening sockets is cheap and this listener is reachable by
+    // anything that can route to it.
+    let head = match tokio::time::timeout(READ_TIMEOUT, read_head(&mut stream)).await {
+        Ok(head) => head?,
+        Err(_) => return respond(&mut stream, 400, "text/plain", "request timed out").await,
+    };
+    let Some(request) = head else {
         return respond(&mut stream, 400, "text/plain", "bad request").await;
     };
     match route_of(&request) {
@@ -291,6 +301,23 @@ mod tests {
     async fn an_unknown_path_is_a_404_and_never_hangs() {
         let response = get(healthy(), "/nope").await;
         assert!(response.starts_with("HTTP/1.1 404"));
+    }
+
+    /// Opening a socket is cheap; holding one open against this listener
+    /// must not be a way to accumulate tasks on the server.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_sends_a_request_is_dropped() {
+        let endpoint = Endpoint::bind("127.0.0.1:0").await.expect("bind");
+        let addr = endpoint.local_addr().expect("addr");
+        tokio::spawn(endpoint.run(healthy()));
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("the server answers instead of waiting forever");
+        assert!(response.starts_with("HTTP/1.1 400"));
     }
 
     #[tokio::test]
