@@ -5,3 +5,7 @@ crates/*/fuzz/corpus
 crates/*/fuzz/artifacts
 crates/*/fuzz/coverage
 .claude/
+
+# The server default data directory (FERRITE_DATA), if it is ever run
+# from inside the repository.
+data/

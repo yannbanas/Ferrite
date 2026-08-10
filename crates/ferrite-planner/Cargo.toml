@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "AST -> logical plan -> physical plan, rule-based (no cost-based optimizer in v1). Owned by Agent 3, alongside ferrite-exec and ferrite-proc."
+description = "ferrite-sql AST -> logical plan -> physical plan, rule-based (no cost-based optimizer in v1). Owned by Agent 3, alongside ferrite-exec and ferrite-proc."
 readme = "README.md"
 
 [dependencies]
 ferrite-common.workspace = true
+ferrite-sql.workspace = true

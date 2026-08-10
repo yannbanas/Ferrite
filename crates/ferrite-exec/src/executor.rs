@@ -265,7 +265,7 @@ impl<'a> Session<'a> {
                 );
                 let equality = PhysExpr::binary(
                     PhysExpr::Column(column),
-                    ferrite_planner::ast::BinaryOp::Eq,
+                    ferrite_planner::BinaryOp::Eq,
                     PhysExpr::Literal(key),
                 );
                 self.seq_scan(txn, table, Some(&equality))?
@@ -307,7 +307,7 @@ impl<'a> Session<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             let candidate = Row::new(values);
 
-            let row = match self
+            let mut row = match self
                 .procs
                 .fire_before(&ctx, TriggerEvent::Insert, &candidate)?
             {
@@ -316,7 +316,7 @@ impl<'a> Session<'a> {
                 ProcDecision::Replace(row) => row,
             };
 
-            check_row(schema, &row, table_name)?;
+            conform_row(schema, &mut row, table_name)?;
             self.storage.insert(txn, table, row)?;
             affected += 1;
         }
@@ -356,7 +356,7 @@ impl<'a> Session<'a> {
                 .with_event(TriggerEvent::Update)
                 .with_old_row(&tuple.row);
 
-            let row = match self
+            let mut row = match self
                 .procs
                 .fire_before(&ctx, TriggerEvent::Update, &candidate)?
             {
@@ -365,7 +365,7 @@ impl<'a> Session<'a> {
                 ProcDecision::Replace(row) => row,
             };
 
-            check_row(schema, &row, table_name)?;
+            conform_row(schema, &mut row, table_name)?;
             self.storage.update(txn, table, rid, row)?;
             affected += 1;
         }
@@ -447,10 +447,15 @@ fn node_name(plan: &PhysicalPlan) -> &'static str {
     }
 }
 
-/// Arity, nullability and type check before a row reaches storage. Runs
-/// *after* `BEFORE` triggers, so a trigger that rewrites a row cannot
-/// smuggle a malformed one past it.
-fn check_row(schema: &Schema, row: &Row, table: &str) -> Result<(), FerriteError> {
+/// Arity, nullability and type check before a row reaches storage, plus the
+/// widening that check allows. Runs *after* `BEFORE` triggers, so a trigger
+/// that rewrites a row cannot smuggle a malformed one past it.
+///
+/// The widening is applied, not merely permitted. A stored value whose
+/// variant disagreed with its column's declared type would be read back and
+/// put on the wire under that column's OID, so an `Int4` left sitting in a
+/// `BIGINT` column would send four bytes where the client expects eight.
+fn conform_row(schema: &Schema, row: &mut Row, table: &str) -> Result<(), FerriteError> {
     if row.values.len() != schema.columns.len() {
         return Err(FerriteError::Exec(format!(
             "{table} has {} columns, got a row of {}",
@@ -458,7 +463,7 @@ fn check_row(schema: &Schema, row: &Row, table: &str) -> Result<(), FerriteError
             row.values.len()
         )));
     }
-    for (column, value) in schema.columns.iter().zip(&row.values) {
+    for (column, value) in schema.columns.iter().zip(&mut row.values) {
         match value.data_type() {
             None if column.nullable => {}
             None => {
@@ -467,25 +472,27 @@ fn check_row(schema: &Schema, row: &Row, table: &str) -> Result<(), FerriteError
                     column.name
                 )))
             }
-            Some(actual) if assignable(actual, column.data_type) => {}
-            Some(actual) => {
-                return Err(FerriteError::TypeMismatch {
-                    expected: column.data_type,
-                    actual,
-                })
-            }
+            Some(actual) if actual == column.data_type => {}
+            Some(actual) => match widen(value, column.data_type) {
+                Some(widened) => *value = widened,
+                None => {
+                    return Err(FerriteError::TypeMismatch {
+                        expected: column.data_type,
+                        actual,
+                    })
+                }
+            },
         }
     }
     Ok(())
 }
 
 /// Implicit widening only — no string/number coercion, no truncation.
-fn assignable(from: DataType, to: DataType) -> bool {
-    from == to
-        || matches!(
-            (from, to),
-            (DataType::Int4, DataType::Int8)
-                | (DataType::Int4, DataType::Float8)
-                | (DataType::Int8, DataType::Float8)
-        )
+fn widen(value: &Value, to: DataType) -> Option<Value> {
+    match (value, to) {
+        (Value::Int4(v), DataType::Int8) => Some(Value::Int8(i64::from(*v))),
+        (Value::Int4(v), DataType::Float8) => Some(Value::Float8(f64::from(*v))),
+        (Value::Int8(v), DataType::Float8) => Some(Value::Float8(*v as f64)),
+        _ => None,
+    }
 }

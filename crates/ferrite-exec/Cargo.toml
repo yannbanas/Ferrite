@@ -12,3 +12,6 @@ ferrite-common.workspace = true
 ferrite-planner.workspace = true
 ferrite-proc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+ferrite-sql.workspace = true

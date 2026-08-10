@@ -4,7 +4,7 @@
 
 use ferrite_common::{Schema, TableId};
 
-use crate::ast::{BinaryOp, Expr};
+use crate::expr::{BinaryOp, Expr};
 
 /// Which table a scan reads, resolved against the catalog once so later
 /// stages never touch name resolution again.

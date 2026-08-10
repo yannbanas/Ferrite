@@ -1,9 +1,9 @@
 //! Physical plan: an access-path decision plus expressions bound to column
 //! positions, so the executor never resolves a name at runtime.
 
-use ferrite_common::{FerriteError, Schema, TableId, Value};
+use ferrite_common::{DataType, FerriteError, Schema, TableId, Value};
 
-use crate::ast::{BinaryOp, Expr};
+use crate::expr::{BinaryOp, Expr};
 
 /// Expression with every column reference resolved to its position in the
 /// input row.
@@ -33,6 +33,12 @@ impl PhysExpr {
 /// Resolve column names against `schema`. Pass an empty schema for
 /// contexts where column references are illegal (`INSERT ... VALUES`,
 /// `CALL` arguments); the resulting `ColumnNotFound` is the correct error.
+///
+/// A literal compared against a column is coerced to that column's declared
+/// type on the way through. The executor compares `Value` variants and an
+/// index probe compares them for exact equality, so `WHERE id = 1` against
+/// a `BIGINT` column has to carry an `Int8`, not the `Int4` the literal
+/// parsed as — otherwise the probe silently matches nothing.
 pub fn bind(expr: &Expr, schema: &Schema) -> Result<PhysExpr, FerriteError> {
     Ok(match expr {
         Expr::Column(name) => PhysExpr::Column(
@@ -41,12 +47,47 @@ pub fn bind(expr: &Expr, schema: &Schema) -> Result<PhysExpr, FerriteError> {
                 .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))?,
         ),
         Expr::Literal(v) => PhysExpr::Literal(v.clone()),
+        Expr::Binary { left, op, right } if op.is_comparison() => {
+            let (left, right) = align_comparison(left, right, schema)?;
+            PhysExpr::binary(left, *op, right)
+        }
         Expr::Binary { left, op, right } => {
             PhysExpr::binary(bind(left, schema)?, *op, bind(right, schema)?)
         }
         Expr::Not(inner) => PhysExpr::Not(Box::new(bind(inner, schema)?)),
         Expr::IsNull(inner) => PhysExpr::IsNull(Box::new(bind(inner, schema)?)),
     })
+}
+
+fn align_comparison(
+    left: &Expr,
+    right: &Expr,
+    schema: &Schema,
+) -> Result<(PhysExpr, PhysExpr), FerriteError> {
+    let target = match (left, right) {
+        (Expr::Column(name), Expr::Literal(_)) | (Expr::Literal(_), Expr::Column(name)) => schema
+            .column_index(name)
+            .map(|position| schema.columns[position].data_type),
+        _ => None,
+    };
+    let (left, right) = (bind(left, schema)?, bind(right, schema)?);
+    match target {
+        None => Ok((left, right)),
+        Some(target) => Ok((
+            coerce_literal(left, target)?,
+            coerce_literal(right, target)?,
+        )),
+    }
+}
+
+fn coerce_literal(expr: PhysExpr, target: DataType) -> Result<PhysExpr, FerriteError> {
+    let PhysExpr::Literal(value) = expr else {
+        return Ok(expr);
+    };
+    match crate::lower::coerce(Expr::Literal(value), target)? {
+        Expr::Literal(coerced) => Ok(PhysExpr::Literal(coerced)),
+        other => unreachable!("coerce maps a literal to a literal, got {other:?}"),
+    }
 }
 
 /// Executable plan. Every node produces a stream of rows; `Insert`,

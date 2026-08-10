@@ -96,14 +96,16 @@ index that was not first written to storage.
 ## Index metadata
 
 `IndexCatalog` (`create_index`, `drop_index`, `index`, `index_by_name`,
-`indexes_for`) lives in this crate rather than in `ferrite_common::Catalog`,
-which is a frozen v0 contract this crate must not change unilaterally. It
-belongs in the catalog and not in the planner: it is persistent schema, it must
-be dropped with its table, and the planner (choosing an access path) and the
-executor (maintaining the index on write) must get the same answer. The
-recommendation is to promote the trait into `ferrite-common` once the workspace
-agrees; until then `ferrite-planner` can depend on this crate, which the
-dependency order in `docs/architecture.md` already allows.
+`indexes_for`) now lives in `ferrite-common` and is implemented here; this
+crate re-exports it so callers need only one import. It belongs in the catalog
+and not in the planner: it is persistent schema, it must be dropped with its
+table, and the planner (choosing an access path) and the executor (maintaining
+the index on write) must get the same answer.
+
+`CREATE INDEX` records metadata and nothing more: `ferrite-storage` has no
+secondary-index structure yet, only the primary per-table B-tree. The planner
+does pick an `IndexScan` from that metadata, and the executor then degrades it
+to a filtered sequential scan with a `tracing::warn!` — correct, not fast.
 
 Validated on `create_index`: the table exists and is not a catalog table, the
 column list is non-empty and every column exists in the table's schema, no

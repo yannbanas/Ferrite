@@ -59,13 +59,21 @@ pub trait QueryHandler: Send + Sync + 'static {
 une implementation par defaut ; un moteur qui veut servir les drivers a
 requetes preparees (tokio-postgres, sqlx, JDBC) doit surcharger les deux.
 
+`connect()` (defaut : `None`) rend un handler dedie a une connexion,
+appele une fois par session authentifiee. C'est le seul endroit ou la
+couche protocole signale qu'une session commence, et donc le seul endroit
+ou un moteur peut poser un etat de session — une transaction ouverte par
+`BEGIN`, avant tout. `execute` transporte l'`Identity` de l'appelant, pas
+la connexion, et une meme identite peut tenir plusieurs connexions : les
+indexer par identite ferait partager une transaction a deux clients.
+
 L'`Identity` authentifiee est transmise a chaque appel : c'est ce qui
 alimente le modele de securite par code de `ferrite-proc` (pas de langage de
 policy declaratif, voir `docs/architecture.md`).
 
 `mock::MockHandler` implemente ce trait avec un jeu d'instructions cable en
-dur. Il existe pour prouver le protocole de bout en bout sans moteur, et
-c'est ce que sert `ferrite-server` tant que `ferrite-exec` n'est pas pret.
+dur. Il existe pour prouver le protocole de bout en bout sans moteur ; le
+vrai moteur est desormais cable dans `ferrite-server`.
 
 ## Securite
 

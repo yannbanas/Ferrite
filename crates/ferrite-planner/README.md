@@ -42,25 +42,40 @@ no conjunct matches, or no index exists on that column, the result is a
 No statistics means no "the index is not selective enough, scan instead"
 judgement. That trade is accepted for v1.
 
-## Provisional AST
+## Two expression types, on purpose
 
-`src/ast.rs` is **not the real AST**. `ferrite-sql` (Agent 2) owns that
-type and was being written in parallel; the planner needed something to be
-developed against. The provisional type covers single-table
-`SELECT`/`INSERT`/`UPDATE`/`DELETE` plus `CALL`, with expressions over
-column references and literals.
+`Planner::build_logical` is the only method that reads
+`ferrite_sql::ast::Statement`. `ferrite-sql` parses a good deal more than
+`ferrite-exec` can run, so `src/lower.rs` projects the parsed statement
+onto the narrow IR in `src/expr.rs` and rejects everything else with a
+`FerriteError::Plan`. Every rejection lives in that one module, which is
+what keeps the gap between "parses" and "executes" readable.
 
-Only `Planner::build_logical` reads it. Integration means rewriting that
-one method against `ferrite_sql::ast` and deleting `src/ast.rs`.
+Expanded rather than rejected, because they are sugar over comparisons the
+executor already has: `BETWEEN`, `IN (list)`, `IS [NOT] NULL`, `NOT`, unary
+minus on a literal.
+
+## Literal coercion
+
+The parser gives one `Value` shape per literal syntax, so `'…'` is always
+`Text` and `1` is always the narrowest integer that fits. The planner
+coerces a literal to the type of the column it is written into or compared
+against — `Text` into `UUID`/`TIMESTAMP`/`JSON`, and integer widening. This
+is not cosmetic: the executor compares `Value` variants, an index probe
+compares them for exact equality, and the wire encoder reads the *stored*
+variant, so an `Int4` left in a `BIGINT` column would go out as four bytes
+where the client expects eight.
+
+Anything beyond a literal would need the type-inference pass v1 does not
+have, so `CAST` and computed expressions are `Plan` errors.
 
 ## Index metadata
 
-`ferrite_common::Catalog` has no notion of an index, so this crate declares
-the narrow view it needs — `IndexCatalog` in `src/index.rs` — instead of
-widening the shared v0 contract unilaterally. `NoIndexes` is a valid
-implementation that always yields a sequential scan. The natural end state
-is `ferrite-catalog` implementing `IndexCatalog`, or the method moving into
-`ferrite_common::Catalog` once the agents coordinate on it.
+`ferrite_common::IndexCatalog` is the shared contract, implemented by
+`ferrite-catalog`. Only single-column indexes are considered: the
+executor's `IndexProvider` probes with one key value, so using the leading
+column of a composite key would need a range probe that does not exist in
+v1.
 
 ## Known limits
 

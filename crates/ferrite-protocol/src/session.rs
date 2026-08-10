@@ -13,7 +13,9 @@ use crate::auth::{may_connect, AuthOutcome};
 use crate::codec::Framed;
 use crate::config::ServerConfig;
 use crate::error::{sqlstate, ProtocolError, Result};
-use crate::handler::{CommandTag, FieldDescription, QueryResult, StatementDescription};
+use crate::handler::{
+    CommandTag, FieldDescription, QueryHandler, QueryResult, StatementDescription,
+};
 use crate::message::{
     backend, resolve_formats, FieldMeta, Frontend, Severity, StartupParams, StartupRequest,
     TargetKind, TransactionStatus,
@@ -165,9 +167,16 @@ where
         "session established"
     );
 
+    // A handler with per-session state (an open transaction) hands out one
+    // of its own here; a stateless one keeps the shared instance.
+    let handler = config
+        .handler
+        .connect()
+        .unwrap_or_else(|| Arc::clone(&config.handler));
+
     let mut session = Session {
         framed,
-        config,
+        handler,
         identity: outcome.identity,
         transaction: TransactionStatus::Idle,
         statements: HashMap::new(),
@@ -250,7 +259,7 @@ struct Pending {
 
 struct Session<S> {
     framed: Framed<S>,
-    config: Arc<ServerConfig>,
+    handler: Arc<dyn QueryHandler>,
     identity: Identity,
     transaction: TransactionStatus,
     statements: HashMap<String, Prepared>,
@@ -353,7 +362,7 @@ where
         let result = if sql.trim().is_empty() {
             QueryResult::empty_query()
         } else {
-            let handler = Arc::clone(&self.config.handler);
+            let handler = Arc::clone(&self.handler);
             match handler.execute(sql, self.identity).await {
                 Ok(result) => result,
                 Err(err) => {
@@ -386,7 +395,7 @@ where
     }
 
     async fn parse(&mut self, name: String, sql: String, declared: &[Oid]) -> Result<()> {
-        let handler = Arc::clone(&self.config.handler);
+        let handler = Arc::clone(&self.handler);
         let description = handler
             .describe(&sql, self.identity)
             .await
@@ -500,7 +509,7 @@ where
                 (portal.statement.clone(), portal.params.clone())
             };
             let sql = self.statement(&statement)?.sql.clone();
-            let handler = Arc::clone(&self.config.handler);
+            let handler = Arc::clone(&self.handler);
             let result = match handler.execute_params(&sql, &params, self.identity).await {
                 Ok(result) => result,
                 Err(err) => {

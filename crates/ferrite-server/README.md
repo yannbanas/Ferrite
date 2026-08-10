@@ -1,30 +1,51 @@
 # ferrite-server
 
 Le binaire. Ecoute sur le port **5432** et sert le protocole de fil
-PostgreSQL via `ferrite-protocol`.
+PostgreSQL via `ferrite-protocol`, adosse au vrai moteur.
 
-## Etat du cablage — a lire en premier
+## Ce que `build_handler` assemble
 
-Le serveur sert aujourd'hui `ferrite_protocol::mock::MockHandler`, pas un
-vrai moteur.
+```text
+ferrite-storage   FerriteStorage::open(FERRITE_DATA)   pages, B+-tree, MVCC, journal
+ferrite-catalog   SystemCatalog (bootstrap | open)     schemas + index, stockes en tables
+ferrite-sql       parse()                              texte -> AST
+ferrite-planner   Planner                              AST -> plan physique
+ferrite-exec      Session                              execution, declenche les triggers
+ferrite-proc      ProcRegistry                         roles, permissions, triggers
+```
 
-Tout ce qui est **sous** le trait `QueryHandler` est reel et teste : TLS,
-authentification, framing, cycle simple, cycle etendu, gestion d'erreur.
-Tout ce qui est **au-dessus** est un bouchon : le mock repond a une
-poignee d'instructions cablees en dur (`SELECT 1`, `SELECT * FROM pets`,
-`BEGIN`/`COMMIT`, `INSERT ...`) et rejette le reste.
+Le tout est construit **une fois** au demarrage. `src/engine.rs` expose
+`Engine` (la moitie partagee) et `Connection` (une session cliente).
+`QueryHandler::connect` donne a chaque connexion sa propre `Connection`,
+seul endroit ou vit un etat de session : la transaction ouverte par
+`BEGIN`.
 
-La raison est deliberee : `ferrite-storage`, `ferrite-catalog`,
-`ferrite-sql`, `ferrite-planner`, `ferrite-exec` et `ferrite-proc` etaient
-encore des scaffolds au moment de l'ecriture. Brancher un moteur inexistant
-aurait donne un cablage bancal impossible a tester ; le bouchon donne une
-frontiere nette.
+Une instruction part dans une des trois directions :
 
-**Pour brancher le vrai moteur** : une seule fonction change,
-`build_handler()` dans `src/main.rs`. Elle doit rendre un
-`Arc<dyn QueryHandler>` construit sur `ferrite-exec`, et les dependances
-moteur doivent revenir dans `Cargo.toml` (elles en ont ete retirees pour ne
-pas coupler la compilation du binaire a du travail en cours).
+| | |
+| --- | --- |
+| `BEGIN`/`COMMIT`/`ROLLBACK` | gere dans `engine.rs` : c'est l'etat de session |
+| `CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX` | va directement a `ferrite-catalog` (`*_in`, donc dans la transaction du client) |
+| tout le reste | `ferrite-planner` puis `ferrite-exec` |
+
+Hors transaction explicite, chaque instruction ouvre et valide la sienne —
+l'autocommit de PostgreSQL. Dans une transaction, le snapshot est repris a
+chaque instruction (`read committed`), sans quoi une transaction ouverte
+avant un `CREATE TABLE` valide ailleurs ne verrait jamais la table.
+
+Le stockage est synchrone et prend un verrou global : chaque instruction
+part sur `tokio::task::spawn_blocking`, pour qu'un scan long ne bloque pas
+un worker dont les autres connexions ont besoin.
+
+## Identite et permissions
+
+Le compte de bootstrap a **une seule** identite
+(`identity_for_user(FERRITE_USER)`), utilisee des deux cotes du modele de
+securite : `StaticAuthenticator` la delivre a la connexion, et
+`ProcRegistry::grant_role` est ce qui lui donne effectivement des droits.
+Sans ce grant, la connexion reussirait et chaque instruction serait
+refusee — le modele est deny-by-default et l'authentification reseau seule
+ne confere rien.
 
 ## Lancer
 
@@ -42,6 +63,7 @@ n'est signe par personne).
 | Variable | Defaut | Role |
 | --- | --- | --- |
 | `FERRITE_LISTEN` | `0.0.0.0:5432` | adresse d'ecoute |
+| `FERRITE_DATA` | `./data` | repertoire de `ferrite.db` et `ferrite.wal` |
 | `FERRITE_USER` | `ferrite` | compte unique du bootstrap |
 | `FERRITE_PASSWORD` | genere aleatoirement | mot de passe de ce compte |
 | `FERRITE_TLS_CERT` / `FERRITE_TLS_KEY` | — | chaine PEM + cle privee ; les deux ou aucun |
@@ -54,6 +76,18 @@ pour du loopback ou un transport deja securise, pas un mode normal.
 Le compte unique est provisoire : il disparait des que `ferrite-catalog`
 expose une table de roles et qu'un `Authenticator` peut la lire.
 
+## Limites connues du cablage
+
+- `SELECT` sans `FROM` (`SELECT 1`, `SELECT version()`) n'existe pas : le
+  planificateur part toujours d'une table.
+- Pas de `RETURNING`, pas de `ORDER BY`, pas d'agregats, pas de `JOIN`,
+  pas de sous-requetes, pas d'`ALTER TABLE` — voir `ferrite-planner`.
+- `CREATE PROCEDURE`/`CREATE TRIGGER` sont refuses : les procedures sont
+  des closures Rust enregistrees au demarrage (`ferrite-proc`), il n'y a
+  pas de langage procedural en v1.
+- Une chaine multi-instructions s'execute en entier ; seul le resultat de
+  la derniere revient au client.
+
 ## Tests
 
 ```bash
@@ -61,5 +95,8 @@ cargo test -p ferrite-server --all-targets
 ```
 
 `tests/boot.rs` lance le vrai binaire en processus fils et lui parle avec
-`tokio-postgres` : il verifie qu'une requete aboutit sur un listener en
-clair, et qu'un listener par defaut refuse une session non chiffree.
+`tokio-postgres` : TLS exige par defaut, cycle complet DDL/DML avec index
+et parametres lies, transaction annulee, survie a un redemarrage apres un
+`kill` (donc recuperation par le journal), conflit d'ecriture entre deux
+connexions rendu en `40001`, et refus propre de tout ce que le sous-ensemble
+v1 ne couvre pas sans casser la connexion.

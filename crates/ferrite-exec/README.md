@@ -41,7 +41,10 @@ Every statement goes through the same sequence, and each step can stop it:
    `Err(FerriteError::PermissionDenied(..))`.
 4. **Row validation** — arity, nullability, and type assignability against
    the schema. Runs *after* triggers, so a rewritten row is checked too.
-   Widening (`Int4 → Int8 → Float8`) is implicit; nothing else is.
+   Widening (`Int4 → Int8 → Float8`) is implicit; nothing else is, and it is
+   *applied*, not merely permitted — a value stored under a variant its
+   column does not declare would be read back and put on the wire under the
+   column's OID.
 5. **Storage write**.
 
 `UPDATE` evaluates its assignments against the row's pre-image, as SQL
@@ -83,9 +86,9 @@ silent `false`.
 
 ## Tests
 
-`tests/end_to_end.rs` runs the whole chain — provisional AST → planner →
-physical plan → executor — against the in-memory `StorageEngine`/`Catalog`
-in `tests/support/`. Those are test scaffolding, not a second engine:
+`tests/end_to_end.rs` runs the whole chain — SQL text → `ferrite-sql` →
+planner → physical plan → executor — against the in-memory
+`StorageEngine`/`Catalog` in `tests/support/`. Those are test scaffolding, not a second engine:
 `ferrite-storage` (Agent 1) and `ferrite-catalog` (Agent 2) own the real
 ones, and there is no MVCC visibility in the fakes.
 

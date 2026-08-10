@@ -10,11 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use ferrite_common::{
-    Catalog, ColumnDef, FerriteError, Row, RowId, ScanIter, Schema, Snapshot, StorageEngine,
-    TableId, TxnId, Value,
+    Catalog, ColumnDef, FerriteError, IndexCatalog, IndexDef, IndexId, Row, RowId, ScanIter,
+    Schema, Snapshot, StorageEngine, TableId, TxnId, Value,
 };
 use ferrite_exec::IndexProvider;
-use ferrite_planner::{IndexCatalog, IndexInfo};
 
 #[derive(Default)]
 struct StorageInner {
@@ -150,7 +149,8 @@ struct CatalogInner {
     next_id: TableId,
     by_name: HashMap<String, TableId>,
     schemas: HashMap<TableId, Schema>,
-    indexes: Vec<IndexInfo>,
+    indexes: Vec<IndexDef>,
+    next_index_id: IndexId,
 }
 
 #[derive(Default)]
@@ -163,11 +163,19 @@ impl MemCatalog {
         Self::default()
     }
 
+    /// `column` is a position in the table's schema, which is what the
+    /// tests find convenient; the shared `IndexDef` names its columns, so
+    /// it is resolved here.
     pub fn add_index(&self, name: &str, table: TableId, column: usize, unique: bool) {
-        self.inner.lock().unwrap().indexes.push(IndexInfo {
+        let mut inner = self.inner.lock().unwrap();
+        let column_name = inner.schemas[&table].columns[column].name.clone();
+        inner.next_index_id += 1;
+        let id = inner.next_index_id;
+        inner.indexes.push(IndexDef {
+            id,
             name: name.to_string(),
             table,
-            column,
+            columns: vec![column_name],
             unique,
         });
     }
@@ -179,13 +187,12 @@ impl MemCatalog {
     }
 
     fn index_column(&self, table: TableId, name: &str) -> Option<usize> {
-        self.inner
-            .lock()
-            .unwrap()
+        let inner = self.inner.lock().unwrap();
+        let def = inner
             .indexes
             .iter()
-            .find(|i| i.table == table && i.name == name)
-            .map(|i| i.column)
+            .find(|i| i.table == table && i.name == name)?;
+        inner.schemas.get(&table)?.column_index(&def.columns[0])
     }
 }
 
@@ -246,15 +253,67 @@ impl Catalog for MemCatalog {
 }
 
 impl IndexCatalog for MemCatalog {
-    fn indexes(&self, table: TableId) -> Vec<IndexInfo> {
-        self.inner
+    fn create_index(
+        &self,
+        name: &str,
+        table: TableId,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexId, FerriteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_index_id += 1;
+        let id = inner.next_index_id;
+        inner.indexes.push(IndexDef {
+            id,
+            name: name.to_string(),
+            table,
+            columns: columns.to_vec(),
+            unique,
+        });
+        Ok(id)
+    }
+
+    fn drop_index(&self, index: IndexId) -> Result<(), FerriteError> {
+        self.inner.lock().unwrap().indexes.retain(|i| i.id != index);
+        Ok(())
+    }
+
+    fn index(&self, index: IndexId) -> Result<Option<IndexDef>, FerriteError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .indexes
+            .iter()
+            .find(|i| i.id == index)
+            .cloned())
+    }
+
+    fn index_by_name(
+        &self,
+        _namespace: &str,
+        name: &str,
+    ) -> Result<Option<IndexDef>, FerriteError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .cloned())
+    }
+
+    fn indexes_for(&self, table: TableId) -> Result<Vec<IndexDef>, FerriteError> {
+        Ok(self
+            .inner
             .lock()
             .unwrap()
             .indexes
             .iter()
             .filter(|i| i.table == table)
             .cloned()
-            .collect()
+            .collect())
     }
 }
 

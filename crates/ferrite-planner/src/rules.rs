@@ -2,7 +2,7 @@
 //! (`docs/architecture.md`), so this is a single deterministic pass rather
 //! than a search over equivalent plans.
 
-use crate::ast::Expr;
+use crate::expr::Expr;
 use crate::logical::{combine_conjunction, split_conjunction, LogicalPlan, ProjectionItem};
 
 /// Run every rule once, in a fixed order.
@@ -99,7 +99,7 @@ fn materialize(plan: LogicalPlan, pending: Vec<Expr>) -> LogicalPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::BinaryOp;
+    use crate::expr::BinaryOp;
     use crate::logical::TableSource;
     use ferrite_common::{ColumnDef, DataType, Schema, Value};
 

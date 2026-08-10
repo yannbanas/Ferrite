@@ -151,6 +151,22 @@ impl StatementDescription {
 /// `docs/architecture.md` §Modèle de sécurité).
 #[async_trait]
 pub trait QueryHandler: Send + Sync + 'static {
+    /// Hands out a handler dedicated to one client connection. Called once
+    /// per authenticated session, before any statement runs.
+    ///
+    /// `None` — the default — keeps every connection on the shared handler,
+    /// which is right for a stateless one such as
+    /// [`crate::mock::MockHandler`]. An engine with per-session state
+    /// (an open transaction, above all) has nowhere else to put it:
+    /// [`QueryHandler::execute`] carries the caller's [`Identity`], not a
+    /// connection, and one identity may hold several connections at once,
+    /// so keying state by identity would let two of them share a
+    /// transaction. This is the only point at which the protocol layer
+    /// tells the engine that a session began.
+    fn connect(&self) -> Option<std::sync::Arc<dyn QueryHandler>> {
+        None
+    }
+
     /// Runs a statement with no bound parameters. This is the whole of the
     /// simple query flow and the only required method.
     async fn execute(&self, sql: &str, caller: Identity) -> Result<QueryResult, FerriteError>;

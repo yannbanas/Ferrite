@@ -2,11 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ferrite_common::{
-    Catalog, ColumnDef, DataType, FerriteError, Row, RowId, Schema, StorageEngine, TableId, TxnId,
-    Value,
+    Catalog, ColumnDef, DataType, FerriteError, IndexCatalog, IndexDef, IndexId, Row, RowId,
+    Schema, StorageEngine, TableId, TxnId, Value,
 };
-
-use crate::index::{IndexCatalog, IndexDef, IndexId};
 
 /// `TableId` of the table listing every table, including itself.
 pub const TABLES_TABLE_ID: TableId = 1;

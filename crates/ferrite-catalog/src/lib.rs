@@ -37,10 +37,11 @@
 #[cfg(any(test, feature = "test-util"))]
 pub mod memory;
 
-mod index;
 mod system;
 
-pub use index::{IndexCatalog, IndexDef, IndexId};
+/// Index metadata now lives in the shared contract; re-exported so callers
+/// of `SystemCatalog` do not have to import from two crates.
+pub use ferrite_common::{IndexCatalog, IndexDef, IndexId};
 pub use system::{
     SystemCatalog, CATALOG_SCHEMA, COLUMNS_TABLE_ID, DEFAULT_SCHEMA, FIRST_USER_TABLE_ID,
     INDEXES_TABLE_ID, TABLES_TABLE_ID,

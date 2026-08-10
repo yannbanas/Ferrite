@@ -7,6 +7,10 @@ use std::path::PathBuf;
 /// adjustment.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:5432";
 pub const DEFAULT_USER: &str = "ferrite";
+/// Relative, so a container that mounts nothing still starts; a deployment
+/// that wants the data to survive the container points `FERRITE_DATA` at a
+/// volume.
+pub const DEFAULT_DATA_DIR: &str = "./data";
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -17,6 +21,8 @@ pub struct Settings {
     pub tls_key: Option<PathBuf>,
     /// Opt-out only: TLS is on unless this is explicitly set.
     pub tls_disabled: bool,
+    /// Directory holding `ferrite.db` and `ferrite.wal`.
+    pub data_dir: PathBuf,
 }
 
 impl Settings {
@@ -28,6 +34,9 @@ impl Settings {
             tls_cert: var("FERRITE_TLS_CERT").map(PathBuf::from),
             tls_key: var("FERRITE_TLS_KEY").map(PathBuf::from),
             tls_disabled: is_truthy("FERRITE_TLS_DISABLE"),
+            data_dir: var("FERRITE_DATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
         };
         if settings.tls_cert.is_some() != settings.tls_key.is_some() {
             return Err("FERRITE_TLS_CERT and FERRITE_TLS_KEY must be set together".to_owned());
@@ -65,6 +74,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             tls_disabled: false,
+            data_dir: PathBuf::from(DEFAULT_DATA_DIR),
         };
         assert_eq!(
             settings.tls_description(),

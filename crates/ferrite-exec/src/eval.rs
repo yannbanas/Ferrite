@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use ferrite_common::{FerriteError, Row, Value};
-use ferrite_planner::ast::BinaryOp;
+use ferrite_planner::BinaryOp;
 use ferrite_planner::PhysExpr;
 
 /// Evaluate `expr` against `row`. Column references are positions, resolved

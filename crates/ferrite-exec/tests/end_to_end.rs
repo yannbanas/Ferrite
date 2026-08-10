@@ -1,5 +1,5 @@
-//! End-to-end: provisional AST -> planner -> physical plan -> executor,
-//! against the in-memory storage/catalog in `support`.
+//! End-to-end: SQL text -> `ferrite-sql` -> planner -> physical plan ->
+//! executor, against the in-memory storage/catalog in `support`.
 
 mod support;
 
@@ -8,17 +8,15 @@ use ferrite_common::{
     TableId, Value,
 };
 use ferrite_exec::{QueryResult, Session};
-use ferrite_planner::ast::{
-    Assignment, BinaryOp, CallStmt, DeleteStmt, Expr, InsertStmt, SelectItem, SelectStmt,
-    Statement, TableRef, UpdateStmt,
-};
-use ferrite_planner::Planner;
+use ferrite_planner::{PhysicalPlan, Planner};
 use ferrite_proc::{ProcDecision, ProcRegistry, Procedure, TriggerEvent};
 
 use support::{column, MemCatalog, MemIndexes, MemStorage};
 
 const OWNER: Identity = Identity([1u8; 32]);
 const GUEST: Identity = Identity([2u8; 32]);
+
+const TWO_PEOPLE: &str = "INSERT INTO users VALUES (1, 'ada', 36), (2, 'grace', 45)";
 
 fn users_schema() -> Schema {
     Schema {
@@ -59,33 +57,8 @@ fn full_access() -> ProcRegistry {
     registry
 }
 
-fn insert_stmt(rows: Vec<Vec<Expr>>) -> Statement {
-    Statement::Insert(InsertStmt {
-        table: TableRef::new("users"),
-        columns: Vec::new(),
-        rows,
-    })
-}
-
-fn person(id: i64, name: &str, age: i32) -> Vec<Expr> {
-    vec![
-        Expr::Literal(Value::Int8(id)),
-        Expr::Literal(Value::Text(name.into())),
-        Expr::Literal(Value::Int4(age)),
-    ]
-}
-
-fn select_all(filter: Option<Expr>) -> Statement {
-    Statement::Select(SelectStmt {
-        projection: vec![SelectItem::Wildcard],
-        from: TableRef::new("users"),
-        filter,
-        limit: None,
-    })
-}
-
-fn id_eq(id: i64) -> Expr {
-    Expr::eq(Expr::column("id"), Expr::Literal(Value::Int8(id)))
+fn plan_of(catalog: &MemCatalog, sql: &str) -> Result<PhysicalPlan, FerriteError> {
+    Planner::new(catalog, catalog).plan(&ferrite_sql::parse_statement(sql)?)
 }
 
 fn run(
@@ -93,10 +66,9 @@ fn run(
     catalog: &MemCatalog,
     procs: &ProcRegistry,
     identity: Identity,
-    stmt: &Statement,
+    sql: &str,
 ) -> Result<QueryResult, FerriteError> {
-    let planner = Planner::new(catalog, catalog);
-    let plan = planner.plan(stmt)?;
+    let plan = plan_of(catalog, sql)?;
     Session::new(storage, catalog, procs, identity).execute(1, &plan)
 }
 
@@ -112,37 +84,33 @@ fn insert_then_select_round_trips() {
     let (storage, catalog, _) = setup();
     let procs = full_access();
 
-    let inserted = run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    let inserted = run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
     assert_eq!(inserted, QueryResult::Affected(2));
 
-    let rows = rows_of(run(&storage, &catalog, &procs, OWNER, &select_all(None)).unwrap());
+    let rows = rows_of(run(&storage, &catalog, &procs, OWNER, "SELECT * FROM users").unwrap());
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values[1], Value::Text("ada".into()));
+}
+
+#[test]
+fn a_literal_is_stored_as_the_declared_column_type() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    // `1` parses as the narrowest integer that fits, but `id` is BIGINT and
+    // the wire encoder reads the stored variant, not the column's type.
+    assert_eq!(storage.dump(table)[0].values[0], Value::Int8(1));
 }
 
 #[test]
 fn an_equality_filter_really_goes_through_the_index() {
     let (storage, catalog, _) = setup();
     let procs = full_access();
-    run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
 
     let indexes = MemIndexes::new(&storage, &catalog);
-    let planner = Planner::new(&catalog, &catalog);
-    let plan = planner.plan(&select_all(Some(id_eq(2)))).unwrap();
+    let plan = plan_of(&catalog, "SELECT * FROM users WHERE id = 2").unwrap();
 
     let result = Session::new(&storage, &catalog, &procs, OWNER)
         .with_indexes(&indexes)
@@ -163,14 +131,7 @@ fn an_equality_filter_really_goes_through_the_index() {
 fn an_index_scan_still_works_without_an_index_provider() {
     let (storage, catalog, _) = setup();
     let procs = full_access();
-    run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
 
     let rows = rows_of(
         run(
@@ -178,7 +139,7 @@ fn an_index_scan_still_works_without_an_index_provider() {
             &catalog,
             &procs,
             OWNER,
-            &select_all(Some(id_eq(1))),
+            "SELECT * FROM users WHERE id = 1",
         )
         .unwrap(),
     );
@@ -205,7 +166,7 @@ fn a_before_insert_trigger_that_denies_leaves_no_row() {
         &catalog,
         &procs,
         OWNER,
-        &insert_stmt(vec![person(1, "kid", 12)]),
+        "INSERT INTO users VALUES (1, 'kid', 12)",
     );
 
     assert!(matches!(denied, Err(FerriteError::PermissionDenied(_))));
@@ -219,7 +180,7 @@ fn a_before_insert_trigger_that_denies_leaves_no_row() {
         &catalog,
         &procs,
         OWNER,
-        &insert_stmt(vec![person(2, "ada", 36)]),
+        "INSERT INTO users VALUES (2, 'ada', 36)",
     )
     .unwrap();
     assert_eq!(storage.dump(table).len(), 1);
@@ -240,7 +201,7 @@ fn a_before_insert_trigger_can_rewrite_the_row() {
         &catalog,
         &procs,
         OWNER,
-        &insert_stmt(vec![person(1, "ada", 36)]),
+        "INSERT INTO users VALUES (1, 'ada', 36)",
     )
     .unwrap();
 
@@ -264,14 +225,7 @@ fn a_before_insert_trigger_can_skip_a_row_without_failing_the_statement() {
         },
     );
 
-    let result = run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    let result = run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
 
     assert_eq!(result, QueryResult::Affected(1));
     assert_eq!(storage.dump(table).len(), 1);
@@ -304,7 +258,7 @@ fn a_trigger_sees_the_caller_identity_and_can_reject_a_stranger() {
             &catalog,
             &procs,
             GUEST,
-            &insert_stmt(vec![person(1, "mallory", 30)])
+            "INSERT INTO users VALUES (1, 'mallory', 30)"
         ),
         Err(FerriteError::PermissionDenied(_))
     ));
@@ -315,7 +269,7 @@ fn a_trigger_sees_the_caller_identity_and_can_reject_a_stranger() {
         &catalog,
         &procs,
         OWNER,
-        &insert_stmt(vec![person(1, "ada", 36)]),
+        "INSERT INTO users VALUES (1, 'ada', 36)",
     )
     .unwrap();
     assert_eq!(storage.dump(table).len(), 1);
@@ -339,25 +293,17 @@ fn update_applies_assignments_and_exposes_the_old_row_to_triggers() {
         },
     );
 
-    run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
 
-    let stmt = Statement::Update(UpdateStmt {
-        table: TableRef::new("users"),
-        assignments: vec![Assignment {
-            column: "name".into(),
-            value: Expr::Literal(Value::Text("ada l.".into())),
-        }],
-        filter: Some(id_eq(1)),
-    });
     assert_eq!(
-        run(&storage, &catalog, &procs, OWNER, &stmt).unwrap(),
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "UPDATE users SET name = 'ada l.' WHERE id = 1"
+        )
+        .unwrap(),
         QueryResult::Affected(1)
     );
 
@@ -365,16 +311,14 @@ fn update_applies_assignments_and_exposes_the_old_row_to_triggers() {
     assert_eq!(stored[0].values[1], Value::Text("ada l.".into()));
     assert_eq!(stored[1].values[1], Value::Text("grace".into()));
 
-    let forbidden = Statement::Update(UpdateStmt {
-        table: TableRef::new("users"),
-        assignments: vec![Assignment {
-            column: "id".into(),
-            value: Expr::Literal(Value::Int8(99)),
-        }],
-        filter: Some(id_eq(2)),
-    });
     assert!(matches!(
-        run(&storage, &catalog, &procs, OWNER, &forbidden),
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "UPDATE users SET id = 99 WHERE id = 2"
+        ),
         Err(FerriteError::PermissionDenied(_))
     ));
     assert_eq!(storage.dump(table)[1].values[0], Value::Int8(2));
@@ -392,31 +336,29 @@ fn delete_removes_only_the_matching_rows_and_a_trigger_can_veto() {
         }
     });
 
-    run(
-        &storage,
-        &catalog,
-        &procs,
-        OWNER,
-        &insert_stmt(vec![person(1, "ada", 36), person(2, "grace", 45)]),
-    )
-    .unwrap();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
 
-    let delete_ada = Statement::Delete(DeleteStmt {
-        table: TableRef::new("users"),
-        filter: Some(id_eq(1)),
-    });
     assert_eq!(
-        run(&storage, &catalog, &procs, OWNER, &delete_ada).unwrap(),
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "DELETE FROM users WHERE id = 1"
+        )
+        .unwrap(),
         QueryResult::Affected(1)
     );
     assert_eq!(storage.dump(table).len(), 1);
 
-    let delete_grace = Statement::Delete(DeleteStmt {
-        table: TableRef::new("users"),
-        filter: Some(id_eq(2)),
-    });
     assert!(matches!(
-        run(&storage, &catalog, &procs, OWNER, &delete_grace),
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "DELETE FROM users WHERE id = 2"
+        ),
         Err(FerriteError::PermissionDenied(_))
     ));
     assert_eq!(storage.dump(table).len(), 1);
@@ -440,16 +382,16 @@ fn a_statement_is_denied_before_it_reaches_storage() {
             &catalog,
             &procs,
             GUEST,
-            &insert_stmt(vec![person(1, "mallory", 30)])
+            "INSERT INTO users VALUES (1, 'mallory', 30)"
         ),
         Err(FerriteError::PermissionDenied(_))
     ));
     assert!(storage.dump(table).is_empty());
 
-    assert!(run(&storage, &catalog, &procs, GUEST, &select_all(None)).is_ok());
+    assert!(run(&storage, &catalog, &procs, GUEST, "SELECT * FROM users").is_ok());
 
     assert!(matches!(
-        run(&storage, &catalog, &procs, OWNER, &select_all(None)),
+        run(&storage, &catalog, &procs, OWNER, "SELECT * FROM users"),
         Err(FerriteError::PermissionDenied(_))
     ));
 }
@@ -463,30 +405,18 @@ fn projection_and_limit_shape_the_result() {
         &catalog,
         &procs,
         OWNER,
-        &insert_stmt(vec![
-            person(1, "ada", 36),
-            person(2, "grace", 45),
-            person(3, "alan", 41),
-        ]),
+        "INSERT INTO users VALUES (1, 'ada', 36), (2, 'grace', 45), (3, 'alan', 41)",
     )
     .unwrap();
 
-    let stmt = Statement::Select(SelectStmt {
-        projection: vec![SelectItem::Expr {
-            expr: Expr::column("name"),
-            alias: Some("who".into()),
-        }],
-        from: TableRef::new("users"),
-        filter: Some(Expr::binary(
-            Expr::column("age"),
-            BinaryOp::Gt,
-            Expr::Literal(Value::Int4(35)),
-        )),
-        limit: Some(2),
-    });
-
-    let QueryResult::Rows { schema, rows } = run(&storage, &catalog, &procs, OWNER, &stmt).unwrap()
-    else {
+    let QueryResult::Rows { schema, rows } = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "SELECT name AS who FROM users WHERE age > 35 LIMIT 2",
+    )
+    .unwrap() else {
         panic!("expected rows");
     };
     assert_eq!(schema.columns.len(), 1);
@@ -515,17 +445,12 @@ fn call_runs_a_stored_procedure_under_the_callers_identity() {
         },
     );
 
-    let stmt = Statement::Call(CallStmt {
-        name: "whoami".into(),
-        args: Vec::new(),
-    });
-
     assert_eq!(
-        run(&storage, &catalog, &procs, OWNER, &stmt).unwrap(),
+        run(&storage, &catalog, &procs, OWNER, "CALL whoami()").unwrap(),
         QueryResult::Value(Value::Int4(1))
     );
     assert!(matches!(
-        run(&storage, &catalog, &procs, GUEST, &stmt),
+        run(&storage, &catalog, &procs, GUEST, "CALL whoami()"),
         Err(FerriteError::PermissionDenied(_))
     ));
 }
@@ -535,13 +460,14 @@ fn a_not_null_violation_is_rejected() {
     let (storage, catalog, table) = setup();
     let procs = full_access();
 
-    let stmt = Statement::Insert(InsertStmt {
-        table: TableRef::new("users"),
-        columns: vec!["name".into()],
-        rows: vec![vec![Expr::Literal(Value::Text("ada".into()))]],
-    });
-
-    assert!(run(&storage, &catalog, &procs, OWNER, &stmt).is_err());
+    assert!(run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users (name) VALUES ('ada')"
+    )
+    .is_err());
     assert!(storage.dump(table).is_empty());
 }
 
@@ -550,8 +476,7 @@ fn a_plan_built_against_an_older_schema_is_rejected() {
     let (storage, catalog, table) = setup();
     let procs = full_access();
 
-    let planner = Planner::new(&catalog, &catalog);
-    let plan = planner.plan(&select_all(None)).unwrap();
+    let plan = plan_of(&catalog, "SELECT * FROM users").unwrap();
 
     let mut altered = users_schema();
     altered.columns.push(column("email", DataType::Text, true));

@@ -1,23 +1,26 @@
-//! The Ferrite server binary.
+//! The Ferrite server binary: assembles storage, catalog, parser, planner,
+//! executor and procedure registry behind the PostgreSQL wire protocol and
+//! listens on 5432.
 //!
-//! Today it wires the PostgreSQL wire protocol to
-//! `ferrite_protocol::mock::MockHandler`, because the storage, catalog and
-//! executor crates are still scaffolds. Everything below the
-//! `QueryHandler` seam is therefore real — TLS, authentication, framing,
-//! both query flows — and everything above it is a stand-in. Swapping in
-//! the real engine is one line in [`build_handler`]; see the crate README.
+//! [`build_handler`] is where the whole engine is put together, once, at
+//! startup. Everything a connection touches afterwards hangs off the
+//! [`Engine`](engine::Engine) it returns.
 
 use std::sync::Arc;
 
-use ferrite_protocol::auth::{superuser_role, StaticAuthenticator};
-use ferrite_protocol::mock::MockHandler;
+use ferrite_common::Identity;
+use ferrite_proc::ProcRegistry;
+use ferrite_protocol::auth::{identity_for_user, superuser_role, StaticAuthenticator};
 use ferrite_protocol::{QueryHandler, Server, ServerConfig, TlsMode};
 use rand::Rng;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod describe;
+mod engine;
 mod settings;
 
+use engine::Engine;
 use settings::Settings;
 
 #[tokio::main]
@@ -42,15 +45,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // One identity for the bootstrap account, derived from its name and
+    // shared by both halves of the security model: the authenticator hands
+    // it out on login, and the procedure registry is what actually grants
+    // it permissions. Without the grant, a login would succeed and every
+    // statement would then be denied — the model is deny-by-default and
+    // network authentication alone confers nothing.
+    let superuser = identity_for_user(&settings.user);
+    let engine = build_handler(&settings, superuser)?;
+
     let tls = build_tls(&settings)?;
-    let authenticator =
-        StaticAuthenticator::new().with_user(&settings.user, &password, superuser_role());
-    let config = ServerConfig::new(build_handler(), Arc::new(authenticator), tls);
+    let authenticator = StaticAuthenticator::new().with_account(
+        &settings.user,
+        &password,
+        superuser,
+        superuser_role(),
+    );
+    let config = ServerConfig::new(
+        Arc::clone(&engine) as Arc<dyn QueryHandler>,
+        Arc::new(authenticator),
+        tls,
+    );
 
     let server = Server::bind(&settings.listen, config).await?;
     info!(
         addr = %server.local_addr()?,
         tls = settings.tls_description(),
+        data = %settings.data_dir.display(),
         "ferrite-server listening"
     );
 
@@ -58,18 +79,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = server.run() => result?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
+
+    // Fold the journal into the data file so a restart has nothing to
+    // replay. Recovery reaches the same state without it; this only makes
+    // the next start cheap.
+    if let Err(err) = engine.checkpoint() {
+        warn!(error = %err, "checkpoint on shutdown failed");
+    }
     Ok(())
 }
 
-/// The single point where the real engine gets plugged in: replace the mock
-/// with whatever `ferrite-exec` ends up exposing as a
-/// [`QueryHandler`](ferrite_protocol::QueryHandler).
-fn build_handler() -> Arc<dyn QueryHandler> {
-    warn!(
-        "no storage engine is wired: serving ferrite-protocol's mock handler, \
-         which answers a fixed set of statements and nothing else"
-    );
-    Arc::new(MockHandler::new())
+/// Builds the engine every connection is served from.
+fn build_handler(
+    settings: &Settings,
+    superuser: Identity,
+) -> Result<Arc<Engine>, Box<dyn std::error::Error>> {
+    let mut procs = ProcRegistry::new();
+    procs.grant_role(superuser, superuser_role());
+
+    std::fs::create_dir_all(&settings.data_dir)?;
+    Ok(Arc::new(Engine::open(&settings.data_dir, procs)?))
 }
 
 fn build_tls(settings: &Settings) -> Result<TlsMode, Box<dyn std::error::Error>> {
