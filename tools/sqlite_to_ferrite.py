@@ -27,11 +27,24 @@ Type mapping, and why:
   `TEXT`.
 
 Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `UNIQUE`,
-`DEFAULT` (parsed but never applied, so keeping it would be misleading),
-`COLLATE`, `AUTOINCREMENT` and `CHECK`. `PRIMARY KEY` and `NOT NULL` are
-kept. Every identifier is quoted: Ferrite reserves nearly every keyword, and
-application schemas are full of columns called `type`, `position` and
-`content`.
+`COLLATE`, `AUTOINCREMENT` and `CHECK`. `PRIMARY KEY`, `NOT NULL` and
+`DEFAULT` are kept. Every identifier is quoted: Ferrite reserves nearly every
+keyword, and application schemas are full of columns called `type`,
+`position` and `content`.
+
+`DEFAULT` is translated into the subset Ferrite stores — a literal, or the
+current timestamp — and dropped with a note otherwise, since Ferrite refuses
+a `DEFAULT` it cannot evaluate rather than accepting one it would ignore.
+SQLite's `datetime('now')` and `CURRENT_TIMESTAMP` both map to
+`CURRENT_TIMESTAMP`.
+
+`_after.sql` holds what only makes sense once every table exists, and is
+where the two features an application actually depends on get exercised
+against real data: one `ALTER TABLE ... ADD COLUMN` of each shape per table
+(nullable, and `NOT NULL DEFAULT`, which is what PawChat's migrations look
+like), and one `INSERT` per table naming only the columns that have neither
+a default nor a nullable type — the shape that used to fail on a column the
+application never mentions.
 """
 
 import json
@@ -80,6 +93,43 @@ def literal(v):
     if isinstance(v, bytes):
         return None  # BLOB: no representation in Ferrite v1
     return "'" + str(v).replace("'", "''") + "'"
+
+
+NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+NOW = re.compile(r"^(current_timestamp|datetime\(\s*'now'\s*\)|strftime\(.*'now'.*\))$")
+
+
+def ferrite_default(raw, ty, nullable):
+    """Translate one SQLite `DEFAULT` into Ferrite's subset.
+
+    Returns `(clause, note)`; `clause` is `None` when the default has no
+    Ferrite equivalent, which is a dropped constraint like any other rather
+    than a silent behaviour change — Ferrite refuses a `DEFAULT` it cannot
+    store, so emitting one it does not understand would cost the whole table.
+    """
+    if raw is None:
+        return None, None
+    expr = raw.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        expr = expr[1:-1].strip()
+    folded = expr.lower()
+
+    if folded == "null":
+        return ("DEFAULT NULL", None) if nullable else (None, "DEFAULT NULL on a NOT NULL column")
+    if NOW.match(folded):
+        if ty == "TIMESTAMP":
+            return "DEFAULT CURRENT_TIMESTAMP", None
+        return None, f"DEFAULT {expr}: needs a TIMESTAMP column, this one is {ty}"
+    if NUMBER.match(expr):
+        if ty in ("BIGINT", "DOUBLE PRECISION"):
+            return f"DEFAULT {expr}", None
+        return None, f"DEFAULT {expr}: numeric, but the column is {ty}"
+    if len(expr) >= 2 and expr[0] == "'" and expr[-1] == "'":
+        body = expr[1:-1].replace("''", "'")
+        if ty in ("TEXT", "JSON") or (ty == "TIMESTAMP" and is_timestamp(body)):
+            return f"DEFAULT {literal(body)}", None
+        return None, f"DEFAULT {expr}: a string, but the column is {ty}"
+    return None, f"DEFAULT {expr}: outside the subset Ferrite stores"
 
 
 def ferrite_type(decl, values, name):
@@ -131,6 +181,7 @@ def main():
                 "name": c[1].decode(),
                 "decl": c[2].decode() if c[2] else "",
                 "notnull": bool(c[3]),
+                "default": c[4].decode() if isinstance(c[4], bytes) else c[4],
                 "pk": c[5],
             }
             for c in info
@@ -160,10 +211,20 @@ def main():
 
         pk = [c["name"] for c in cols if c["pk"]]
         pieces = []
+        defaults, mandatory = {}, []
         for _, col, ty in kept:
             piece = f'  {quote(col["name"])} {ty}'
+            not_null = col["notnull"] or col["name"] in pk
             if col["notnull"] and col["name"] not in pk:
                 piece += " NOT NULL"
+            clause, why = ferrite_default(col["default"], ty, not not_null)
+            if clause:
+                piece += " " + clause
+                defaults[col["name"]] = clause
+            elif why:
+                dropped.append((col["name"], why))
+            if not_null and not clause:
+                mandatory.append(col["name"])
             pieces.append(piece)
         if len(pk) == 1 and any(c["name"] == pk[0] for _, c, _ in kept):
             pieces = [
@@ -194,6 +255,23 @@ def main():
                 f"INSERT INTO {quote(table)} ({names}) VALUES (" + ", ".join(values) + ")"
             )
 
+        # An INSERT naming only the columns the application has no choice
+        # but to supply. Every other column has to come from its DEFAULT,
+        # which is the case that used to write a wrong value or fail.
+        probe = None
+        if defaults and mandatory and rows:
+            values = [
+                literal(rows[0][i]) for i, col, _ in kept if col["name"] in mandatory
+            ]
+            if all(v is not None for v in values):
+                probe = (
+                    f"INSERT INTO {quote(table)} ("
+                    + ", ".join(quote(n) for n in mandatory)
+                    + ") VALUES ("
+                    + ", ".join(values)
+                    + ")"
+                )
+
         with open(os.path.join(OUT, f"{table}.sql"), "w", encoding="utf-8") as f:
             f.write(("\n" + SENTINEL + "\n").join(statements))
 
@@ -203,11 +281,33 @@ def main():
                 "columns": len(cols),
                 "kept": len(kept),
                 "dropped": dropped,
+                "defaults": defaults,
                 "rows": len(rows),
                 "skipped_rows": skipped_rows,
                 "decisions": decisions,
+                "probe": probe,
             }
         )
+
+    # Everything that only makes sense once every table is there, and holds
+    # rows: the migration an application replays at boot, then a write that
+    # leans on the defaults.
+    after = []
+    for n in notes:
+        t = quote(n["table"])
+        after.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
+        after.append(
+            f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added_flag" '
+            "BIGINT NOT NULL DEFAULT 0"
+        )
+        # Re-running a migration list has to be a no-op, not an error.
+        after.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
+        # Rows written before the two columns existed still have to read.
+        after.append(f'SELECT "ferrite_added", "ferrite_added_flag" FROM {t}')
+        if n["probe"]:
+            after.append(n["probe"])
+    with open(os.path.join(OUT, "_after.sql"), "w", encoding="utf-8") as f:
+        f.write(("\n" + SENTINEL + "\n").join(after))
 
     with open(os.path.join(OUT, "manifest.txt"), "w", encoding="utf-8") as f:
         for n in notes:
@@ -225,7 +325,10 @@ def main():
             f.write("\n")
 
     total_rows = sum(n["rows"] - n["skipped_rows"] for n in notes)
+    kept_defaults = sum(len(n["defaults"]) for n in notes)
+    probes = sum(1 for n in notes if n["probe"])
     print(f"{len(tables)} tables, {total_rows} rows, out={OUT}")
+    print(f"{kept_defaults} DEFAULT clauses kept, {probes} defaults probes in _after.sql")
     for n in notes:
         if n["dropped"] or n["skipped_rows"]:
             print(f'  {n["table"]}: dropped={[d[0] for d in n["dropped"]]} skipped={n["skipped_rows"]}')
