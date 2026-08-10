@@ -8,8 +8,22 @@ description = "PostgreSQL wire protocol v3 server: framing, auth, TLS. Speaks th
 
 [dependencies]
 ferrite-common.workspace = true
-ferrite-exec.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "2"
+async-trait = "0.1"
+subtle = "2.6"
+sha2 = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rcgen = "0.13"
+tracing-subscriber.workspace = true

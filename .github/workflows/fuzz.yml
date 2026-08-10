@@ -1,15 +1,23 @@
 name: Fuzz
 
-# Fuzzing needs a nightly toolchain and takes minutes, not seconds, so it
-# runs nightly and on demand rather than on every push — the parser's
-# panic-freedom is also covered by proptest in the normal CI test job.
+# Le parseur de protocole lit des octets non fiables venant du reseau : une
+# regression qui panique est une denial-of-service a distance, donc le job
+# "protocol" tourne a chaque PR (passe courte) en plus de la nuit. Le
+# parseur SQL n'est pas encore expose directement au reseau (le protocole
+# sert encore MockHandler, voir ferrite-server/README §Wiring status) et sa
+# non-panique est deja couverte par proptest en CI normale, donc le job
+# "sql" reste nocturne/manuel pour ne pas alourdir chaque PR.
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       seconds:
-        description: "Seconds to run each fuzz target"
+        description: "Seconds to run each fuzz target (job sql only)"
         required: false
         default: "300"
 
@@ -18,6 +26,7 @@ permissions:
 
 jobs:
   sql:
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -49,3 +58,38 @@ jobs:
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: crates/ferrite-sql/fuzz/artifacts
+
+  protocol:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [message_decode, session]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # cargo-fuzz a besoin de nightly (sanitizers + libFuzzer).
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, toolchain: nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: crates/ferrite-protocol/fuzz
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-fuzz
+      # 60 s par cible sur PR/push, 15 min la nuit.
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: crates/ferrite-protocol
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SECONDS_TO_RUN=900
+          else
+            SECONDS_TO_RUN=60
+          fi
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time=$SECONDS_TO_RUN
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: crates/ferrite-protocol/fuzz/artifacts
