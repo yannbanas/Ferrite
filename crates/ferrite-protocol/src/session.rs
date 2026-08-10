@@ -363,7 +363,9 @@ where
             QueryResult::empty_query()
         } else {
             let handler = Arc::clone(&self.handler);
-            match handler.execute(sql, self.identity).await {
+            match crate::guard::guarded("the query handler", handler.execute(sql, self.identity))
+                .await?
+            {
                 Ok(result) => result,
                 Err(err) => {
                     let err = ProtocolError::Ferrite(err);
@@ -396,10 +398,10 @@ where
 
     async fn parse(&mut self, name: String, sql: String, declared: &[Oid]) -> Result<()> {
         let handler = Arc::clone(&self.handler);
-        let description = handler
-            .describe(&sql, self.identity)
-            .await
-            .map_err(ProtocolError::Ferrite)?;
+        let description =
+            crate::guard::guarded("the query handler", handler.describe(&sql, self.identity))
+                .await?
+                .map_err(ProtocolError::Ferrite)?;
         let param_types = merge_parameter_types(declared, &description);
         let (fields, described) = match description.fields {
             Some(fields) => (fields, true),
@@ -510,7 +512,12 @@ where
             };
             let sql = self.statement(&statement)?.sql.clone();
             let handler = Arc::clone(&self.handler);
-            let result = match handler.execute_params(&sql, &params, self.identity).await {
+            let result = match crate::guard::guarded(
+                "the query handler",
+                handler.execute_params(&sql, &params, self.identity),
+            )
+            .await?
+            {
                 Ok(result) => result,
                 Err(err) => {
                     self.fail_transaction();

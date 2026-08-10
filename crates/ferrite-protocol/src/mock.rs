@@ -154,6 +154,10 @@ impl MockHandler {
                 QueryResult::command(CommandTag::Rollback).with_transaction(TransactionStatus::Idle)
             }
             "boom" => return Err(FerriteError::Exec("the mock handler exploded".into())),
+            // The test gate for panic isolation. A handler that panics is
+            // a bug, and the only way to prove the server contains one is
+            // to have a handler that does it on request.
+            "panic" => panic!("the mock handler panicked on request"),
             "select secret" => {
                 return Err(FerriteError::PermissionDenied("relation secret".into()))
             }

@@ -124,10 +124,23 @@ impl FerriteStorage {
         self.lock()?.pager.checkpoint()
     }
 
+    /// The engine lock, or an error once a panic has poisoned it.
+    ///
+    /// Poisoning is not cleared. A panic inside a page mutation can leave
+    /// a half-updated page in the cache, and flushing that later is
+    /// exactly the corruption this engine exists to prevent — so the
+    /// database refuses to serve anything more, and a restart replays the
+    /// journal onto a known-good state. That is a deliberate trade of
+    /// availability for correctness, and the log line says so, because
+    /// "storage lock poisoned" on every subsequent query is otherwise a
+    /// mystery.
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, FerriteError> {
-        self.inner
-            .lock()
-            .map_err(|_| FerriteError::Storage("storage lock poisoned by a previous panic".into()))
+        self.inner.lock().map_err(|_| {
+            tracing::error!(
+                "the storage engine's lock is poisoned: a panic left a page mid-update, so                  this process will refuse every further statement. Restart it — recovery                  replays the journal onto the last consistent state."
+            );
+            FerriteError::Storage("storage lock poisoned by a previous panic".into())
+        })
     }
 
     fn scan_step(

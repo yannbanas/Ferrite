@@ -58,6 +58,7 @@ mod buf;
 mod codec;
 mod config;
 mod error;
+mod guard;
 mod handler;
 pub mod message;
 pub mod mock;

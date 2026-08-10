@@ -39,6 +39,12 @@ pub enum ProtocolError {
     #[error("connection closed by peer")]
     Closed,
 
+    /// The `QueryHandler` panicked. Contained rather than propagated —
+    /// see `crate::guard` — but not recoverable: whatever state the
+    /// handler holds for this session was left mid-update by the unwind.
+    #[error("internal error: {0}")]
+    HandlerPanic(String),
+
     /// Bubbled up from the `QueryHandler` implementation.
     #[error(transparent)]
     Ferrite(#[from] FerriteError),
@@ -67,6 +73,7 @@ impl ProtocolError {
             ProtocolError::AuthFailed(_) => sqlstate::INVALID_PASSWORD,
             ProtocolError::TlsRequired => sqlstate::INVALID_AUTHORIZATION,
             ProtocolError::Tls(_) => sqlstate::CONNECTION_FAILURE,
+            ProtocolError::HandlerPanic(_) => sqlstate::INTERNAL_ERROR,
             ProtocolError::Ferrite(e) => ferrite_sqlstate(e),
         }
     }
