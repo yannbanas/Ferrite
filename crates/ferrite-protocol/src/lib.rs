@@ -26,6 +26,10 @@
 //! - Connecting is deny-by-default: a role without
 //!   [`Permission::Connect`](ferrite_common::Permission) cannot open a
 //!   session.
+//! - Authentication is rate limited per source address and per attempted
+//!   user name ([`throttle`]): failed attempts are answered progressively
+//!   more slowly, and a source past the threshold is refused before a
+//!   password prompt is offered at all.
 //! - Every byte decoded here comes from an untrusted peer. Decoding is
 //!   total: bad lengths, bad counts, non-UTF-8 text, unknown tags and
 //!   truncation all produce a [`ProtocolError`], never a panic. See
@@ -63,6 +67,7 @@ pub mod message;
 pub mod mock;
 mod server;
 mod session;
+pub mod throttle;
 mod tls;
 pub mod types;
 
@@ -72,6 +77,7 @@ pub use error::{sqlstate, ProtocolError, Result};
 pub use handler::{CommandTag, FieldDescription, QueryHandler, QueryResult, StatementDescription};
 pub use message::TransactionStatus;
 pub use server::Server;
-pub use session::serve_connection;
+pub use session::{serve_connection, serve_connection_from};
+pub use throttle::{AuthThrottle, ThrottlePolicy};
 pub use tls::TlsMode;
 pub use types::Format;

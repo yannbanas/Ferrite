@@ -128,6 +128,10 @@ Prometheus du même réseau Docker scrape `ferrite:9187`.
 | `FERRITE_PASSWORD` | généré aléatoirement | **à définir en production** |
 | `FERRITE_TLS_CERT` / `FERRITE_TLS_KEY` | — | chaîne PEM + clé privée ; les deux ou aucun |
 | `FERRITE_TLS_DISABLE` | non | `1` pour accepter du clair, avec un avertissement |
+| `FERRITE_AUTH_MAX_FAILURES` | `5` | échecs d'auth tolérés par fenêtre, par IP et par nom d'utilisateur |
+| `FERRITE_AUTH_WINDOW` | `60` | largeur de la fenêtre glissante, en secondes |
+| `FERRITE_AUTH_LOCKOUT` | `300` | durée du verrouillage temporaire, en secondes |
+| `FERRITE_AUTH_THROTTLE_DISABLE` | non | `1` pour ne pas limiter du tout, avec un avertissement |
 | `FERRITE_METRICS_LISTEN` | `0.0.0.0:9187` | endpoint `/metrics` + `/health` |
 | `FERRITE_METRICS_DISABLE` | non | `1` pour ne pas ouvrir cet endpoint (et donc perdre le healthcheck) |
 | `FERRITE_HEALTH_URL` | `http://127.0.0.1:9187/health` | ce qu'interroge le `HEALTHCHECK` de l'image ; à changer avec `FERRITE_METRICS_LISTEN` |

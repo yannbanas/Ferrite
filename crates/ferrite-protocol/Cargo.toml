@@ -24,6 +24,7 @@ sha2 = "0.10"
 rand = "0.8"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"

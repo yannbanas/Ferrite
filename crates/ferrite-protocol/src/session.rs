@@ -2,6 +2,7 @@
 //! authentication, then the simple and extended query flows.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use ferrite_common::{DataType, Identity, Row, Value};
@@ -31,9 +32,26 @@ pub async fn serve_connection<S>(stream: S, config: Arc<ServerConfig>) -> Result
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    serve_connection_from(stream, None, config).await
+}
+
+/// [`serve_connection`], told who the peer is.
+///
+/// The address is what the brute-force limiter keys on, so a listener that
+/// can name its peer — [`crate::Server`] can — should use this. `None`
+/// still limits by attempted user name, which is the half that catches a
+/// distributed attempt anyway.
+pub async fn serve_connection_from<S>(
+    stream: S,
+    peer: Option<IpAddr>,
+    config: Arc<ServerConfig>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut framed = Framed::new(stream, config.max_message_size);
     match negotiate(&mut framed, &config, false).await? {
-        Negotiated::Startup(params) => run_session(framed, params, config).await,
+        Negotiated::Startup(params) => run_session(framed, params, peer, config).await,
         Negotiated::Closed => Ok(()),
         Negotiated::UpgradeTls => {
             let acceptor = config
@@ -48,7 +66,7 @@ where
                 .map_err(|e| ProtocolError::Tls(e.to_string()))?;
             let mut framed = Framed::new(stream, config.max_message_size);
             match negotiate(&mut framed, &config, true).await? {
-                Negotiated::Startup(params) => run_session(framed, params, config).await,
+                Negotiated::Startup(params) => run_session(framed, params, peer, config).await,
                 Negotiated::Closed => Ok(()),
                 // Unreachable: `negotiate` refuses a second SSLRequest once
                 // the channel is already encrypted.
@@ -123,12 +141,13 @@ where
 async fn run_session<S>(
     mut framed: Framed<S>,
     params: StartupParams,
+    peer: Option<IpAddr>,
     config: Arc<ServerConfig>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let outcome = match authenticate(&mut framed, &params, &config).await {
+    let outcome = match authenticate(&mut framed, &params, peer, &config).await {
         Ok(outcome) => outcome,
         Err(err) => {
             ferrite_metrics::metrics().connections_rejected_total.inc();
@@ -191,11 +210,26 @@ where
 async fn authenticate<S>(
     framed: &mut Framed<S>,
     params: &StartupParams,
+    peer: Option<IpAddr>,
     config: &ServerConfig,
 ) -> Result<AuthOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Checked before a password prompt is even offered: a locked-out source
+    // must not get another guess in, and must not learn anything from how
+    // far it got.
+    if let Err(remaining) = config.throttle.check(peer, &params.user) {
+        ferrite_metrics::metrics().auth_throttled_total.inc();
+        warn!(
+            user = %params.user,
+            peer = ?peer,
+            retry_in_s = remaining.as_secs(),
+            "refusing an authentication attempt: this source is locked out"
+        );
+        return Err(ProtocolError::AuthFailed(params.user.clone()));
+    }
+
     framed.send(backend::authentication_cleartext_password());
     framed.flush().await?;
     let password = match framed.read_message().await? {
@@ -215,14 +249,18 @@ where
         }
     };
 
-    let outcome = config
+    let outcome = match config
         .authenticator
         .authenticate(&params.user, &params.database, &password)
         .await
-        .inspect_err(|_| {
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
             ferrite_metrics::metrics().auth_failures_total.inc();
-            warn!(user = %params.user, "authentication failed");
-        })?;
+            warn!(user = %params.user, peer = ?peer, "authentication failed");
+            return Err(fail_slowly(&params.user, peer, config, err).await);
+        }
+    };
 
     if !may_connect(&outcome.role) {
         ferrite_metrics::metrics().auth_failures_total.inc();
@@ -231,9 +269,35 @@ where
             role = %outcome.role.name,
             "connection denied: role lacks the Connect permission"
         );
-        return Err(ProtocolError::AuthFailed(params.user.clone()));
+        return Err(fail_slowly(
+            &params.user,
+            peer,
+            config,
+            ProtocolError::AuthFailed(params.user.clone()),
+        )
+        .await);
     }
+    config.throttle.record_success(peer, &params.user);
     Ok(outcome)
+}
+
+/// Records the failure and holds the refusal back for as long as the
+/// throttle asks.
+///
+/// The delay is an `await`, not a sleeping thread: an attacker looping on
+/// guesses pays for it in wall-clock time while the server pays nothing but
+/// a timer.
+async fn fail_slowly(
+    user: &str,
+    peer: Option<IpAddr>,
+    config: &ServerConfig,
+    err: ProtocolError,
+) -> ProtocolError {
+    let delay = config.throttle.record_failure(peer, user);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    err
 }
 
 struct Prepared {

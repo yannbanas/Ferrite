@@ -4,6 +4,7 @@ use crate::auth::Authenticator;
 use crate::codec::DEFAULT_MAX_MESSAGE_SIZE;
 use crate::handler::QueryHandler;
 use crate::message::StartupParams;
+use crate::throttle::AuthThrottle;
 use crate::tls::TlsMode;
 
 /// Everything a listener needs, shared by every connection it accepts.
@@ -12,6 +13,9 @@ pub struct ServerConfig {
     pub authenticator: Arc<dyn Authenticator>,
     /// TLS is required unless this is explicitly [`TlsMode::Disabled`].
     pub tls: TlsMode,
+    /// Brute-force limiter, on by default: an unlimited number of guesses
+    /// defeats any password check, however carefully it compares.
+    pub throttle: Arc<AuthThrottle>,
     pub max_message_size: usize,
     /// Reported as the `server_version` parameter. Clients gate features on
     /// it, so it claims a PostgreSQL version and names Ferrite alongside.
@@ -28,6 +32,7 @@ impl ServerConfig {
             handler,
             authenticator,
             tls,
+            throttle: Arc::new(AuthThrottle::default()),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             server_version: format!("16.0 (Ferrite {})", env!("CARGO_PKG_VERSION")),
         }
@@ -35,6 +40,11 @@ impl ServerConfig {
 
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = bytes;
+        self
+    }
+
+    pub fn with_throttle(mut self, throttle: AuthThrottle) -> Self {
+        self.throttle = Arc::new(throttle);
         self
     }
 

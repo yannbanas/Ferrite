@@ -2,6 +2,9 @@
 //! than a config file so the container image needs nothing mounted to boot.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+use ferrite_protocol::ThrottlePolicy;
 
 /// The PostgreSQL port, so existing clients and connection strings need no
 /// adjustment.
@@ -29,6 +32,9 @@ pub struct Settings {
     pub data_dir: PathBuf,
     /// Where the Prometheus/health endpoint listens. `None` disables it.
     pub metrics_listen: Option<String>,
+    /// Brute-force policy for authentication. `None` turns the limiter off,
+    /// which is only appropriate on an already-trusted transport.
+    pub auth_throttle: Option<ThrottlePolicy>,
 }
 
 impl Settings {
@@ -50,6 +56,19 @@ impl Settings {
                     var("FERRITE_METRICS_LISTEN")
                         .unwrap_or_else(|| DEFAULT_METRICS_LISTEN.to_owned()),
                 )
+            },
+            auth_throttle: if is_truthy("FERRITE_AUTH_THROTTLE_DISABLE") {
+                None
+            } else {
+                let default = ThrottlePolicy::default();
+                Some(ThrottlePolicy {
+                    max_failures: number("FERRITE_AUTH_MAX_FAILURES")
+                        .unwrap_or(default.max_failures as u64)
+                        as u32,
+                    window: seconds("FERRITE_AUTH_WINDOW").unwrap_or(default.window),
+                    lockout: seconds("FERRITE_AUTH_LOCKOUT").unwrap_or(default.lockout),
+                    ..default
+                })
             },
         };
         if settings.tls_cert.is_some() != settings.tls_key.is_some() {
@@ -75,6 +94,16 @@ fn is_truthy(key: &str) -> bool {
     var(key).is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// A number, or `None` when unset or unparseable. Silently falling back to
+/// the default beats refusing to boot over a typo in a tuning knob.
+fn number(key: &str) -> Option<u64> {
+    var(key).and_then(|v| v.parse().ok())
+}
+
+fn seconds(key: &str) -> Option<Duration> {
+    number(key).map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +119,7 @@ mod tests {
             tls_disabled: false,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             metrics_listen: Some(DEFAULT_METRICS_LISTEN.to_owned()),
+            auth_throttle: Some(ThrottlePolicy::default()),
         };
         assert_eq!(
             settings.tls_description(),

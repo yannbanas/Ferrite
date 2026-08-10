@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use crate::config::ServerConfig;
 use crate::error::{ProtocolError, Result};
-use crate::session::serve_connection;
+use crate::session::serve_connection_from;
 
 /// A TCP listener speaking the PostgreSQL wire protocol.
 pub struct Server {
@@ -50,7 +50,7 @@ impl Server {
                 // holds a connection, and that is exactly the shape an
                 // operator needs to see.
                 let _counted = ferrite_metrics::ConnectionGuard::new();
-                match serve_connection(stream, config).await {
+                match serve_connection_from(stream, Some(peer.ip()), config).await {
                     Ok(()) => debug!(%peer, "connection closed"),
                     Err(err) => debug!(%peer, error = %err, "connection ended with an error"),
                 }

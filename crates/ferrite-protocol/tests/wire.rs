@@ -461,3 +461,58 @@ async fn concurrent_connections_are_served_independently() {
         handle.await.expect("connection task");
     }
 }
+
+/// Over the wire, the whole point of the limiter: past the threshold the
+/// server stops offering a password prompt at all, so a guessing loop no
+/// longer gets a guess per connection.
+#[tokio::test]
+async fn repeated_wrong_passwords_lock_the_source_out() {
+    use ferrite_protocol::{AuthThrottle, ThrottlePolicy, TlsMode};
+    use std::time::Duration;
+
+    let policy = ThrottlePolicy {
+        max_failures: 3,
+        window: Duration::from_secs(60),
+        lockout: Duration::from_secs(60),
+        // The progressive delay is tested in the unit tests; here it would
+        // only make this test slow.
+        delay_step: Duration::ZERO,
+        max_delay: Duration::ZERO,
+    };
+    let addr = start(config(TlsMode::Disabled).with_throttle(AuthThrottle::new(policy))).await;
+
+    for attempt in 0..3 {
+        let mut client = RawClient::connect(addr).await;
+        client.write(&startup_packet(USER, DATABASE)).await;
+        assert_eq!(
+            client.read_message().await.tag,
+            b'R',
+            "attempt {attempt} is under the threshold, so a password is still asked for"
+        );
+        client.write(&password_message("not the password")).await;
+        assert_eq!(client.read_message().await.tag, b'E');
+    }
+
+    let mut client = RawClient::connect(addr).await;
+    client.write(&startup_packet(USER, DATABASE)).await;
+    let response = client.read_message().await;
+    assert_eq!(
+        response.tag, b'E',
+        "past the threshold the error replaces the password prompt"
+    );
+    assert_eq!(response.sqlstate().as_deref(), Some("28P01"));
+
+    // The lockout is on the source, not on the guess: the right password
+    // does not get through it either.
+    let mut client = RawClient::connect(addr).await;
+    client.write(&startup_packet(USER, DATABASE)).await;
+    assert_eq!(client.read_message().await.tag, b'E');
+
+    // The lockout covers every account from that address, not just the one
+    // that was guessed at — otherwise spraying user names would walk
+    // straight around it. The price is that clients behind one outbound
+    // address share the limit; see `throttle.rs`.
+    let mut client = RawClient::connect(addr).await;
+    client.write(&startup_packet("reader", DATABASE)).await;
+    assert_eq!(client.read_message().await.tag, b'E');
+}

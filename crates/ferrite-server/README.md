@@ -68,6 +68,10 @@ n'est signe par personne).
 | `FERRITE_PASSWORD` | genere aleatoirement | mot de passe de ce compte |
 | `FERRITE_TLS_CERT` / `FERRITE_TLS_KEY` | — | chaine PEM + cle privee ; les deux ou aucun |
 | `FERRITE_TLS_DISABLE` | non | `1` pour accepter du clair, **avec un avertissement** |
+| `FERRITE_AUTH_MAX_FAILURES` | `5` | echecs d'auth toleres par fenetre |
+| `FERRITE_AUTH_WINDOW` | `60` | fenetre glissante, en secondes |
+| `FERRITE_AUTH_LOCKOUT` | `300` | verrouillage temporaire, en secondes |
+| `FERRITE_AUTH_THROTTLE_DISABLE` | non | `1` pour ne pas limiter, **avec un avertissement** |
 | `FERRITE_METRICS_LISTEN` | `0.0.0.0:9187` | endpoint `/metrics` + `/health` |
 | `FERRITE_METRICS_DISABLE` | non | `1` pour ne pas ouvrir cet endpoint |
 | `FERRITE_LOG` | `info` | filtre `tracing-subscriber` |

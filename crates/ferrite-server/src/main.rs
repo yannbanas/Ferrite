@@ -11,7 +11,7 @@ use std::sync::Arc;
 use ferrite_common::Identity;
 use ferrite_proc::ProcRegistry;
 use ferrite_protocol::auth::{identity_for_user, superuser_role, StaticAuthenticator};
-use ferrite_protocol::{QueryHandler, Server, ServerConfig, TlsMode};
+use ferrite_protocol::{AuthThrottle, QueryHandler, Server, ServerConfig, TlsMode};
 use rand::Rng;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -70,11 +70,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         superuser,
         superuser_role(),
     );
+    let throttle = match settings.auth_throttle {
+        Some(policy) => AuthThrottle::new(policy),
+        None => {
+            warn!(
+                "FERRITE_AUTH_THROTTLE_DISABLE is set: password guessing is unlimited. \
+                 Only acceptable when the listener is already unreachable from untrusted hosts."
+            );
+            AuthThrottle::disabled()
+        }
+    };
     let config = ServerConfig::new(
         Arc::clone(&engine) as Arc<dyn QueryHandler>,
         Arc::new(authenticator),
         tls,
-    );
+    )
+    .with_throttle(throttle);
 
     let server = Server::bind(&settings.listen, config).await?;
     info!(
