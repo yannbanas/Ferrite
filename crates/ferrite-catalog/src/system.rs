@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ferrite_common::{
     Catalog, ColumnDef, ColumnDefault, DataType, FerriteError, IndexCatalog, IndexDef, IndexId,
-    Row, RowId, Schema, StorageEngine, TableId, TxnId, Value,
+    Row, RowId, Schema, StorageEngine, TableId, TxnId, UniqueKey, Value,
 };
 
 /// `TableId` of the table listing every table, including itself.
@@ -65,6 +65,41 @@ fn indexes_schema() -> Schema {
 
 fn column(name: &str, data_type: DataType) -> ColumnDef {
     ColumnDef::new(name, data_type, false)
+}
+
+/// The keys the catalog's own tables must not hold twice.
+///
+/// The catalog is stored as ordinary tables, so nothing distinguishes its
+/// rows from anyone else's — and until these were declared, nothing stopped
+/// it from holding two rows naming one table. The in-memory index is no
+/// defence: it is a `HashMap` keyed by name, so it can only ever see one of
+/// a pair, and `reload` rebuilds it from storage, where the duplicate
+/// silently wins or loses on iteration order. The observable symptom is a
+/// `DROP TABLE` that appears to work followed by a `CREATE TABLE` refused
+/// as already existing, because the drop removed one row and the reload
+/// found the other.
+///
+/// These are enforced by storage, atomically with the write, exactly like a
+/// user table's `PRIMARY KEY` — see `StorageEngine::insert_unique`.
+fn tables_keys() -> Vec<UniqueKey> {
+    vec![
+        UniqueKey::new("ferrite_tables_pkey", vec![0]),
+        UniqueKey::new("ferrite_tables_name_key", vec![1, 2]),
+    ]
+}
+
+fn columns_keys() -> Vec<UniqueKey> {
+    vec![
+        UniqueKey::new("ferrite_columns_pkey", vec![0, 1]),
+        UniqueKey::new("ferrite_columns_name_key", vec![0, 2]),
+    ]
+}
+
+fn indexes_keys() -> Vec<UniqueKey> {
+    vec![
+        UniqueKey::new("ferrite_indexes_pkey", vec![0, 3]),
+        UniqueKey::new("ferrite_indexes_name_key", vec![2, 3]),
+    ]
 }
 
 /// Encode a `DEFAULT` for the `default_expr` column of `ferrite_columns`.
@@ -473,7 +508,7 @@ impl SystemCatalog {
             id
         };
         for (position, column) in columns.iter().enumerate() {
-            self.storage.insert(
+            self.storage.insert_unique(
                 txn,
                 INDEXES_TABLE_ID,
                 Row::new(vec![
@@ -484,6 +519,7 @@ impl SystemCatalog {
                     Value::Text(column.clone()),
                     Value::Boolean(unique),
                 ]),
+                &indexes_keys(),
             )?;
         }
         self.write_cache()?.insert_index(
@@ -538,7 +574,7 @@ impl SystemCatalog {
         schema: &str,
         name: &str,
     ) -> Result<RowId, FerriteError> {
-        self.storage.insert(
+        self.storage.insert_unique(
             txn,
             TABLES_TABLE_ID,
             Row::new(vec![
@@ -546,6 +582,7 @@ impl SystemCatalog {
                 Value::Text(schema.to_string()),
                 Value::Text(name.to_string()),
             ]),
+            &tables_keys(),
         )
     }
 
@@ -567,7 +604,7 @@ impl SystemCatalog {
             Some(default) => Value::Text(encode_default(default, col.data_type)?),
             None => Value::Null,
         };
-        self.storage.insert(
+        self.storage.insert_unique(
             txn,
             COLUMNS_TABLE_ID,
             Row::new(vec![
@@ -578,6 +615,7 @@ impl SystemCatalog {
                 Value::Boolean(col.nullable),
                 default,
             ]),
+            &columns_keys(),
         )?;
         Ok(())
     }

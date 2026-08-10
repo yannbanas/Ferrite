@@ -131,6 +131,7 @@ fn a_crashed_transaction_id_is_never_handed_out_again() {
             ferrite_storage::StorageConfig {
                 cache_pages: 8,
                 fsync: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -319,7 +320,7 @@ proptest::proptest! {
         let open = || {
             ferrite_storage::FerriteStorage::open_with(
                 scratch.path(),
-                ferrite_storage::StorageConfig { cache_pages: 8, fsync: false },
+                ferrite_storage::StorageConfig { cache_pages: 8, fsync: false, ..Default::default() },
             )
             .expect("open storage")
         };
@@ -371,6 +372,7 @@ fn crash_child() {
         ferrite_storage::StorageConfig {
             cache_pages: 32,
             fsync: true,
+            ..Default::default()
         },
     )
     .expect("open storage");
@@ -444,4 +446,216 @@ fn killed_process_leaves_a_consistent_database() {
     storage.commit(txn).unwrap();
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The journal is a physical log of *full page images*, so it grows far
+/// faster than the data it describes: replaying a real application schema
+/// (72 tables, 938 rows, a few hundred statements) once left a 13 MiB
+/// database behind a 5.8 GiB journal, because nothing truncated it until
+/// shutdown. Filling the disk is a crash, and it is the one crash recovery
+/// cannot help with.
+#[test]
+fn the_journal_is_checkpointed_before_it_outgrows_the_database() {
+    let scratch = Scratch::new("crash_journal_bound");
+    const BUDGET: u64 = 256 * 1024;
+
+    let storage = ferrite_storage::FerriteStorage::open_with(
+        scratch.path(),
+        ferrite_storage::StorageConfig {
+            cache_pages: 16,
+            fsync: false,
+            checkpoint_journal_bytes: BUDGET,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let setup = storage.begin().unwrap();
+    storage.create_table(setup, T).unwrap();
+    storage.commit(setup).unwrap();
+
+    let journal = scratch.path().join(ferrite_storage::JOURNAL_FILE);
+    let mut peak = 0;
+    for i in 0..400i64 {
+        let txn = storage.begin().unwrap();
+        storage.insert(txn, T, int_row(i)).unwrap();
+        storage.commit(txn).unwrap();
+        peak = peak.max(std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0));
+    }
+
+    // The budget is a threshold checked after a commit, not a hard cap, so
+    // the journal may overshoot by whatever that commit wrote. What must
+    // not happen is unbounded growth.
+    assert!(
+        peak < BUDGET * 4,
+        "the journal reached {peak} bytes against a {BUDGET}-byte budget"
+    );
+
+    // And the data is all there, through the checkpoints.
+    let reader = storage.begin().unwrap();
+    assert_eq!(values(&storage, reader), (0..400).collect::<Vec<i64>>());
+    storage.commit(reader).unwrap();
+}
+
+/// An automatic checkpoint runs while other transactions are open, so it
+/// has to leave their uncommitted work invisible — the commit bitmap is
+/// what makes that safe, and this is the test that says so.
+#[test]
+fn a_checkpoint_taken_mid_transaction_does_not_publish_uncommitted_rows() {
+    let scratch = Scratch::new("crash_journal_midtxn");
+    let storage = ferrite_storage::FerriteStorage::open_with(
+        scratch.path(),
+        ferrite_storage::StorageConfig {
+            cache_pages: 16,
+            fsync: false,
+            checkpoint_journal_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let setup = storage.begin().unwrap();
+    storage.create_table(setup, T).unwrap();
+    storage.commit(setup).unwrap();
+
+    // Open and write, then leave it in flight while other commits drive
+    // the journal past its budget.
+    let doomed = storage.begin().unwrap();
+    for i in 1000..1100i64 {
+        storage.insert(doomed, T, int_row(i)).unwrap();
+    }
+    for i in 0..200i64 {
+        let txn = storage.begin().unwrap();
+        storage.insert(txn, T, int_row(i)).unwrap();
+        storage.commit(txn).unwrap();
+    }
+    std::mem::drop(storage);
+
+    let storage = scratch.open();
+    let txn = storage.begin().unwrap();
+    assert_eq!(values(&storage, txn), (0..200).collect::<Vec<i64>>());
+    storage.commit(txn).unwrap();
+}
+
+/// Overwrites the second half of `page` in the data file, leaving the
+/// first half as it was.
+///
+/// That is what a power cut in the middle of an 8 KiB write leaves behind:
+/// the sectors the drive had already taken carry the new contents, the
+/// rest still carry the old. The page is internally inconsistent in a way
+/// no single-byte flip reproduces, and — the point — the checksum stored
+/// in its header belongs to neither half.
+fn tear_page(path: &std::path::Path, page: usize) {
+    let mut bytes = std::fs::read(path).expect("read the data file");
+    let size = ferrite_storage::PAGE_SIZE;
+    let start = page * size;
+    assert!(bytes.len() >= start + size, "page {page} is past the file");
+    for byte in bytes[start + size / 2..start + size].iter_mut() {
+        *byte = 0xa5;
+    }
+    std::fs::write(path, &bytes).expect("write the data file");
+}
+
+/// A crash *during* a page write, rather than between two complete
+/// operations.
+///
+/// The journal is what makes this survivable: it holds a full image of
+/// every page a commit dirtied, so recovery overwrites the torn page
+/// wholesale instead of trying to patch it. This is the reason the journal
+/// logs images rather than operations, and the test that says so.
+#[test]
+fn a_page_torn_mid_write_is_repaired_by_the_journal() {
+    let scratch = Scratch::new("crash_torn_page");
+    let rows: Vec<i64> = (0..400).collect();
+    let data = scratch.path().join(ferrite_storage::DATA_FILE);
+    {
+        let storage = scratch.open();
+        let setup = storage.begin().unwrap();
+        storage.create_table(setup, T).unwrap();
+        for value in &rows {
+            storage.insert(setup, T, int_row(*value)).unwrap();
+        }
+        storage.commit(setup).unwrap();
+        // Everything reaches the data file and the journal is emptied, so
+        // what follows is the only thing the journal will hold.
+        storage.checkpoint().unwrap();
+
+        // Rewrite every row. These pages are already on disk, so the
+        // journal now holds a newer image of a page the data file also
+        // has an older version of — which is exactly the situation a torn
+        // write leaves behind.
+        let update = storage.begin().unwrap();
+        let ids: Vec<u64> = storage
+            .scan(update, T)
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        for id in ids {
+            let previous = row_int(&storage.get(update, T, id).unwrap());
+            storage
+                .update(update, T, id, int_row(previous + 1000))
+                .unwrap();
+        }
+        storage.commit(update).unwrap();
+        std::mem::drop(storage);
+    }
+
+    let pages = std::fs::metadata(&data).unwrap().len() as usize / ferrite_storage::PAGE_SIZE;
+    assert!(pages > 1, "the test needs a page other than the meta page");
+    tear_page(&data, pages - 1);
+
+    let storage = scratch.open();
+    let txn = storage.begin().unwrap();
+    assert_eq!(
+        values(&storage, txn),
+        rows.iter().map(|v| v + 1000).collect::<Vec<i64>>(),
+        "recovery must overwrite the torn page from its journalled image"
+    );
+    storage.commit(txn).unwrap();
+}
+
+/// The same tear with no journal to repair it. This is the case where the
+/// checksum is the only defence, and it has to hold: a half-written page
+/// served as if it were intact is silent data corruption, which is worse
+/// than an error.
+#[test]
+fn a_page_torn_with_no_journal_to_repair_it_is_reported_not_served() {
+    let scratch = Scratch::new("crash_torn_no_journal");
+    {
+        let storage = scratch.open();
+        let setup = storage.begin().unwrap();
+        storage.create_table(setup, T).unwrap();
+        for value in 0..60i64 {
+            storage.insert(setup, T, int_row(value)).unwrap();
+        }
+        storage.commit(setup).unwrap();
+        // The checkpoint makes the data file self-sufficient and empties
+        // the journal, so nothing can repair what follows.
+        storage.checkpoint().unwrap();
+        std::mem::drop(storage);
+    }
+
+    let data = scratch.path().join(ferrite_storage::DATA_FILE);
+    let pages = std::fs::metadata(&data).unwrap().len() as usize / ferrite_storage::PAGE_SIZE;
+    tear_page(&data, pages - 1);
+
+    let outcome = std::panic::catch_unwind(|| {
+        let storage = scratch.try_open()?;
+        let txn = storage.begin()?;
+        let seen: Vec<i64> = storage
+            .scan(txn, T)?
+            .map(|r| r.map(|(_, row)| row_int(&row)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<Vec<i64>, FerriteError>(seen)
+    });
+
+    match outcome {
+        Ok(Ok(rows)) => panic!("a torn page was served as {} intact rows", rows.len()),
+        Ok(Err(FerriteError::Storage(message))) => assert!(
+            message.contains("checksum") || message.contains("corrupt"),
+            "expected the tear to be named, got: {message}"
+        ),
+        Ok(Err(other)) => panic!("expected a storage error, got {other}"),
+        Err(_) => panic!("a torn page must be an error, not a panic"),
+    }
 }

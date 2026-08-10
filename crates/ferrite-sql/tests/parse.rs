@@ -892,11 +892,36 @@ fn deep_nesting_is_rejected_rather_than_overflowing_the_stack() {
     assert!(parse(&deep).is_err());
 }
 
+/// A long run of `AND`/`OR` is a shape applications really send, so it
+/// has to keep parsing — and the tree it produces has to stay shallow,
+/// because a chain one level per term is what everything downstream then
+/// walks recursively.
 #[test]
-fn long_flat_input_still_parses() {
+fn long_flat_input_still_parses_and_stays_shallow() {
     let terms: Vec<String> = (0..2000).map(|i| format!("a = {i}")).collect();
     let sql = format!("SELECT 1 FROM t WHERE {}", terms.join(" OR "));
-    assert!(parse(&sql).is_ok());
+    let statements = parse(&sql).expect("2000 OR terms must parse");
+
+    fn height(expr: &Expr) -> usize {
+        match expr {
+            Expr::BinaryOp { left, right, .. } => 1 + height(left).max(height(right)),
+            _ => 1,
+        }
+    }
+    let Statement::Query(query) = &statements[0] else {
+        panic!("expected a query");
+    };
+    let SetExpr::Select(select) = &query.body else {
+        panic!("expected a select");
+    };
+    let predicate = select.selection.as_ref().expect("a WHERE clause");
+    // 2000 terms balanced is eleven levels plus the comparison; chained it
+    // would be two thousand.
+    assert!(
+        height(predicate) <= 16,
+        "2000 OR terms produced a tree {} levels tall",
+        height(predicate)
+    );
 }
 
 #[test]

@@ -35,6 +35,22 @@ pub struct Settings {
     /// Brute-force policy for authentication. `None` turns the limiter off,
     /// which is only appropriate on an already-trusted transport.
     pub auth_throttle: Option<ThrottlePolicy>,
+    /// Sessions served at once; further connections are refused with
+    /// SQLSTATE `53300` rather than accepted and starved.
+    pub max_connections: usize,
+    /// Wall-clock budget for one statement. `None` disables it, which
+    /// leaves a runaway query holding a blocking thread and an MVCC
+    /// snapshot for as long as it likes.
+    pub statement_timeout: Option<Duration>,
+    /// How long a transaction may stay open. Checked when its session
+    /// speaks again, so an idle connection is caught on its next statement
+    /// rather than in the background — see `SessionHandle::in_transaction`.
+    pub transaction_timeout: Option<Duration>,
+    /// Rows one plan node may materialize. `0` disables the bound.
+    pub max_result_rows: usize,
+    /// Journal size past which a commit also checkpoints. `0` disables it,
+    /// and the journal then only shrinks on an orderly shutdown.
+    pub checkpoint_journal_bytes: u64,
 }
 
 impl Settings {
@@ -62,14 +78,30 @@ impl Settings {
             } else {
                 let default = ThrottlePolicy::default();
                 Some(ThrottlePolicy {
-                    max_failures: number("FERRITE_AUTH_MAX_FAILURES")
+                    max_failures: number("FERRITE_AUTH_MAX_FAILURES")?
                         .unwrap_or(default.max_failures as u64)
                         as u32,
-                    window: seconds("FERRITE_AUTH_WINDOW").unwrap_or(default.window),
-                    lockout: seconds("FERRITE_AUTH_LOCKOUT").unwrap_or(default.lockout),
+                    window: seconds("FERRITE_AUTH_WINDOW")?.unwrap_or(default.window),
+                    lockout: seconds("FERRITE_AUTH_LOCKOUT")?.unwrap_or(default.lockout),
                     ..default
                 })
             },
+            max_connections: number("FERRITE_MAX_CONNECTIONS")?
+                .map(|n| n.max(1) as usize)
+                .unwrap_or(ferrite_protocol::DEFAULT_MAX_CONNECTIONS),
+            statement_timeout: duration_ms(
+                "FERRITE_STATEMENT_TIMEOUT_MS",
+                Some(ferrite_exec::DEFAULT_STATEMENT_TIMEOUT),
+            )?,
+            transaction_timeout: duration_ms(
+                "FERRITE_TRANSACTION_TIMEOUT_MS",
+                Some(DEFAULT_TRANSACTION_TIMEOUT),
+            )?,
+            max_result_rows: number("FERRITE_MAX_RESULT_ROWS")?
+                .map(|n| n as usize)
+                .unwrap_or(ferrite_exec::DEFAULT_MAX_ROWS),
+            checkpoint_journal_bytes: number("FERRITE_CHECKPOINT_JOURNAL_BYTES")?
+                .unwrap_or(ferrite_storage::DEFAULT_CHECKPOINT_JOURNAL_BYTES),
         };
         if settings.tls_cert.is_some() != settings.tls_key.is_some() {
             return Err("FERRITE_TLS_CERT and FERRITE_TLS_KEY must be set together".to_owned());
@@ -86,6 +118,33 @@ impl Settings {
     }
 }
 
+/// A transaction left open holds back MVCC pruning for every table it
+/// could see, so the default is minutes rather than hours.
+pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Parses a numeric environment variable, refusing a value that is present
+/// but not a number rather than silently falling back to the default —
+/// a typo in a limit should stop the boot, not disable the limit.
+fn number(key: &str) -> Result<Option<u64>, String> {
+    match var(key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{key} must be a whole number, got {raw:?}")),
+    }
+}
+
+/// `0` means "no limit" for every duration knob, which is the spelling
+/// PostgreSQL uses for `statement_timeout`.
+fn duration_ms(key: &str, default: Option<Duration>) -> Result<Option<Duration>, String> {
+    match number(key)? {
+        None => Ok(default),
+        Some(0) => Ok(None),
+        Some(ms) => Ok(Some(Duration::from_millis(ms))),
+    }
+}
+
 fn var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
@@ -94,14 +153,8 @@ fn is_truthy(key: &str) -> bool {
     var(key).is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
-/// A number, or `None` when unset or unparseable. Silently falling back to
-/// the default beats refusing to boot over a typo in a tuning knob.
-fn number(key: &str) -> Option<u64> {
-    var(key).and_then(|v| v.parse().ok())
-}
-
-fn seconds(key: &str) -> Option<Duration> {
-    number(key).map(Duration::from_secs)
+fn seconds(key: &str) -> Result<Option<Duration>, String> {
+    Ok(number(key)?.map(Duration::from_secs))
 }
 
 #[cfg(test)]
@@ -120,6 +173,11 @@ mod tests {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             metrics_listen: Some(DEFAULT_METRICS_LISTEN.to_owned()),
             auth_throttle: Some(ThrottlePolicy::default()),
+            max_connections: 10,
+            statement_timeout: None,
+            transaction_timeout: None,
+            max_result_rows: 0,
+            checkpoint_journal_bytes: 0,
         };
         assert_eq!(
             settings.tls_description(),

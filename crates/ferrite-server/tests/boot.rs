@@ -830,3 +830,338 @@ async fn the_metrics_endpoint_reports_real_traffic() {
         ) >= 1.0
     );
 }
+
+/// The exact statement the PawChat replay used to duplicate, over the real
+/// wire, against PawChat's own `users` shape: `id` is the primary key and
+/// `username` is `UNIQUE`. Before unique enforcement both inserts were
+/// accepted and the table ended up holding two rows with `id = 'demo-1'`;
+/// the follow-up `SELECT` then returned two rows against Ferrite and one
+/// against SQLite.
+#[tokio::test]
+async fn a_duplicate_primary_key_is_refused_over_the_wire() {
+    let data = scratch("unique");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute(
+            "CREATE TABLE users (
+                 id TEXT NOT NULL PRIMARY KEY,
+                 username TEXT NOT NULL UNIQUE,
+                 password TEXT NOT NULL
+             )",
+        )
+        .await
+        .expect("CREATE TABLE users");
+
+    let insert = "INSERT INTO users (id, username, password) \
+                  VALUES ('demo-1', 'demo', 'scrypt$x')";
+    client.batch_execute(insert).await.expect("the first row");
+
+    let duplicate = client
+        .batch_execute(insert)
+        .await
+        .expect_err("the same primary key twice must be refused");
+    assert_eq!(
+        duplicate.code().map(|c| c.code()),
+        Some("23505"),
+        "a duplicate row is a unique violation, not {duplicate}"
+    );
+
+    // The unique constraint on `username` is enforced on its own, so a
+    // different id carrying the same username is refused too.
+    let same_username = client
+        .batch_execute(
+            "INSERT INTO users (id, username, password) \
+             VALUES ('demo-2', 'demo', 'scrypt$y')",
+        )
+        .await
+        .expect_err("a duplicate username must be refused");
+    assert_eq!(same_username.code().map(|c| c.code()), Some("23505"));
+
+    let rows = client
+        .query("SELECT id FROM users WHERE username = 'demo'", &[])
+        .await
+        .expect("read the table back");
+    assert_eq!(rows.len(), 1, "exactly one row may carry this key");
+
+    // An `UPDATE` cannot walk a row onto a key another row holds either.
+    client
+        .batch_execute(
+            "INSERT INTO users (id, username, password) \
+             VALUES ('demo-3', 'other', 'scrypt$z')",
+        )
+        .await
+        .expect("a distinct row");
+    let collide = client
+        .batch_execute("UPDATE users SET username = 'demo' WHERE id = 'demo-3'")
+        .await
+        .expect_err("an UPDATE onto a taken key must be refused");
+    assert_eq!(collide.code().map(|c| c.code()), Some("23505"));
+
+    // The connection is still usable after all of it.
+    assert_eq!(
+        client
+            .query("SELECT id FROM users", &[])
+            .await
+            .expect("the connection survived")
+            .len(),
+        2
+    );
+}
+
+/// Two connections inserting the same key at the same time. Whatever the
+/// interleaving, one wins and one gets a `23505` — never two rows.
+#[tokio::test]
+async fn concurrent_connections_cannot_both_insert_one_key() {
+    let data = scratch("unique-race");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let setup = connect(port).await;
+    setup
+        .batch_execute("CREATE TABLE codes (code TEXT NOT NULL PRIMARY KEY)")
+        .await
+        .expect("CREATE TABLE codes");
+
+    let a = connect(port).await;
+    let b = connect(port).await;
+    let statement = "INSERT INTO codes (code) VALUES ('SAME')";
+    let (first, second) = tokio::join!(a.batch_execute(statement), b.batch_execute(statement));
+
+    let refused = [&first, &second]
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .count();
+    assert_eq!(refused, 1, "exactly one of the two must be refused");
+    for result in [&first, &second] {
+        if let Err(err) = result {
+            assert_eq!(err.code().map(|c| c.code()), Some("23505"), "{err}");
+        }
+    }
+
+    assert_eq!(
+        setup
+            .query("SELECT code FROM codes", &[])
+            .await
+            .expect("read back")
+            .len(),
+        1
+    );
+}
+
+/// A unique index cannot be declared over data that already contradicts
+/// it: the duplicates would survive, unreachable through the constraint
+/// meant to describe them.
+#[tokio::test]
+async fn a_unique_index_is_refused_when_the_data_already_violates_it() {
+    let data = scratch("unique-index");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE TABLE tags (name TEXT NOT NULL)")
+        .await
+        .expect("CREATE TABLE");
+    for _ in 0..2 {
+        client
+            .batch_execute("INSERT INTO tags (name) VALUES ('dup')")
+            .await
+            .expect("a table with no constraint accepts both");
+    }
+
+    let refused = client
+        .batch_execute("CREATE UNIQUE INDEX tags_name ON tags (name)")
+        .await
+        .expect_err("the existing rows violate it");
+    assert_eq!(refused.code().map(|c| c.code()), Some("23505"), "{refused}");
+
+    // A non-unique index over the same column is fine.
+    client
+        .batch_execute("CREATE INDEX tags_name ON tags (name)")
+        .await
+        .expect("a plain index makes no promise about duplicates");
+}
+
+/// The limits, through the real binary and its environment variables.
+///
+/// Each of these bounds something that is otherwise unbounded, and the
+/// point of testing them here rather than in a unit test is that the
+/// wiring — environment variable to setting to engine to executor — is
+/// where a limit silently goes missing.
+#[tokio::test]
+async fn the_configured_limits_are_enforced_end_to_end() {
+    let data = scratch("limits");
+    let port = free_port();
+    let _server = spawn(
+        port,
+        &data,
+        &[
+            ("FERRITE_TLS_DISABLE", "1"),
+            ("FERRITE_MAX_RESULT_ROWS", "10"),
+            ("FERRITE_TRANSACTION_TIMEOUT_MS", "300"),
+            ("FERRITE_MAX_CONNECTIONS", "8"),
+        ],
+    );
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE TABLE big (id BIGINT NOT NULL)")
+        .await
+        .expect("CREATE TABLE");
+    for id in 0..40 {
+        client
+            .execute("INSERT INTO big (id) VALUES ($1)", &[&(id as i64)])
+            .await
+            .expect("INSERT");
+    }
+
+    let refused = client
+        .query("SELECT id FROM big", &[])
+        .await
+        .expect_err("40 rows must not fit a 10-row budget");
+    assert_eq!(refused.code().map(|c| c.code()), Some("54000"), "{refused}");
+
+    // A `LIMIT` does *not* rescue it: the scan under the limit collects the
+    // whole table first, because the v1 executor materializes every node
+    // and there is no limit pushdown. A `WHERE` clause does, because a
+    // sequential scan filters as it reads. Asserting both is the point —
+    // that asymmetry is the honest shape of this budget.
+    assert!(client
+        .query("SELECT id FROM big LIMIT 5", &[])
+        .await
+        .is_err());
+    assert_eq!(
+        client
+            .query("SELECT id FROM big WHERE id = 3", &[])
+            .await
+            .expect("a selective read stays inside the budget")
+            .len(),
+        1
+    );
+
+    // A transaction left open past its budget is rolled back rather than
+    // holding its snapshot — and holding back MVCC pruning — forever.
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .execute("INSERT INTO big (id) VALUES (999)", &[])
+        .await
+        .expect("a write inside the transaction");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let expired = client
+        .execute("INSERT INTO big (id) VALUES (1000)", &[])
+        .await
+        .expect_err("the transaction is past its budget");
+    assert_eq!(expired.code().map(|c| c.code()), Some("57014"), "{expired}");
+
+    // Rolled back, so neither write landed, and the connection is usable.
+    let survivors = connect(port).await;
+    assert_eq!(
+        survivors
+            .query("SELECT id FROM big WHERE id = 999", &[])
+            .await
+            .expect("the server is still serving")
+            .len(),
+        0,
+        "the expired transaction was rolled back, so its write is not there"
+    );
+}
+
+/// Two servers on one data directory is the classic self-inflicted
+/// corruption: both replay the journal at startup, both cache pages, and
+/// each writes back a version of a page the other never saw. Nothing in
+/// the page format, the checksums or the journal defends against it — they
+/// all assume a single writer — so the defence is refusing to start.
+#[tokio::test]
+async fn a_second_server_on_the_same_data_directory_refuses_to_start() {
+    let data = scratch("dirlock");
+    let first_port = free_port();
+    let second_port = free_port();
+
+    let _first = spawn(first_port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(first_port).await;
+    let client = connect(first_port).await;
+    client
+        .batch_execute("CREATE TABLE held (id BIGINT NOT NULL)")
+        .await
+        .expect("the first server owns the directory");
+
+    // The second one must die rather than listen. `scratch` would wipe the
+    // directory, so the path is reused directly.
+    let mut second = Command::new(env!("CARGO_BIN_EXE_ferrite-server"))
+        .env("FERRITE_LISTEN", format!("127.0.0.1:{second_port}"))
+        .env("FERRITE_USER", "ferrite")
+        .env("FERRITE_PASSWORD", "hunter2")
+        .env("FERRITE_DATA", &data)
+        .env("FERRITE_TLS_DISABLE", "1")
+        .env("FERRITE_LOG", "warn")
+        .spawn()
+        .expect("spawn the second server");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second server is still running; it should have refused the locked directory"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        !status.success(),
+        "the second server exited cleanly instead of refusing"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", second_port))
+            .await
+            .is_err(),
+        "the second server must not be listening"
+    );
+
+    // And the first one never noticed.
+    client
+        .execute("INSERT INTO held (id) VALUES (1)", &[])
+        .await
+        .expect("the holder is unaffected");
+}
+
+/// A lock the operating system holds on a handle, not a file that must be
+/// deleted: a killed server has to be restartable on the same directory,
+/// which is the whole promise of "restart and everything works".
+#[tokio::test]
+async fn a_killed_server_leaves_the_directory_lockable_again() {
+    let data = scratch("dirlock-restart");
+    let port = free_port();
+    {
+        let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+        wait_for_port(port).await;
+        let client = connect(port).await;
+        client
+            .batch_execute("CREATE TABLE kept (id BIGINT NOT NULL)")
+            .await
+            .expect("CREATE TABLE");
+        client
+            .execute("INSERT INTO kept (id) VALUES (7)", &[])
+            .await
+            .expect("INSERT");
+        // Dropped here: the child is killed, not asked to stop.
+    }
+
+    let port = free_port();
+    let _restarted = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+    let client = connect(port).await;
+    let row = client
+        .query_one("SELECT id FROM kept WHERE id = 7", &[])
+        .await
+        .expect("a killed holder must not block the restart");
+    assert_eq!(row.get::<_, i64>(0), 7);
+}

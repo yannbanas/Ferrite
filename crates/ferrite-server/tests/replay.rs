@@ -20,6 +20,21 @@ use std::path::PathBuf;
 use tokio_postgres::{Client, NoTls};
 
 const SENTINEL: &str = "-- @@STATEMENT@@";
+/// Marks a statement the server is supposed to *refuse*, with the SQLSTATE
+/// it must refuse it with. A constraint is only proven by a write that
+/// fails, so those statements need somewhere to say so.
+const EXPECT: &str = "-- @@EXPECT ";
+
+/// Splits an `EXPECT` marker off the front of a statement.
+fn expected_failure(statement: &str) -> (Option<String>, &str) {
+    let Some(rest) = statement.strip_prefix(EXPECT) else {
+        return (None, statement);
+    };
+    match rest.split_once("@@") {
+        Some((code, body)) => (Some(code.trim().to_owned()), body.trim_start()),
+        None => (None, statement),
+    }
+}
 
 fn conn_str() -> String {
     let addr =
@@ -179,7 +194,31 @@ async fn replay_a_translated_schema() {
         .filter(|s| !s.is_empty())
     {
         total += 1;
+        let (expect, statement) = expected_failure(statement);
         let one_line = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        if let Some(code) = expect {
+            let outcome = client.batch_execute(statement).await;
+            let actual = outcome
+                .as_ref()
+                .err()
+                .and_then(|e| e.as_db_error())
+                .map(|d| d.code().code().to_owned());
+            if actual.as_deref() == Some(code.as_str()) {
+                ok += 1;
+                println!("  refused {code:<4} {one_line}");
+            } else {
+                println!(
+                    "  NOT REFUSED  {one_line}
+                expected {code}, got {}",
+                    match &outcome {
+                        Ok(()) => "acceptance".to_owned(),
+                        Err(err) => describe(err),
+                    }
+                );
+            }
+            continue;
+        }
         // A query goes through `query` rather than `batch_execute` so the
         // report can say how many rows came back. "Accepted" and "answered"
         // are not the same claim, and for a `JOIN` or a `count(*)` only the

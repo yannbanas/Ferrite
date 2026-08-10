@@ -806,3 +806,109 @@ fn usable_behind_an_index_catalog_trait_object() {
     assert!(boxed.indexes_for(table).unwrap().is_empty());
     assert!(boxed.drop_index(id).is_err());
 }
+
+/// The catalog is stored as ordinary tables, so nothing about its rows is
+/// special — and the only thing that used to stop it from holding two rows
+/// naming one table was an in-memory `HashMap` private to one
+/// `SystemCatalog`. Two catalogs over one storage is the cheap way to
+/// reproduce what a crash and a restart can also produce: a second writer
+/// whose index has never seen the first one's row.
+///
+/// The symptom that surfaces from a duplicate is confusing rather than
+/// obviously fatal — `DROP TABLE` appears to work, and the `CREATE TABLE`
+/// after it is refused as already existing, because the drop removed one
+/// row and the next reload found the other.
+#[test]
+fn two_catalogs_cannot_both_record_the_same_table_name() {
+    let storage = Arc::new(MemoryStorage::new());
+    let first = SystemCatalog::bootstrap(storage.clone()).expect("bootstrap");
+    let second = SystemCatalog::open(storage.clone()).expect("open the same storage again");
+
+    first
+        .create_table("public", "stress", users())
+        .expect("the first writer");
+    let refused = second
+        .create_table("public", "stress", users())
+        .expect_err("a second row for one table name is corruption, not a race to tolerate");
+    // Two guards stand between here and a duplicate row, and which one
+    // speaks depends on whether the two writers also picked the same id.
+    // Storage refuses a table id that already exists; the unique key on
+    // `(schema_name, table_name)` refuses the row itself, and is the one
+    // that still holds when the ids differ. The assertion is that *some*
+    // guard refuses, and that the catalog is left holding one row.
+    assert!(
+        matches!(
+            refused,
+            FerriteError::UniqueViolation { .. } | FerriteError::Storage(_)
+        ),
+        "expected a refusal naming the collision, got {refused:?}"
+    );
+
+    // One row, so a drop really drops it and the name is free again.
+    let rows = storage.rows(TABLES_TABLE_ID).expect("read ferrite_tables");
+    let named: Vec<_> = rows
+        .iter()
+        .filter(|row| row.values.get(2) == Some(&Value::Text("stress".into())))
+        .collect();
+    assert_eq!(named.len(), 1, "ferrite_tables holds {named:?}");
+
+    let id = first.table_id("public", "stress").unwrap().unwrap();
+    first.drop_table(id).expect("drop");
+    let reloaded = SystemCatalog::open(storage.clone()).expect("reopen");
+    assert_eq!(
+        reloaded.table_id("public", "stress").unwrap(),
+        None,
+        "after a drop the name must be free, including to a fresh reader"
+    );
+    reloaded
+        .create_table("public", "stress", users())
+        .expect("the name is reusable");
+}
+
+/// The same guarantee for the other two catalog tables, whose duplicates
+/// would be quieter and worse: a column listed twice changes a table's
+/// arity, and an index listed twice changes what a unique key covers.
+#[test]
+fn the_column_and_index_catalogs_refuse_duplicates_too() {
+    let storage = Arc::new(MemoryStorage::new());
+    let first = SystemCatalog::bootstrap(storage.clone()).expect("bootstrap");
+    let id = first.create_table("public", "t", users()).expect("create");
+    first
+        .create_index("t_email", id, &["email".to_string()], true)
+        .expect("create index");
+
+    let second = SystemCatalog::open(storage.clone()).expect("open again");
+    assert!(
+        second
+            .add_column(id, ColumnDef::new("age", DataType::Int4, true))
+            .is_err(),
+        "a column listed twice changes the table arity every reader computes"
+    );
+    assert!(
+        second
+            .create_index("t_email", id, &["email".to_string()], true)
+            .is_err(),
+        "an index listed twice changes what a unique key is understood to cover"
+    );
+
+    // Whichever guard spoke, the stored rows are what matter: one row per
+    // column, one row per index column.
+    let columns = storage
+        .rows(COLUMNS_TABLE_ID)
+        .expect("read ferrite_columns");
+    let ages = columns
+        .iter()
+        .filter(|row| row.values.first() == Some(&Value::Int8(i64::from(id))))
+        .filter(|row| row.values.get(2) == Some(&Value::Text("age".into())))
+        .count();
+    assert_eq!(ages, 1, "ferrite_columns holds {ages} rows for `age`");
+
+    let indexes = storage
+        .rows(INDEXES_TABLE_ID)
+        .expect("read ferrite_indexes");
+    let named = indexes
+        .iter()
+        .filter(|row| row.values.get(2) == Some(&Value::Text("t_email".into())))
+        .count();
+    assert_eq!(named, 1, "ferrite_indexes holds {named} rows for `t_email`");
+}

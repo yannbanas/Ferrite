@@ -187,8 +187,10 @@ fn arithmetic(op: BinaryOp, left: Value, right: Value) -> Result<Value, FerriteE
             })
         }
         (Value::Int4(_) | Value::Int8(_), Value::Int4(_) | Value::Int8(_)) => {
-            let (a, b) = (as_int(&left), as_int(&right));
-            Ok(Value::Int8(integer_op(op, a.unwrap(), b.unwrap())?))
+            match (as_int(&left), as_int(&right)) {
+                (Some(a), Some(b)) => Ok(Value::Int8(integer_op(op, a, b)?)),
+                _ => Err(mismatch(DataType::Int8)),
+            }
         }
         _ => Err(mismatch(DataType::Float8)),
     }

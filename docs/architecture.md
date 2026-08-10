@@ -177,6 +177,14 @@ réconcilie pas l'arité d'abord.
 72/72 tables, 938/938 lignes, 337/337 énoncés `_after` acceptés
 ```
 
+Après l'application réelle des contraintes d'unicité, le même replay rend
+`433/435` (les deux refus restants étant le `SELECT` sans `FROM`, joué deux
+fois), et trois énoncés y sont désormais *attendus en échec* : réinsérer la
+ligne `users` de PawChat rend un `23505` et le `count(*)` reste à 22 de part
+et d'autre. Le probe de migration, lui, recopiait la clé primaire d'une
+ligne existante — un doublon depuis toujours, que seule l'absence de
+contrainte rendait acceptable ; il génère maintenant une clé fraîche.
+
 `count(*)` sur `vr_room_objects` rend 394 avant les migrations et 395 après,
 la ligne de plus étant l'`INSERT` qui ne nomme que les colonnes obligatoires
 et laisse le reste aux `DEFAULT`. La même bascule se lit sur le
@@ -243,12 +251,88 @@ c'est la cible de réécriture des trois recherches `LIKE` de PawChat, listées
 dans `docs/pawchat-sql-audit.md`. `LIKE` n'a **pas** été rendu insensible,
 la casse étant le bon comportement partout ailleurs.
 
-Le risque le plus sérieux avant une mise en production n'est pas dialectal :
-`ferrite-storage` n'ayant pas encore d'index secondaire, **aucune contrainte
-`PRIMARY KEY` ou `UNIQUE` n'est appliquée**. Le catalogue les enregistre —
-c'est ce qui donne sa cible à `INSERT OR IGNORE` — mais une écriture qui les
-viole passe. Le replay le montre : réinsérer la ligne `users` de PawChat
-crée un doublon que SQLite refuserait deux fois.
+~~Le risque le plus sérieux avant une mise en production n'est pas dialectal :
+`ferrite-storage` n'ayant pas encore d'index secondaire, aucune contrainte
+`PRIMARY KEY` ou `UNIQUE` n'est appliquée.~~ — *corrigé.* Les contraintes
+d'unicité sont désormais **réellement appliquées** (`23505` sur violation),
+sans index secondaire pour autant : c'est le moteur de stockage qui vérifie,
+sous son verrou, juste avant l'écriture qu'il protège. Deux propriétés que
+l'exécuteur ne pouvait pas se donner tout seul, et qui sont testées
+séparément (`crates/ferrite-storage/tests/unique.rs`) :
+
+- **la vérification voit plus large qu'un snapshot** — une ligne validée
+  après la prise de snapshot, ou écrite par une transaction encore en vol,
+  est invisible d'un `scan` et laissait passer le doublon ; l'unicité est
+  une propriété de la table, pas d'une vue ;
+- **vérification et écriture sont un seul pas** — vérifier puis écrire est
+  un TOCTOU classique : deux transactions concurrentes ne trouvaient rien
+  chacune de son côté et écrivaient toutes les deux.
+
+Le coût d'un scan complet par écriture est évité par un cache négatif de
+hachages de clés (`crates/ferrite-storage/src/unique.rs`) : un sur-ensemble
+des clés vivantes, donc une absence y est une preuve d'absence et le scan
+n'a lieu que sur suspicion de conflit. Sa justesse ne dépend que de
+l'invariant de sur-ensemble, jamais de sa précision.
+
+Limite assumée : une ligne en cours de suppression par une transaction
+encore en vol est comptée comme présente. PostgreSQL attendrait cette
+transaction ; sans gestionnaire de verrous pour attendre, refuser est la
+seule réponse qui ne peut pas produire de doublon — trop stricte, jamais
+fausse.
+
+## Passe durcissement crash/corruption (août 2026)
+
+Menée avec une seule question en tête : « impossible de corrompre les
+données, aucun crash possible, et s'il y en a un, un redémarrage et tout
+remarche ». Ce qui a été trouvé et corrigé, dans l'ordre de gravité :
+
+1. **Aucune contrainte d'unicité n'était appliquée** — voir la section
+   ci-dessus, corrigé et prouvé par le replay.
+2. **Une chaîne `OR` plate abattait le process.** 192 termes,
+   quelques kilo-octets de SQL : le parseur ne récursait pas (c'est une
+   boucle), donc son garde de profondeur ne voyait rien, mais l'arbre
+   produit gagnait un niveau par terme et tout le reste le parcourt
+   récursivement. Un débordement de pile *abort* le process — ni
+   `catch_unwind` ni l'isolation par tâche tokio ne le rattrapent. `AND`/`OR`
+   sont désormais pliés en arbre équilibré, l'expansion de `IN (liste)`
+   aussi.
+3. **Un `CASE` imbriqué partait en exponentielle.** `infer()` inférait la
+   première branche pour le type puis toutes les branches pour la
+   nullabilité : `2^profondeur`. 32 niveaux et la connexion ne revenait
+   jamais, en tenant un thread bloquant.
+4. **Le journal grossissait sans borne.** Un seul replay du schéma PawChat
+   laissait 13 Mio de base derrière **5,8 Gio** de journal, parce que rien
+   ne le tronquait avant l'arrêt. Remplir le disque est un crash, et le
+   seul dont la récupération ne sauve pas. `commit` checkpointe désormais
+   au-delà de 64 Mio : quatre replays consécutifs tiennent maintenant dans
+   ~40 Mio de journal au lieu de ~23 Gio.
+5. **Une page corrompue indexait hors bornes.** Le checksum prouve que les
+   octets sont ceux qui ont été écrits, pas qu'ils décrivent une page
+   cohérente ; `slot_count`, `free_end` et l'étendue de chaque slot
+   venaient du disque et indexaient le tampon plus loin. Validés à
+   l'arrivée.
+6. **Rien n'empêchait deux instances sur le même `FERRITE_DATA`.** Verrou
+   exclusif tenu par le noyau sur un handle ouvert — donc relâché même si
+   le process est tué, ce qu'un fichier-verrou ne fait pas.
+
+7. **Le catalogue lui-même n'avait aucune clé unique appliquée.** Il est
+   stocké dans des tables ordinaires, donc rien ne distinguait ses lignes
+   des autres, et la seule garde contre deux lignes nommant une même table
+   était une `HashMap` en mémoire privée à une instance de `SystemCatalog`
+   — laquelle ne peut de toute façon en voir qu'une des deux, et se
+   reconstruit depuis le stockage où le doublon gagne ou perd selon
+   l'ordre d'itération. Le symptôme est déroutant plutôt que
+   manifestement fatal : un `DROP TABLE` qui a l'air de marcher, puis un
+   `CREATE TABLE` refusé en `42710`, parce que le drop a supprimé une
+   ligne et le rechargement a trouvé l'autre. `ferrite_tables`,
+   `ferrite_columns` et `ferrite_indexes` déclarent maintenant leurs clés
+   et passent par la même application atomique que n'importe quelle table
+   utilisateur. Cf. le rapport pour ce que ça ne prouve pas.
+
+Plus : isolation d'un panic à la connexion fautive (avec un vrai
+`ErrorResponse` plutôt qu'une socket qui tombe), timeout d'énoncé et de
+transaction, borne sur le jeu de résultats matérialisé, plafond de
+connexions simultanées.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 

@@ -62,6 +62,7 @@ mod buf;
 mod codec;
 mod config;
 mod error;
+mod guard;
 mod handler;
 pub mod message;
 pub mod mock;
@@ -72,7 +73,7 @@ mod tls;
 pub mod types;
 
 pub use codec::DEFAULT_MAX_MESSAGE_SIZE;
-pub use config::ServerConfig;
+pub use config::{ServerConfig, DEFAULT_MAX_CONNECTIONS};
 pub use error::{sqlstate, ProtocolError, Result};
 pub use handler::{CommandTag, FieldDescription, QueryHandler, QueryResult, StatementDescription};
 pub use message::TransactionStatus;

@@ -167,6 +167,42 @@ aborted `xmax`es are cleared, and versions deleted by a transaction older
 than every live snapshot are discarded. When a chain empties, the key leaves
 the tree.
 
+## Unique constraints
+
+Ferrite has no secondary indexes yet, so there is no B-tree to make a
+duplicate key impossible by construction. `insert_unique`/`update_unique`
+enforce it anyway, and they live behind the `StorageEngine` trait rather
+than above it because two of the guarantees cannot be reconstructed from
+outside:
+
+- **The check ignores the caller's snapshot.** A row committed after the
+  writer's snapshot was taken, or written by a transaction still in flight,
+  is invisible to `scan` — checking through one would let the duplicate in.
+  Uniqueness is a property of the table, which is why PostgreSQL's unique
+  index does not consult a snapshot either.
+- **The check and the write share one acquisition of the engine lock.**
+  Checking first and writing after is a time-of-check/time-of-use race:
+  two transactions inserting the same key would both find nothing.
+
+A version counts as present unless its creator aborted, or its deleter
+committed, or its deleter is the checking transaction itself. A row being
+deleted by a transaction still in flight is therefore counted as present:
+PostgreSQL would wait on that transaction and admit the insert if the
+delete commits, and with no lock manager to wait on, refusing is the only
+answer that cannot produce a duplicate. Over-strict, never wrong.
+
+Scanning the table on every write would make a bulk load quadratic, so a
+negative cache (`src/unique.rs`) sits in front. It holds, per constraint, a
+set of key hashes that is a **superset** of the live keys: a hash it does
+not hold cannot be in the table, and the write proceeds with no scan. A
+hash it does hold only means "look properly". Correctness rests on the
+superset invariant alone — never on precision — so the maintenance rules
+are blunt: a checked write records its hash, a write that skipped the check
+invalidates the table's caches, and a delete needs nothing (removing a row
+only makes the set more of a superset). The cache is per process, capped at
+`StorageConfig::unique_filter_capacity` entries, and rebuilt by one scan on
+first use.
+
 ## Journal
 
 `docs/architecture.md` left the journal format to this crate. Ferrite v1
@@ -186,6 +222,15 @@ over the data file and stops at the first record that fails its length or
 CRC check — the normal signature of a write interrupted by a power cut.
 Records before the tear are unaffected because each is checksummed
 independently.
+
+That covers a tear in the *journal*. A tear in the **data file** — a power
+cut halfway through an 8 KiB page write, leaving some sectors new and the
+rest old — is covered by the same images: recovery overwrites the page
+wholesale rather than patching it, so a half-written page becomes a whole
+one. `tests/recovery.rs` tears a page for real (second half overwritten,
+first half intact) and asserts both halves of the guarantee: repaired when
+the journal still holds its image, and reported as a checksum failure
+rather than served when a checkpoint has already emptied the journal.
 
 **Why full images rather than physiological logging.** Logging operations
 instead of pages writes far less, but it needs per-page LSN comparison during
@@ -214,10 +259,34 @@ the commit bitmap makes it harmless. Two ordering rules make that safe:
 
 `checkpoint()` writes every cached change into the data file, fsyncs it, and
 truncates the journal; after that the data file alone is a complete
-database. It is optional — recovery reaches the same state from the journal
-— but it bounds both recovery time and journal size. The journal is also
+database. Recovery reaches the same state from the journal without it, but
+it bounds both recovery time and journal size — and with full page images
+that size grows fast. Replaying a real application schema once (72 tables,
+938 rows, a few hundred statements) left a 13 MiB database behind a
+**5.8 GiB** journal, because nothing truncated it until shutdown. Filling
+the disk is a crash, and it is the one crash recovery cannot help with, so
+`commit` now checkpoints on its own once the journal passes
+`StorageConfig::checkpoint_journal_bytes` (64 MiB by default). That is safe
+with other transactions still open for the same reason uncommitted work may
+reach the data file at all: the commit bitmap is what makes it invisible. The journal is also
 truncated at the end of recovery, once its records have been applied and the
 data file fsynced.
+
+## The data directory belongs to one process
+
+`FerriteStorage::open` takes an exclusive lock on the directory before it
+touches a single file, and holds it for the life of the engine. Two
+processes on one `FERRITE_DATA` would each replay the journal at startup,
+each cache pages, and each write back a version of a page the other never
+saw; nothing in the page format, the checksums or the journal defends
+against that, because all three assume a single writer.
+
+The lock lives on an open file handle (`share_mode(0)` on Windows,
+`flock(LOCK_EX | LOCK_NB)` on Unix), not on the existence of a file. That
+is the whole point: a lock file created on start and deleted on exit does
+not survive a crash, and the stale one a killed process leaves behind would
+block the very restart recovery exists for. A handle-based lock is released
+by the kernel however the process dies.
 
 The engine does no work in `Drop`. Dropping a `FerriteStorage` therefore
 leaves the files exactly as a power cut would, which is what most of the
@@ -236,12 +305,18 @@ visibility logic, only who may touch a page.
 
 ## Configuration
 
-`StorageConfig` has two knobs: `cache_pages` (default 1024, i.e. 8 MiB) and
-`fsync` (default on). Turning `fsync` off trades durability for speed and is
-only appropriate for data you are willing to lose.
+`StorageConfig` has four knobs: `cache_pages` (default 1024, i.e. 8 MiB),
+`fsync` (default on), `unique_filter_capacity` (default 2^20 hashes per
+constraint), and `checkpoint_journal_bytes` (default 64 MiB, `0` to
+disable). Turning `fsync` off trades durability for speed and is only
+appropriate for data you are willing to lose; lowering the filter capacity
+trades scans for memory and never changes which writes are accepted.
 
 ## Known limitations
 
+- **A unique constraint costs a scan on the first write of each process,
+  and on any write whose key hash the negative cache holds.** A real
+  secondary index removes both.
 - **No node merging.** Deletions leave underfull B-tree nodes in place.
   Space comes back when a table is dropped, not when its rows are.
 - **Aborted DDL leaks pages.** A `create_table` that is rolled back leaves

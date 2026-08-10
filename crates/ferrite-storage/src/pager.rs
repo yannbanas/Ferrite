@@ -428,6 +428,11 @@ impl Pager {
         self.journal.sync()
     }
 
+    /// How large the journal has grown since it was last truncated.
+    pub fn journal_len(&self) -> u64 {
+        self.journal.len()
+    }
+
     /// Records an explicit rollback. Not required for correctness — a
     /// transaction with no commit record is treated as aborted anyway —
     /// but it lets recovery distinguish "rolled back" from "still running

@@ -134,7 +134,22 @@ Ferrite already has, is sufficient. Savepoints are not needed.
 they are SQLite storage-engine knobs with no Postgres equivalent and no
 application-visible semantics to preserve.
 
-## Before production: Ferrite enforces no constraint at all
+## ~~Before production: Ferrite enforces no constraint at all~~ — fixed
+
+**Update (crash/corruption hardening pass).** Everything in this section
+described the state before unique constraints were enforced. They now are:
+a duplicate `PRIMARY KEY` or `UNIQUE` write is refused with SQLSTATE
+`23505`, in series and under concurrency, and the two PawChat `users`
+inserts below are the regression test
+(`crates/ferrite-server/tests/boot.rs`,
+`a_duplicate_primary_key_is_refused_over_the_wire`). The 30 `INSERT OR
+IGNORE` sites and the registration / invite-code / E2E-directory flows are
+safe. `COLLATE NOCASE` on the `username` column is still recorded as a
+plain unique index, so two usernames differing only by case are still
+accepted — see §2 below; that one is unchanged.
+
+The original finding, kept for the record:
+
 
 This is the largest single risk in the port, and it is not a dialect
 question.
@@ -330,16 +345,37 @@ emits, on top of the DDL and DML it already covered:
   `?` with a constant, and rewriting the three flagged `LIKE`s as `ILIKE`.
 
 Replayed against a running `ferrite-server` over the PostgreSQL wire
-protocol:
+protocol, after unique enforcement landed:
 
 ```
-72 tables, 938 rows
-424/426 statements accepted
+72/72 tables, 938/938 rows, read back with the expected row count
+433/435 statements accepted
 ```
 
 The two refusals are the same statement twice (the read set runs before and
 after the migrations): `SELECT lower(hex(randomblob(4))) AS code`, refused
 for the missing `FROM`-less select documented above.
+
+Three of the accepted statements are accepted *because they fail*. They
+carry an `-- @@EXPECT 23505@@` marker and re-insert a row that is already
+in the table, PawChat's own `users` row among them:
+
+```
+ok, = 22       SELECT count(*) FROM "users"
+refused 23505  INSERT INTO "users" ("id", "username", "password", …)
+                 VALUES ('demo-1', 'demo', 'scrypt$…', …)
+ok, = 22       SELECT count(*) FROM "users"
+```
+
+The count either side is what makes it a proof rather than an assertion:
+before enforcement that insert was accepted and the count went to 23.
+
+Enforcement also caught a latent bug in the translator itself. The
+`_after.sql` migration probe — the `INSERT` naming only the columns an
+application has no choice but to supply — copied its values from an
+existing row, primary key included. It was a duplicate-key insert all
+along, and only ever succeeded because nothing enforced the key. It now
+generates a fresh value for every column covered by a key.
 
 Two bugs were found by that replay and by nothing else, both now fixed with
 regression tests:

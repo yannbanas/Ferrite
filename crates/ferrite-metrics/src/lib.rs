@@ -106,6 +106,9 @@ pub enum ErrorKind {
     Protocol,
     ObjectAlreadyExists,
     InvalidDefinition,
+    UniqueViolation,
+    Timeout,
+    ResourceLimit,
 }
 
 impl Label for ErrorKind {
@@ -124,6 +127,9 @@ impl Label for ErrorKind {
         "protocol",
         "object_already_exists",
         "invalid_definition",
+        "unique_violation",
+        "timeout",
+        "resource_limit",
     ];
     const NAME: &'static str = "category";
 
@@ -143,6 +149,9 @@ impl Label for ErrorKind {
             ErrorKind::Protocol => 11,
             ErrorKind::ObjectAlreadyExists => 12,
             ErrorKind::InvalidDefinition => 13,
+            ErrorKind::UniqueViolation => 14,
+            ErrorKind::Timeout => 15,
+            ErrorKind::ResourceLimit => 16,
         }
     }
 }

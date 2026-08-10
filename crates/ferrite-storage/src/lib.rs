@@ -33,8 +33,10 @@ mod clog;
 mod codec;
 mod crc;
 mod engine;
+mod lockfile;
 mod page;
 mod pager;
+mod unique;
 mod version;
 mod wal;
 
@@ -42,7 +44,9 @@ mod wal;
 mod testutil;
 
 pub use engine::{
-    FerriteStorage, StorageConfig, StorageStats, DATA_FILE, JOURNAL_FILE, MAX_TXN_ID,
+    FerriteStorage, StorageConfig, StorageStats, DATA_FILE, DEFAULT_CHECKPOINT_JOURNAL_BYTES,
+    JOURNAL_FILE, MAX_TXN_ID,
 };
+pub use lockfile::LOCK_FILE;
 pub use page::PAGE_SIZE;
 pub use pager::{CLOG_DIRECTORY_CAPACITY, DEFAULT_CACHE_PAGES};

@@ -12,5 +12,12 @@ ferrite-metrics.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Only for `flock` on the data directory. Windows has an exclusive share
+# mode in `std`; Unix has no equivalent, and a lock the kernel releases on
+# process death is the only kind that survives a crash without blocking the
+# restart that follows it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest.workspace = true

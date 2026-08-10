@@ -1,11 +1,13 @@
 //! Single-threaded physical plan executor.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use ferrite_common::{
     Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Row, RowId, Schema,
-    StorageEngine, TableId, TxnId, Value,
+    StorageEngine, TableId, TxnId, UniqueKey, Value,
 };
 use ferrite_planner::{
     JoinType, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey, PhysicalPlan,
@@ -62,6 +64,68 @@ pub struct Session<'a> {
     procs: &'a ProcRegistry,
     indexes: Option<&'a dyn IndexProvider>,
     identity: Identity,
+    limits: Limits,
+    /// When the statement in flight must give up, set by
+    /// [`Session::execute`] and cleared when it returns.
+    deadline: Cell<Option<Instant>>,
+    /// Rows seen since the deadline was last consulted. Checking the clock
+    /// once per row would cost more than the comparison it guards.
+    since_check: Cell<u32>,
+}
+
+/// What one statement is allowed to consume.
+///
+/// Both defaults are deliberately generous rather than absent: a query
+/// that runs forever holds a blocking thread *and* an MVCC snapshot, which
+/// stops every version it can see from being pruned, and a materializing
+/// executor turns one `SELECT *` on a large table into resident memory
+/// proportional to the table. Neither is a bug in the query; both are ways
+/// one client takes the process down for the others.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Rows a single plan node may materialize. `0` means no limit.
+    pub max_rows: usize,
+    /// Wall-clock budget for one statement. `None` means no limit.
+    pub statement_timeout: Option<Duration>,
+}
+
+/// Rows one node may hold. Ten million narrow rows is already gigabytes,
+/// and no interactive query wants them.
+///
+/// The bound is on what a node **materializes**, not on what the client
+/// receives, and the v1 executor materializes every node — so `LIMIT 5`
+/// over a table larger than the budget is still refused: the scan
+/// underneath it collects the whole table first, and there is no limit
+/// pushdown to stop it. A `WHERE` clause *does* help, because a `SeqScan`
+/// filters as it reads. That asymmetry is a consequence of the
+/// materializing execution model (see the crate README), not of this
+/// budget, and it disappears with a pull pipeline.
+pub const DEFAULT_MAX_ROWS: usize = 10_000_000;
+/// Statement budget. Long enough for a report over a large table, short
+/// enough that a runaway query is not permanent.
+pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many rows pass between two reads of the clock.
+const CLOCK_INTERVAL: u32 = 512;
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_MAX_ROWS,
+            statement_timeout: Some(DEFAULT_STATEMENT_TIMEOUT),
+        }
+    }
+}
+
+impl Limits {
+    /// No budget at all. For a caller that enforces its own, and for tests
+    /// that would rather fail than time out.
+    pub fn unlimited() -> Self {
+        Self {
+            max_rows: 0,
+            statement_timeout: None,
+        }
+    }
 }
 
 impl<'a> Session<'a> {
@@ -77,7 +141,16 @@ impl<'a> Session<'a> {
             procs,
             indexes: None,
             identity,
+            limits: Limits::default(),
+            deadline: Cell::new(None),
+            since_check: Cell::new(0),
         }
+    }
+
+    /// Replace the per-statement budget. See [`Limits`].
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Wire up index access. Without one, an `IndexScan` still executes —
@@ -94,6 +167,51 @@ impl<'a> Session<'a> {
     /// Run one statement under `txn`. Permission checks happen first, so a
     /// denied statement never reaches storage.
     pub fn execute(&self, txn: TxnId, plan: &PhysicalPlan) -> Result<QueryResult, FerriteError> {
+        self.deadline
+            .set(self.limits.statement_timeout.map(|d| Instant::now() + d));
+        self.since_check.set(0);
+        let outcome = self.execute_within_budget(txn, plan);
+        self.deadline.set(None);
+        outcome
+    }
+
+    /// Whether the statement still has time. Called from every loop that
+    /// can run long; the clock is read once per [`CLOCK_INTERVAL`] rows,
+    /// so the check costs a counter increment in the common case.
+    fn tick(&self) -> Result<(), FerriteError> {
+        let Some(deadline) = self.deadline.get() else {
+            return Ok(());
+        };
+        let seen = self.since_check.get() + 1;
+        if seen < CLOCK_INTERVAL {
+            self.since_check.set(seen);
+            return Ok(());
+        }
+        self.since_check.set(0);
+        if Instant::now() >= deadline {
+            return Err(FerriteError::Timeout(
+                "the statement ran past its time budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether a node may hold `rows` more.
+    fn admit(&self, rows: usize) -> Result<(), FerriteError> {
+        if self.limits.max_rows == 0 || rows <= self.limits.max_rows {
+            return Ok(());
+        }
+        Err(FerriteError::ResourceLimit(format!(
+            "a query materialized more than {} rows; narrow it with a WHERE clause, or raise              the executor row budget",
+            self.limits.max_rows
+        )))
+    }
+
+    fn execute_within_budget(
+        &self,
+        txn: TxnId,
+        plan: &PhysicalPlan,
+    ) -> Result<QueryResult, FerriteError> {
         // An uncorrelated `IN (SELECT ...)` has one answer for the whole
         // statement, so its subplan runs once here and becomes a plain
         // value test. Plans without one are left untouched.
@@ -125,6 +243,7 @@ impl<'a> Session<'a> {
                 schema,
                 rows,
                 on_conflict,
+                unique,
             } => {
                 self.procs
                     .authorize(self.identity, txn, Permission::Insert)?;
@@ -141,7 +260,15 @@ impl<'a> Session<'a> {
                         .authorize(self.identity, txn, Permission::Update)?;
                 }
                 self.check_schema(*table, table_name, schema)?;
-                self.run_insert(txn, *table, table_name, schema, rows, on_conflict.as_ref())
+                self.run_insert(
+                    txn,
+                    *table,
+                    table_name,
+                    schema,
+                    rows,
+                    on_conflict.as_ref(),
+                    unique,
+                )
             }
 
             PhysicalPlan::Update {
@@ -150,11 +277,12 @@ impl<'a> Session<'a> {
                 schema,
                 source,
                 assignments,
+                unique,
             } => {
                 self.procs
                     .authorize(self.identity, txn, Permission::Update)?;
                 self.check_schema(*table, table_name, schema)?;
-                self.run_update(txn, *table, table_name, schema, source, assignments)
+                self.run_update(txn, *table, table_name, schema, source, assignments, unique)
             }
 
             PhysicalPlan::Delete {
@@ -198,6 +326,12 @@ impl<'a> Session<'a> {
 
     /// Materialize the rows produced by a query node.
     fn stream(&self, txn: TxnId, plan: &PhysicalPlan) -> Result<Vec<Tuple>, FerriteError> {
+        let rows = self.stream_node(txn, plan)?;
+        self.admit(rows.len())?;
+        Ok(rows)
+    }
+
+    fn stream_node(&self, txn: TxnId, plan: &PhysicalPlan) -> Result<Vec<Tuple>, FerriteError> {
         match plan {
             PhysicalPlan::SeqScan {
                 table,
@@ -242,6 +376,7 @@ impl<'a> Session<'a> {
             PhysicalPlan::Filter { input, predicate } => {
                 let mut out = Vec::new();
                 for tuple in self.stream(txn, input)? {
+                    self.tick()?;
                     if eval_predicate(predicate, &tuple.row)? {
                         out.push(tuple);
                     }
@@ -273,7 +408,10 @@ impl<'a> Session<'a> {
             } => {
                 let outer = self.stream(txn, left)?;
                 let inner = self.stream(txn, right)?;
-                nested_loop_join(&outer, &inner, *join_type, predicate.as_ref())
+                // The product of two inputs that each passed the budget on
+                // their own, which is how an accidental cross join between
+                // two thousand-row tables becomes a million rows.
+                self.nested_loop_join(&outer, &inner, *join_type, predicate.as_ref())
             }
 
             PhysicalPlan::Aggregate {
@@ -327,12 +465,14 @@ impl<'a> Session<'a> {
         target: ScanTarget<'_>,
         filter: Option<&PhysExpr>,
     ) -> Result<Vec<Tuple>, FerriteError> {
-        let scanned = self
-            .storage
-            .scan(txn, target.table)?
-            .collect::<Result<Vec<_>, _>>()?;
+        // The scan is consumed row by row rather than collected first:
+        // collecting materializes the whole table before the filter has
+        // rejected any of it, and before either budget has had a chance to
+        // stop it.
         let mut out = Vec::new();
-        for (rid, mut row) in scanned {
+        for entry in self.storage.scan(txn, target.table)? {
+            self.tick()?;
+            let (rid, mut row) = entry?;
             fill_added_columns(target.schema, &mut row);
             let keep = match filter {
                 Some(predicate) => eval_predicate(predicate, &row)?,
@@ -343,6 +483,7 @@ impl<'a> Session<'a> {
                     rid: Some(rid),
                     row,
                 });
+                self.admit(out.len())?;
             }
         }
         Ok(out)
@@ -399,6 +540,7 @@ impl<'a> Session<'a> {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_insert(
         &self,
         txn: TxnId,
@@ -407,6 +549,7 @@ impl<'a> Session<'a> {
         schema: &Schema,
         rows: &[Vec<PhysExpr>],
         on_conflict: Option<&PhysOnConflict>,
+        unique: &[UniqueKey],
     ) -> Result<QueryResult, FerriteError> {
         let empty = Row::new(Vec::new());
         let ctx = self
@@ -417,6 +560,7 @@ impl<'a> Session<'a> {
 
         let mut affected = 0;
         for exprs in rows {
+            self.tick()?;
             let values = exprs
                 .iter()
                 .map(|e| eval(e, &empty))
@@ -439,13 +583,13 @@ impl<'a> Session<'a> {
                     self.conflicting_row(txn, table, schema, &clause.target, &row)?
                 {
                     affected += self.resolve_conflict(
-                        txn, table, table_name, schema, clause, rid, existing, row,
+                        txn, table, table_name, schema, clause, rid, existing, row, unique,
                     )?;
                     continue;
                 }
             }
 
-            self.storage.insert(txn, table, row)?;
+            self.storage.insert_unique(txn, table, row, unique)?;
             affected += 1;
         }
         Ok(QueryResult::Affected(affected))
@@ -456,10 +600,19 @@ impl<'a> Session<'a> {
     ///
     /// This is a scan. Ferrite's storage layer has no secondary indexes
     /// yet (`docs/architecture.md`), so a unique key exists in the catalog
-    /// as metadata but has nothing to probe — and nothing enforces it
-    /// either, which is precisely why the conflict has to be looked for
-    /// rather than caught. The cost is linear in the table, per inserted
-    /// row; it becomes an index probe the day secondary indexes land.
+    /// as metadata but has nothing to probe. It becomes an index probe the
+    /// day secondary indexes land.
+    ///
+    /// It is not the constraint check, and does not replace it. The two
+    /// answer different questions: this one needs the conflicting row
+    /// itself — its `RowId` and its values — so that `DO UPDATE` has
+    /// something to rewrite, which means it can only consider rows this
+    /// transaction can *see*. `StorageEngine::insert_unique` looks past
+    /// the snapshot at rows no transaction could hand back, and refuses.
+    /// So an upsert racing a concurrent insert of the same key does not
+    /// find a row to update here, falls through to the insert, and is
+    /// refused there — a clean `23505` the client can retry, rather than
+    /// the silent duplicate this scan alone would have allowed.
     fn conflicting_row(
         &self,
         txn: TxnId,
@@ -480,6 +633,7 @@ impl<'a> Session<'a> {
             return Ok(None);
         }
         for entry in self.storage.scan(txn, table)? {
+            self.tick()?;
             let (rid, mut row) = entry?;
             fill_added_columns(schema, &mut row);
             if key(&row) == wanted {
@@ -502,6 +656,7 @@ impl<'a> Session<'a> {
         rid: RowId,
         existing: Row,
         excluded: Row,
+        unique: &[UniqueKey],
     ) -> Result<usize, FerriteError> {
         let PhysConflictAction::Update {
             assignments,
@@ -546,10 +701,12 @@ impl<'a> Session<'a> {
             ProcDecision::Replace(row) => row,
         };
         conform_row(schema, &mut updated, table_name)?;
-        self.storage.update(txn, table, rid, updated)?;
+        self.storage
+            .update_unique(txn, table, rid, updated, unique)?;
         Ok(1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_update(
         &self,
         txn: TxnId,
@@ -558,11 +715,13 @@ impl<'a> Session<'a> {
         schema: &Schema,
         source: &PhysicalPlan,
         assignments: &[(usize, PhysExpr)],
+        unique: &[UniqueKey],
     ) -> Result<QueryResult, FerriteError> {
         let targets = self.stream(txn, source)?;
         let mut affected = 0;
 
         for tuple in targets {
+            self.tick()?;
             let rid = tuple
                 .rid
                 .ok_or_else(|| FerriteError::Exec("UPDATE source lost row identity".to_string()))?;
@@ -593,7 +752,7 @@ impl<'a> Session<'a> {
             };
 
             conform_row(schema, &mut row, table_name)?;
-            self.storage.update(txn, table, rid, row)?;
+            self.storage.update_unique(txn, table, rid, row, unique)?;
             affected += 1;
         }
         Ok(QueryResult::Affected(affected))
@@ -610,6 +769,7 @@ impl<'a> Session<'a> {
         let mut affected = 0;
 
         for tuple in targets {
+            self.tick()?;
             let rid = tuple
                 .rid
                 .ok_or_else(|| FerriteError::Exec("DELETE source lost row identity".to_string()))?;
@@ -734,53 +894,60 @@ pub(crate) fn value_key(values: &[Value]) -> String {
 /// Outer rows are emitted in input order; a preserved row with no match is
 /// padded with nulls, and for a `RIGHT`/`FULL` join the unmatched inner
 /// rows follow at the end.
-fn nested_loop_join(
-    outer: &[Tuple],
-    inner: &[Tuple],
-    join_type: JoinType,
-    predicate: Option<&PhysExpr>,
-) -> Result<Vec<Tuple>, FerriteError> {
-    let outer_width = outer.first().map(|t| t.row.values.len()).unwrap_or(0);
-    let inner_width = inner.first().map(|t| t.row.values.len()).unwrap_or(0);
-    let mut matched = vec![false; inner.len()];
-    let mut out = Vec::new();
+impl Session<'_> {
+    fn nested_loop_join(
+        &self,
+        outer: &[Tuple],
+        inner: &[Tuple],
+        join_type: JoinType,
+        predicate: Option<&PhysExpr>,
+    ) -> Result<Vec<Tuple>, FerriteError> {
+        let outer_width = outer.first().map(|t| t.row.values.len()).unwrap_or(0);
+        let inner_width = inner.first().map(|t| t.row.values.len()).unwrap_or(0);
+        let mut matched = vec![false; inner.len()];
+        let mut out = Vec::new();
 
-    for left in outer {
-        let mut any = false;
-        for (position, right) in inner.iter().enumerate() {
-            let joined = concat(&left.row.values, &right.row.values);
-            let keep = match predicate {
-                None => true,
-                Some(predicate) => eval_predicate(predicate, &joined)?,
-            };
-            if keep {
-                any = true;
-                matched[position] = true;
+        for left in outer {
+            let mut any = false;
+            for (position, right) in inner.iter().enumerate() {
+                self.tick()?;
+                let joined = concat(&left.row.values, &right.row.values);
+                let keep = match predicate {
+                    None => true,
+                    Some(predicate) => eval_predicate(predicate, &joined)?,
+                };
+                if keep {
+                    any = true;
+                    matched[position] = true;
+                    out.push(Tuple {
+                        rid: None,
+                        row: joined,
+                    });
+                    self.admit(out.len())?;
+                }
+            }
+            if !any && join_type.preserves_left() {
                 out.push(Tuple {
                     rid: None,
-                    row: joined,
+                    row: concat(&left.row.values, &vec![Value::Null; inner_width]),
                 });
+                self.admit(out.len())?;
             }
         }
-        if !any && join_type.preserves_left() {
-            out.push(Tuple {
-                rid: None,
-                row: concat(&left.row.values, &vec![Value::Null; inner_width]),
-            });
-        }
-    }
 
-    if join_type.preserves_right() {
-        for (position, right) in inner.iter().enumerate() {
-            if !matched[position] {
-                out.push(Tuple {
-                    rid: None,
-                    row: concat(&vec![Value::Null; outer_width], &right.row.values),
-                });
+        if join_type.preserves_right() {
+            for (position, right) in inner.iter().enumerate() {
+                if !matched[position] {
+                    out.push(Tuple {
+                        rid: None,
+                        row: concat(&vec![Value::Null; outer_width], &right.row.values),
+                    });
+                    self.admit(out.len())?;
+                }
             }
         }
+        Ok(out)
     }
-    Ok(out)
 }
 
 fn concat(left: &[Value], right: &[Value]) -> Row {

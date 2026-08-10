@@ -39,6 +39,12 @@ pub enum ProtocolError {
     #[error("connection closed by peer")]
     Closed,
 
+    /// The `QueryHandler` panicked. Contained rather than propagated —
+    /// see `crate::guard` — but not recoverable: whatever state the
+    /// handler holds for this session was left mid-update by the unwind.
+    #[error("internal error: {0}")]
+    HandlerPanic(String),
+
     /// Bubbled up from the `QueryHandler` implementation.
     #[error(transparent)]
     Ferrite(#[from] FerriteError),
@@ -67,6 +73,7 @@ impl ProtocolError {
             ProtocolError::AuthFailed(_) => sqlstate::INVALID_PASSWORD,
             ProtocolError::TlsRequired => sqlstate::INVALID_AUTHORIZATION,
             ProtocolError::Tls(_) => sqlstate::CONNECTION_FAILURE,
+            ProtocolError::HandlerPanic(_) => sqlstate::INTERNAL_ERROR,
             ProtocolError::Ferrite(e) => ferrite_sqlstate(e),
         }
     }
@@ -95,6 +102,9 @@ fn ferrite_sqlstate(err: &FerriteError) -> &'static str {
         FerriteError::Plan(_) | FerriteError::Exec(_) => sqlstate::INTERNAL_ERROR,
         FerriteError::Protocol(_) => sqlstate::PROTOCOL_VIOLATION,
         FerriteError::ObjectAlreadyExists(_) => sqlstate::DUPLICATE_OBJECT,
+        FerriteError::UniqueViolation { .. } => sqlstate::UNIQUE_VIOLATION,
+        FerriteError::Timeout(_) => sqlstate::QUERY_CANCELED,
+        FerriteError::ResourceLimit(_) => sqlstate::PROGRAM_LIMIT_EXCEEDED,
         FerriteError::InvalidDefinition(_) => sqlstate::INVALID_TABLE_DEFINITION,
     }
 }
@@ -119,6 +129,12 @@ pub mod sqlstate {
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const DUPLICATE_OBJECT: &str = "42710";
+    /// A duplicate *row*, not a duplicate schema object. Drivers key an
+    /// application's "already registered" branch off this exact code.
+    pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const QUERY_CANCELED: &str = "57014";
+    pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+    pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 }
 

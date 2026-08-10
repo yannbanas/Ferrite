@@ -55,6 +55,7 @@ impl Scratch {
             StorageConfig {
                 cache_pages: 64,
                 fsync: false,
+                ..Default::default()
             },
         )
     }

@@ -137,7 +137,41 @@ impl Page {
             bytes: Box::new(bytes),
         };
         PageKind::from_u8(page.bytes[12])?;
+        page.validate_layout(page_id)?;
         Ok(page)
+    }
+
+    /// Checks the slot directory against the page it describes.
+    ///
+    /// A checksum proves the bytes are the bytes that were written; it
+    /// proves nothing about whether they describe a coherent page. The
+    /// slot count, the free-space boundary and every slot's extent are all
+    /// read from disk, and every one of them indexes into the page buffer
+    /// somewhere downstream. Validating them once here is the difference
+    /// between a corrupt file being reported and a corrupt file panicking
+    /// the thread that read it.
+    fn validate_layout(&self, page_id: PageId) -> Result<(), FerriteError> {
+        let bad = |what: &str| {
+            Err(FerriteError::Storage(format!(
+                "page {page_id}: corrupt layout, {what}"
+            )))
+        };
+        let count = self.slot_count();
+        let slot_end = HEADER_SIZE + count * SLOT_SIZE;
+        let free_end = self.free_end();
+        if slot_end > PAGE_SIZE {
+            return bad("slot array runs past the end of the page");
+        }
+        if free_end > PAGE_SIZE || free_end < slot_end {
+            return bad("free-space boundary outside the item area");
+        }
+        for index in 0..count {
+            let (offset, len) = self.slot_at(index);
+            if offset < free_end || offset.saturating_add(len) > PAGE_SIZE {
+                return bad("an item lies outside the item area");
+            }
+        }
+        Ok(())
     }
 
     /// Serialises the page, recomputing the checksum over the current
@@ -150,6 +184,9 @@ impl Page {
         out
     }
 
+    /// Every page reaching this either came through
+    /// [`Page::from_bytes`], which rejects an unknown kind, or through
+    /// [`Page::new`], which writes one — so the byte is always a kind.
     pub fn kind(&self) -> PageKind {
         PageKind::from_u8(self.bytes[12]).expect("kind validated on load")
     }
@@ -216,6 +253,10 @@ impl Page {
         self.bytes[base + 2..base + 4].copy_from_slice(&(len as u16).to_le_bytes());
     }
 
+    /// The bytes of one item. In range by construction: `index` always
+    /// comes from [`Page::slot_count`], and the slot it names was checked
+    /// against the page bounds by [`Page::validate_layout`] on the way in
+    /// from disk.
     pub fn item(&self, index: usize) -> &[u8] {
         let (offset, len) = self.slot_at(index);
         &self.bytes[offset..offset + len]
@@ -347,6 +388,48 @@ mod tests {
         // an operator sees it even when the statement that hit it was
         // retried and the error never reached anyone.
         assert!(ferrite_metrics::metrics().checksum_failures_total.get() > before);
+    }
+
+    /// A checksum proves the bytes were not altered on their way to disk.
+    /// It proves nothing about whether they describe a coherent page — a
+    /// page written by a buggy build, or a file someone edited and
+    /// re-signed, passes it. Each of these would have indexed the page
+    /// buffer out of bounds somewhere downstream and panicked the reader.
+    #[test]
+    fn rejects_a_well_checksummed_page_with_an_impossible_layout() {
+        let sign = |mut bytes: [u8; PAGE_SIZE]| {
+            let checksum = crc32c(&bytes[4..]);
+            bytes[..4].copy_from_slice(&checksum.to_le_bytes());
+            bytes
+        };
+        let base = || {
+            let mut page = Page::new(PageKind::Leaf);
+            assert!(page.insert_item(0, b"hello"));
+            page.to_bytes()
+        };
+
+        let mut slots_past_the_page = base();
+        slots_past_the_page[14..16].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(Page::from_bytes(sign(slots_past_the_page), 1).is_err());
+
+        let mut free_end_past_the_page = base();
+        free_end_past_the_page[16..18].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(Page::from_bytes(sign(free_end_past_the_page), 2).is_err());
+
+        let mut item_past_the_page = base();
+        item_past_the_page[HEADER_SIZE..HEADER_SIZE + 2]
+            .copy_from_slice(&(PAGE_SIZE as u16 - 2).to_le_bytes());
+        item_past_the_page[HEADER_SIZE + 2..HEADER_SIZE + 4].copy_from_slice(&64u16.to_le_bytes());
+        assert!(Page::from_bytes(sign(item_past_the_page), 3).is_err());
+
+        let mut item_inside_the_slot_array = base();
+        item_inside_the_slot_array[HEADER_SIZE..HEADER_SIZE + 2]
+            .copy_from_slice(&0u16.to_le_bytes());
+        assert!(Page::from_bytes(sign(item_inside_the_slot_array), 4).is_err());
+
+        // The untouched page still loads, so the check is not simply
+        // refusing everything.
+        assert!(Page::from_bytes(base(), 5).is_ok());
     }
 
     #[test]

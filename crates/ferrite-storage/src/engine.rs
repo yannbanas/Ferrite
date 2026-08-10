@@ -11,19 +11,23 @@
 //! MVCC actually has to get right. Replacing the lock with per-page
 //! latching later changes no visibility logic, only who may touch a page.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use ferrite_common::{FerriteError, Row, RowId, ScanIter, Snapshot, StorageEngine, TableId, TxnId};
+use ferrite_common::{
+    FerriteError, Row, RowId, ScanIter, Snapshot, StorageEngine, TableId, TxnId, UniqueKey,
+};
 
 use crate::btree;
 use crate::clog;
 use crate::clog::TXNS_PER_CLOG_PAGE;
 use crate::codec::{decode_row, encode_row};
+use crate::lockfile::DirectoryLock;
 use crate::page::{PageId, PageKind, NO_PAGE};
 use crate::pager::{Pager, CLOG_DIRECTORY_CAPACITY, DEFAULT_CACHE_PAGES};
+use crate::unique::{hash_key, KeyFilters, DEFAULT_FILTER_CAPACITY};
 use crate::version::{decode_chain, encode_chain, Version, NO_TXN};
 
 pub const DATA_FILE: &str = "ferrite.db";
@@ -54,6 +58,12 @@ pub struct StorageStats {
     pub oldest_txn: Option<(TxnId, Duration)>,
 }
 
+/// Journal size that triggers an automatic checkpoint. 64 MiB is roughly
+/// eight thousand page images: often enough that the journal never becomes
+/// the largest thing on the disk, rare enough that the fsync it costs is
+/// amortised over thousands of commits.
+pub const DEFAULT_CHECKPOINT_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Tunables for [`FerriteStorage::open_with`].
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -63,6 +73,22 @@ pub struct StorageConfig {
     /// off trades durability for speed and is only appropriate for
     /// throwaway data; it is on by default.
     pub fsync: bool,
+    /// Hashes kept per unique constraint before the negative cache stops
+    /// trying to prove absence — see `src/unique.rs`. Lowering it trades
+    /// memory for scans; it never affects which writes are accepted.
+    pub unique_filter_capacity: usize,
+    /// Journal size past which a commit also checkpoints, in bytes.
+    ///
+    /// Without this the journal only shrinks on an orderly shutdown, and a
+    /// physical journal of *full page images* grows fast: replaying a real
+    /// application schema — 72 tables, 938 rows, a few hundred statements —
+    /// left a 13 MiB database behind a **5.8 GiB** journal. A long-running
+    /// server fills the disk, and filling the disk is a crash, and the
+    /// recovery that follows has to replay all of it.
+    ///
+    /// `0` disables the automatic checkpoint, which is only reasonable for
+    /// a process that will not run long.
+    pub checkpoint_journal_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -70,6 +96,8 @@ impl Default for StorageConfig {
         Self {
             cache_pages: DEFAULT_CACHE_PAGES,
             fsync: true,
+            unique_filter_capacity: DEFAULT_FILTER_CAPACITY,
+            checkpoint_journal_bytes: DEFAULT_CHECKPOINT_JOURNAL_BYTES,
         }
     }
 }
@@ -96,12 +124,18 @@ struct TxnState {
 struct Inner {
     pager: Pager,
     active: HashMap<TxnId, TxnState>,
+    filters: KeyFilters,
 }
 
 /// Page-based, journalled, MVCC storage engine.
 pub struct FerriteStorage {
     inner: Mutex<Inner>,
     dir: PathBuf,
+    checkpoint_journal_bytes: u64,
+    /// Held for the life of the engine. Two processes writing one data
+    /// directory is corruption nothing else in this crate defends
+    /// against — see `src/lockfile.rs`.
+    _lock: DirectoryLock,
 }
 
 impl FerriteStorage {
@@ -115,6 +149,10 @@ impl FerriteStorage {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)
             .map_err(|e| FerriteError::Storage(format!("creating {}: {e}", dir.display())))?;
+        // Before the files are touched, not after: recovery replays the
+        // journal on open, and two processes replaying it at once is
+        // exactly the case this refuses.
+        let lock = DirectoryLock::acquire(&dir)?;
         let mut pager = Pager::open(
             &dir.join(DATA_FILE),
             &dir.join(JOURNAL_FILE),
@@ -129,8 +167,11 @@ impl FerriteStorage {
             inner: Mutex::new(Inner {
                 pager,
                 active: HashMap::new(),
+                filters: KeyFilters::new(config.unique_filter_capacity),
             }),
             dir,
+            checkpoint_journal_bytes: config.checkpoint_journal_bytes,
+            _lock: lock,
         })
     }
 
@@ -164,10 +205,23 @@ impl FerriteStorage {
         self.lock()?.pager.checkpoint()
     }
 
+    /// The engine lock, or an error once a panic has poisoned it.
+    ///
+    /// Poisoning is not cleared. A panic inside a page mutation can leave
+    /// a half-updated page in the cache, and flushing that later is
+    /// exactly the corruption this engine exists to prevent — so the
+    /// database refuses to serve anything more, and a restart replays the
+    /// journal onto a known-good state. That is a deliberate trade of
+    /// availability for correctness, and the log line says so, because
+    /// "storage lock poisoned" on every subsequent query is otherwise a
+    /// mystery.
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, FerriteError> {
-        self.inner
-            .lock()
-            .map_err(|_| FerriteError::Storage("storage lock poisoned by a previous panic".into()))
+        self.inner.lock().map_err(|_| {
+            tracing::error!(
+                "the storage engine's lock is poisoned: a panic left a page mid-update, so                  this process will refuse every further statement. Restart it — recovery                  replays the journal onto the last consistent state."
+            );
+            FerriteError::Storage("storage lock poisoned by a previous panic".into())
+        })
     }
 
     fn scan_step(
@@ -387,6 +441,126 @@ impl Inner {
         Ok(())
     }
 
+    /// The version of a chain a unique constraint has to reckon with, or
+    /// `None` when the row is gone as far as constraints are concerned.
+    ///
+    /// This deliberately ignores the reader's snapshot. A unique key is a
+    /// property of the *table*, not of one transaction's view of it: a row
+    /// committed after our snapshot, or one a concurrent transaction has
+    /// written but not yet committed, would be invisible to `scan` and
+    /// would let a duplicate through. PostgreSQL's unique index does the
+    /// same thing for the same reason.
+    ///
+    /// The rules, newest version first:
+    ///
+    /// - a version whose creator aborted never existed; keep looking;
+    /// - a version deleted by *this* transaction is gone for us, so a
+    ///   delete-then-insert of the same key inside one transaction works;
+    /// - a version whose deleter aborted is alive again;
+    /// - a version whose deleter committed is gone;
+    /// - a version being deleted by a transaction still in flight is
+    ///   treated as **present**. PostgreSQL would wait for that
+    ///   transaction and let the insert through if the delete commits;
+    ///   without a lock manager to wait on, refusing is the answer that
+    ///   cannot produce a duplicate. It is over-strict, never wrong.
+    fn constraint_version(
+        &mut self,
+        txn: TxnId,
+        chain: &[Version],
+    ) -> Result<Option<Vec<u8>>, FerriteError> {
+        for version in chain {
+            if self.is_aborted(version.xmin)? {
+                continue;
+            }
+            if version.xmax == NO_TXN || self.is_aborted(version.xmax)? {
+                return Ok(Some(version.bytes.clone()));
+            }
+            if version.xmax == txn || !self.active.contains_key(&version.xmax) {
+                return Ok(None);
+            }
+            return Ok(Some(version.bytes.clone()));
+        }
+        Ok(None)
+    }
+
+    /// Walks every row of a table as a unique constraint sees it. `visit`
+    /// returns `false` to stop early.
+    fn walk_for_constraints(
+        &mut self,
+        txn: TxnId,
+        root: PageId,
+        visit: &mut dyn FnMut(RowId, &Row) -> Result<bool, FerriteError>,
+    ) -> Result<(), FerriteError> {
+        let mut cursor = 0u64;
+        loop {
+            let Some((key, payload)) = btree::seek(&mut self.pager, root, cursor)? else {
+                return Ok(());
+            };
+            let chain = decode_chain(&payload)?;
+            if let Some(bytes) = self.constraint_version(txn, &chain)? {
+                if !visit(key, &decode_row(&bytes)?)? {
+                    return Ok(());
+                }
+            }
+            match key.checked_add(1) {
+                Some(next) => cursor = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Refuses `row` if any constraint in `unique` is already matched.
+    /// `exclude` is the row being updated, which does not conflict with
+    /// itself.
+    ///
+    /// Called with the engine lock held and immediately before the write
+    /// it guards, so nothing can slip a colliding row in between.
+    fn enforce_unique(
+        &mut self,
+        txn: TxnId,
+        table: TableId,
+        root: PageId,
+        unique: &[UniqueKey],
+        row: &Row,
+        exclude: Option<RowId>,
+    ) -> Result<(), FerriteError> {
+        for constraint in unique {
+            let Some(wanted) = constraint.extract(row) else {
+                continue;
+            };
+            let hash = hash_key(&wanted);
+
+            if !self.filters.is_built(table, &constraint.columns) {
+                let mut hashes = HashSet::new();
+                let columns = constraint.clone();
+                self.walk_for_constraints(txn, root, &mut |_, existing| {
+                    if let Some(key) = columns.extract(existing) {
+                        hashes.insert(hash_key(&key));
+                    }
+                    Ok(true)
+                })?;
+                self.filters.build(table, &constraint.columns, hashes);
+            }
+
+            if self.filters.may_contain(table, &constraint.columns, hash) {
+                let mut clash = false;
+                let columns = constraint.clone();
+                self.walk_for_constraints(txn, root, &mut |rid, existing| {
+                    if Some(rid) != exclude && columns.extract(existing).as_ref() == Some(&wanted) {
+                        clash = true;
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })?;
+                if clash {
+                    return Err(constraint.violation(&wanted));
+                }
+            }
+            self.filters.note(table, &constraint.columns, hash);
+        }
+        Ok(())
+    }
+
     /// Shared write-conflict check for update, delete and drop table.
     ///
     /// Returns the live version this transaction is allowed to supersede.
@@ -452,6 +626,18 @@ impl StorageEngine for FerriteStorage {
         inner.pager.commit_to_journal(txn)?;
         let state = inner.active.remove(&txn).expect("presence checked above");
 
+        // Fold the journal into the data file once it has grown past its
+        // budget. A checkpoint is safe with other transactions still open:
+        // uncommitted work is allowed to reach the data file, and the
+        // commit bitmap is what makes it invisible.
+        if self.checkpoint_journal_bytes > 0
+            && inner.pager.journal_len() >= self.checkpoint_journal_bytes
+        {
+            let before = inner.pager.journal_len();
+            inner.pager.checkpoint()?;
+            tracing::debug!(before, "journal checkpointed automatically");
+        }
+
         if !state.dropped.is_empty() && inner.active.is_empty() {
             // Reclaiming a dropped table's pages is only safe with no other
             // snapshot around, since v1 has no lock manager to keep a
@@ -495,19 +681,57 @@ impl StorageEngine for FerriteStorage {
     }
 
     fn insert(&self, txn: TxnId, table: TableId, row: Row) -> Result<RowId, FerriteError> {
+        self.insert_unique(txn, table, row, &[])
+    }
+
+    fn update(&self, txn: TxnId, table: TableId, row: RowId, new: Row) -> Result<(), FerriteError> {
+        self.update_unique(txn, table, row, new, &[])
+    }
+
+    /// Checks every constraint and writes the row under a single
+    /// acquisition of the engine lock, which is what makes two concurrent
+    /// inserts of the same key unable to both succeed.
+    ///
+    /// An empty `unique` is an ordinary insert, and says so to the key
+    /// filters: a write that skipped the check cannot be allowed to leave
+    /// a filter claiming the key is absent.
+    fn insert_unique(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        row: Row,
+        unique: &[UniqueKey],
+    ) -> Result<RowId, FerriteError> {
         let mut inner = self.lock()?;
         let snapshot = inner.snapshot_of(txn)?;
         let table_ref = inner.table_ref(&snapshot, table)?;
+        if unique.is_empty() {
+            inner.filters.invalidate(table);
+        } else {
+            inner.enforce_unique(txn, table, table_ref.root, unique, &row, None)?;
+        }
         let row_id = inner.alloc_row_id(table_ref.header)?;
         let chain = vec![Version::live(txn, encode_row(&row))];
         inner.store_chain(Some(table_ref.header), table_ref.root, row_id, &chain)?;
         Ok(row_id)
     }
 
-    fn update(&self, txn: TxnId, table: TableId, row: RowId, new: Row) -> Result<(), FerriteError> {
+    fn update_unique(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        row: RowId,
+        new: Row,
+        unique: &[UniqueKey],
+    ) -> Result<(), FerriteError> {
         let mut inner = self.lock()?;
         let snapshot = inner.snapshot_of(txn)?;
         let table_ref = inner.table_ref(&snapshot, table)?;
+        if unique.is_empty() {
+            inner.filters.invalidate(table);
+        } else {
+            inner.enforce_unique(txn, table, table_ref.root, unique, &new, Some(row))?;
+        }
         let chain = inner.load_chain(table_ref.root, row)?;
         let mut chain = inner.prune(chain)?;
         inner.writable_version(&snapshot, &chain)?;
@@ -582,6 +806,9 @@ impl StorageEngine for FerriteStorage {
             }
         }
 
+        // A table id can be handed out again after a drop, so anything the
+        // filters remember about the previous occupant has to go.
+        inner.filters.invalidate(table);
         let header = inner.pager.alloc_page(PageKind::TableHeader)?;
         let root = btree::create(&mut inner.pager)?;
         inner.pager.with_page_mut(header, |p| {
@@ -622,6 +849,7 @@ impl StorageEngine for FerriteStorage {
                 .unwrap(),
         );
         inner.store_chain(None, catalog_root, table as u64, &chain)?;
+        inner.filters.invalidate(table);
         if let Some(state) = inner.active.get_mut(&txn) {
             state.dropped.push(header);
         }

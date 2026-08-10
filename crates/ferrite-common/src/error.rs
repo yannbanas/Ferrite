@@ -35,6 +35,28 @@ pub enum FerriteError {
     /// instead of a generic internal error.
     #[error("already exists: {0}")]
     ObjectAlreadyExists(String),
+    /// A write would have put two rows with the same key in a table
+    /// carrying a `PRIMARY KEY` or `UNIQUE` constraint.
+    ///
+    /// Deliberately not `ObjectAlreadyExists`: that one is the
+    /// `42710`-class "a *schema object* of this name exists" and is what a
+    /// duplicate `CREATE` raises. A duplicate *row* is SQLSTATE `23505`,
+    /// and every mainstream driver (`sqlx`, node-postgres, JDBC) keys the
+    /// "already registered" branch of an application off that code
+    /// specifically. Collapsing the two would make a duplicate username
+    /// indistinguishable from a duplicate table name on the wire.
+    #[error("duplicate key value violates unique constraint {constraint:?}: ({key})")]
+    UniqueViolation { constraint: String, key: String },
+    /// A statement or transaction ran past its configured time budget and
+    /// was abandoned. Retryable, like a serialization failure.
+    #[error("canceling statement due to timeout: {0}")]
+    Timeout(String),
+    /// A statement asked for more memory than the executor is allowed to
+    /// materialize. Refusing is the point: an unbounded result set is how
+    /// one pathological query takes the process down for every other
+    /// connection too.
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
     /// A schema/DDL definition is well-formed SQL but not a valid object —
     /// e.g. a `PRIMARY KEY` naming a column that doesn't exist, a `CHECK`
     /// referencing an unknown function. Distinct from `Parse` (syntax) and
