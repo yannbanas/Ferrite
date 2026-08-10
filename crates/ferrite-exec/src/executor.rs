@@ -7,7 +7,9 @@ use ferrite_common::{
     Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Row, RowId, Schema,
     StorageEngine, TableId, TxnId, Value,
 };
-use ferrite_planner::{JoinType, PhysExpr, PhysSortKey, PhysicalPlan};
+use ferrite_planner::{
+    JoinType, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey, PhysicalPlan,
+};
 use ferrite_proc::{ProcDecision, ProcRegistry, TriggerEvent};
 
 use crate::eval::{compare, eval, eval_predicate};
@@ -98,11 +100,24 @@ impl<'a> Session<'a> {
                 table_name,
                 schema,
                 rows,
+                on_conflict,
             } => {
                 self.procs
                     .authorize(self.identity, txn, Permission::Insert)?;
+                // An upsert can write an existing row, so it needs the
+                // permission an `UPDATE` would need as well.
+                if matches!(
+                    on_conflict,
+                    Some(PhysOnConflict {
+                        action: PhysConflictAction::Update { .. },
+                        ..
+                    })
+                ) {
+                    self.procs
+                        .authorize(self.identity, txn, Permission::Update)?;
+                }
                 self.check_schema(*table, table_name, schema)?;
-                self.run_insert(txn, *table, table_name, schema, rows)
+                self.run_insert(txn, *table, table_name, schema, rows, on_conflict.as_ref())
             }
 
             PhysicalPlan::Update {
@@ -367,6 +382,7 @@ impl<'a> Session<'a> {
         table_name: &str,
         schema: &Schema,
         rows: &[Vec<PhysExpr>],
+        on_conflict: Option<&PhysOnConflict>,
     ) -> Result<QueryResult, FerriteError> {
         let empty = Row::new(Vec::new());
         let ctx = self
@@ -393,10 +409,121 @@ impl<'a> Session<'a> {
             };
 
             conform_row(schema, &mut row, table_name)?;
+
+            if let Some(clause) = on_conflict {
+                if let Some((rid, existing)) =
+                    self.conflicting_row(txn, table, schema, &clause.target, &row)?
+                {
+                    affected += self.resolve_conflict(
+                        txn, table, table_name, schema, clause, rid, existing, row,
+                    )?;
+                    continue;
+                }
+            }
+
             self.storage.insert(txn, table, row)?;
             affected += 1;
         }
         Ok(QueryResult::Affected(affected))
+    }
+
+    /// The row already in `table` whose `target` columns equal the
+    /// candidate's, if there is one.
+    ///
+    /// This is a scan. Ferrite's storage layer has no secondary indexes
+    /// yet (`docs/architecture.md`), so a unique key exists in the catalog
+    /// as metadata but has nothing to probe — and nothing enforces it
+    /// either, which is precisely why the conflict has to be looked for
+    /// rather than caught. The cost is linear in the table, per inserted
+    /// row; it becomes an index probe the day secondary indexes land.
+    fn conflicting_row(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        schema: &Schema,
+        target: &[usize],
+        candidate: &Row,
+    ) -> Result<Option<(RowId, Row)>, FerriteError> {
+        let key = |row: &Row| -> Vec<Value> {
+            target
+                .iter()
+                .map(|p| row.values.get(*p).cloned().unwrap_or(Value::Null))
+                .collect()
+        };
+        let wanted = key(candidate);
+        // A null never collides, the same rule a unique index follows.
+        if wanted.iter().any(Value::is_null) {
+            return Ok(None);
+        }
+        for entry in self.storage.scan(txn, table)? {
+            let (rid, mut row) = entry?;
+            fill_added_columns(schema, &mut row);
+            if key(&row) == wanted {
+                return Ok(Some((rid, row)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Apply `DO NOTHING` or `DO UPDATE` to a row that already exists.
+    /// Returns how many rows the statement should count.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_conflict(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        table_name: &str,
+        schema: &Schema,
+        clause: &PhysOnConflict,
+        rid: RowId,
+        existing: Row,
+        excluded: Row,
+    ) -> Result<usize, FerriteError> {
+        let PhysConflictAction::Update {
+            assignments,
+            selection,
+        } = &clause.action
+        else {
+            return Ok(0);
+        };
+
+        // Assignments read the existing row followed by the excluded one,
+        // which is the row shape the planner bound them against.
+        let mut combined = existing.clone();
+        combined.values.extend(excluded.values);
+        if let Some(predicate) = selection {
+            if !eval_predicate(predicate, &combined)? {
+                return Ok(0);
+            }
+        }
+
+        let mut candidate = existing.clone();
+        for (position, expr) in assignments {
+            let value = eval(expr, &combined)?;
+            *candidate
+                .values
+                .get_mut(*position)
+                .ok_or_else(|| FerriteError::Exec(format!("column {position} out of range")))? =
+                value;
+        }
+
+        let ctx = self
+            .procs
+            .context(self.identity, txn)
+            .with_table(table, table_name)
+            .with_event(TriggerEvent::Update)
+            .with_old_row(&existing);
+        let mut updated = match self
+            .procs
+            .fire_before(&ctx, TriggerEvent::Update, &candidate)?
+        {
+            ProcDecision::Skip => return Ok(0),
+            ProcDecision::Allow => candidate,
+            ProcDecision::Replace(row) => row,
+        };
+        conform_row(schema, &mut updated, table_name)?;
+        self.storage.update(txn, table, rid, updated)?;
+        Ok(1)
     }
 
     fn run_update(

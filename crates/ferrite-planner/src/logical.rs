@@ -102,6 +102,7 @@ pub enum LogicalPlan {
         source: TableSource,
         /// One entry per table column, in schema order.
         rows: Vec<Vec<Expr>>,
+        on_conflict: Option<OnConflict>,
     },
     Update {
         source: TableSource,
@@ -213,4 +214,27 @@ pub fn combine_conjunction(mut preds: Vec<Expr>) -> Option<Expr> {
         acc = Expr::and(acc, p);
     }
     Some(acc)
+}
+
+/// What to do with a row that collides with an existing one on
+/// [`OnConflict::target`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// Column positions, in schema order, that decide whether two rows
+    /// collide.
+    pub target: Vec<usize>,
+    pub action: ConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    Nothing,
+    /// Assignments and the optional `WHERE` are expressed over a row made
+    /// of the existing row followed by the row the insert would have
+    /// written, so `excluded.col` is just a column reference into the
+    /// second half — the same shape a join produces.
+    Update {
+        assignments: Vec<(usize, Expr)>,
+        selection: Option<Expr>,
+    },
 }

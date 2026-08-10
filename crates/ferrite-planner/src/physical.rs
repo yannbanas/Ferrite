@@ -60,6 +60,24 @@ pub struct PhysAggregate {
     pub distinct: bool,
 }
 
+/// [`crate::logical::OnConflict`] with its expressions bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysOnConflict {
+    pub target: Vec<usize>,
+    pub action: PhysConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhysConflictAction {
+    Nothing,
+    /// Bound against the existing row followed by the excluded row, so a
+    /// position past the table's width reads the excluded half.
+    Update {
+        assignments: Vec<(usize, PhysExpr)>,
+        selection: Option<PhysExpr>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysSortKey {
     pub expr: PhysExpr,
@@ -407,6 +425,7 @@ pub enum PhysicalPlan {
         schema: Schema,
         /// One `PhysExpr` per table column, in schema order.
         rows: Vec<Vec<PhysExpr>>,
+        on_conflict: Option<PhysOnConflict>,
     },
     Update {
         table: TableId,

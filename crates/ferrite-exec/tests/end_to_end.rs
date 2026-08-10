@@ -548,3 +548,161 @@ fn a_plan_built_against_an_older_schema_is_rejected() {
     let result = Session::new(&storage, &catalog, &procs, OWNER).execute(1, &plan);
     assert!(matches!(result, Err(FerriteError::Plan(_))));
 }
+
+#[test]
+fn insert_or_ignore_leaves_the_existing_row_alone() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let again = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR IGNORE INTO users VALUES (1, 'imposter', 99)",
+    )
+    .unwrap();
+    assert_eq!(again, QueryResult::Affected(0));
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].values[1], Value::Text("ada".into()));
+}
+
+#[test]
+fn insert_or_ignore_still_inserts_a_row_that_does_not_collide() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let fresh = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR IGNORE INTO users VALUES (3, 'alan', 41)",
+    )
+    .unwrap();
+    assert_eq!(fresh, QueryResult::Affected(1));
+    assert_eq!(storage.dump(table).len(), 3);
+}
+
+#[test]
+fn on_conflict_do_update_reads_the_excluded_row() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let upsert = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'ada lovelace', 37) \
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = excluded.age",
+    )
+    .unwrap();
+    assert_eq!(upsert, QueryResult::Affected(1));
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].values[1], Value::Text("ada lovelace".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(37));
+}
+
+#[test]
+fn do_update_keeps_the_columns_the_statement_does_not_assign() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'ada k', 99) ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+    )
+    .unwrap();
+
+    let stored = storage.dump(table);
+    assert_eq!(stored[0].values[1], Value::Text("ada k".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(36), "age was not assigned");
+}
+
+#[test]
+fn insert_or_replace_writes_every_named_column() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR REPLACE INTO users (id, name, age) VALUES (1, 'ada b', 38)",
+    )
+    .unwrap();
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2, "replaced in place, not duplicated");
+    assert_eq!(stored[0].values[1], Value::Text("ada b".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(38));
+}
+
+#[test]
+fn do_update_where_can_decline_the_update() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let declined = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'nope', 1) \
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE excluded.age > users.age",
+    )
+    .unwrap();
+    assert_eq!(declined, QueryResult::Affected(0));
+    assert_eq!(storage.dump(table)[0].values[1], Value::Text("ada".into()));
+}
+
+#[test]
+fn an_upsert_needs_update_permission_as_well_as_insert() {
+    let (storage, catalog, _) = setup();
+    let mut procs = full_access();
+    procs.grant_role(
+        GUEST,
+        Role {
+            name: "writer".into(),
+            permissions: vec![Permission::Select, Permission::Insert],
+        },
+    );
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let denied = run(
+        &storage,
+        &catalog,
+        &procs,
+        GUEST,
+        "INSERT INTO users VALUES (1, 'x', 1) ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+    );
+    assert!(matches!(denied, Err(FerriteError::PermissionDenied(_))));
+}
+
+#[test]
+fn on_conflict_without_a_target_needs_a_unique_key_to_be_known() {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table("public", "users", users_schema())
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+
+    let error = plan_of(&catalog, "INSERT OR IGNORE INTO users VALUES (1, 'a', 2)").unwrap_err();
+    assert!(error.to_string().contains("no unique key"), "{error}");
+}

@@ -41,9 +41,13 @@ pub mod scalar;
 pub mod scope;
 
 pub use expr::{AggregateCall, AggregateFunc, BinaryOp, ColumnRef, Expr};
-pub use logical::{JoinType, LogicalPlan, ProjectionItem, SortKey, TableSource};
+pub use logical::{
+    ConflictAction, JoinType, LogicalPlan, OnConflict, ProjectionItem, SortKey, TableSource,
+};
 pub use lower::typecheck_defaults;
-pub use physical::{bind, PhysAggregate, PhysExpr, PhysSortKey, PhysicalPlan};
+pub use physical::{
+    bind, PhysAggregate, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey, PhysicalPlan,
+};
 pub use planner::{Planner, DEFAULT_NAMESPACE};
 pub use rules::optimize;
 pub use scalar::ScalarFunc;

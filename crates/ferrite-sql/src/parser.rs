@@ -721,6 +721,7 @@ impl Parser {
 
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.expect_keyword(Keyword::Insert)?;
+        let sqlite_prefix = self.parse_conflict_prefix()?;
         self.expect_keyword(Keyword::Into)?;
         let table = self.parse_object_name()?;
         let columns = if self.peek() == &Token::LParen && !self.starts_subquery_after_lparen() {
@@ -755,12 +756,88 @@ impl Parser {
             InsertSource::Query(Box::new(self.parse_query()?))
         };
 
+        let on_conflict = match self.parse_on_conflict()? {
+            Some(clause) => Some(clause),
+            None => sqlite_prefix.map(|prefix| prefix.into_on_conflict(&columns)),
+        };
         let returning = self.parse_returning()?;
         Ok(Statement::Insert(Insert {
             table,
             columns,
             source,
             returning,
+            on_conflict,
+        }))
+    }
+
+    /// SQLite's `INSERT OR <resolution>` prefix.
+    ///
+    /// `IGNORE` and `REPLACE` have `ON CONFLICT` equivalents and are
+    /// rewritten into them once the column list is known. `ABORT`, `FAIL`
+    /// and `ROLLBACK` all end the statement with an error, which is what
+    /// Ferrite does without being asked, so they lower to nothing.
+    fn parse_conflict_prefix(&mut self) -> Result<Option<SqliteConflictPrefix>, ParseError> {
+        if !self.eat_keyword(Keyword::Or) {
+            return Ok(None);
+        }
+        let resolution = match self.peek() {
+            Token::Keyword(Keyword::Replace) => {
+                self.advance();
+                "replace".to_string()
+            }
+            Token::Keyword(Keyword::Rollback) => {
+                self.advance();
+                "rollback".to_string()
+            }
+            _ => self.parse_identifier()?,
+        };
+        match resolution.to_ascii_lowercase().as_str() {
+            "ignore" => Ok(Some(SqliteConflictPrefix::Ignore)),
+            "replace" => Ok(Some(SqliteConflictPrefix::Replace)),
+            "abort" | "fail" | "rollback" => Ok(None),
+            other => self.err(format!("`INSERT OR {other}` is not a conflict resolution")),
+        }
+    }
+
+    fn parse_on_conflict(&mut self) -> Result<Option<OnConflict>, ParseError> {
+        if !self.eat_keywords(&[Keyword::On, Keyword::Conflict]) {
+            return Ok(None);
+        }
+        let target = match self.peek() {
+            Token::LParen => self.parse_column_list()?,
+            _ => Vec::new(),
+        };
+        self.expect_keyword(Keyword::Do)?;
+        if self.eat_keyword(Keyword::Nothing) {
+            return Ok(Some(OnConflict {
+                target,
+                action: InsertConflictAction::Nothing,
+            }));
+        }
+        self.expect_keyword(Keyword::Update)?;
+        self.expect_keyword(Keyword::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_identifier()?;
+            self.expect(&Token::Eq)?;
+            assignments.push(Assignment {
+                column,
+                value: self.parse_expr()?,
+            });
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        let selection = match self.eat_keyword(Keyword::Where) {
+            true => Some(self.parse_expr()?),
+            false => None,
+        };
+        Ok(Some(OnConflict {
+            target,
+            action: InsertConflictAction::Update {
+                assignments,
+                selection,
+            },
         }))
     }
 

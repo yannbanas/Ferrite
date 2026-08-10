@@ -898,3 +898,114 @@ fn long_flat_input_still_parses() {
     let sql = format!("SELECT 1 FROM t WHERE {}", terms.join(" OR "));
     assert!(parse(&sql).is_ok());
 }
+
+#[test]
+fn insert_or_ignore_becomes_on_conflict_do_nothing() {
+    let Statement::Insert(insert) =
+        parse_statement("INSERT OR IGNORE INTO t (a, b) VALUES (1, 2)").unwrap()
+    else {
+        panic!("expected an INSERT");
+    };
+    let clause = insert
+        .on_conflict
+        .expect("OR IGNORE sets a conflict clause");
+    assert!(clause.target.is_empty(), "the target is inferred later");
+    assert_eq!(clause.action, InsertConflictAction::Nothing);
+}
+
+#[test]
+fn insert_or_replace_becomes_do_update_over_the_named_columns() {
+    let Statement::Insert(insert) =
+        parse_statement("INSERT OR REPLACE INTO t (a, b) VALUES (1, 2)").unwrap()
+    else {
+        panic!("expected an INSERT");
+    };
+    let InsertConflictAction::Update { assignments, .. } = insert.on_conflict.unwrap().action
+    else {
+        panic!("expected DO UPDATE");
+    };
+    let columns: Vec<&str> = assignments.iter().map(|a| a.column.as_str()).collect();
+    assert_eq!(columns, ["a", "b"]);
+    assert_eq!(
+        assignments[0].value,
+        Expr::Column(ObjectName(vec!["excluded".into(), "a".into()]))
+    );
+}
+
+#[test]
+fn insert_or_abort_carries_no_clause_because_ferrite_aborts_anyway() {
+    for sql in [
+        "INSERT OR ABORT INTO t (a) VALUES (1)",
+        "INSERT OR FAIL INTO t (a) VALUES (1)",
+        "INSERT OR ROLLBACK INTO t (a) VALUES (1)",
+    ] {
+        let Statement::Insert(insert) = parse_statement(sql).unwrap() else {
+            panic!("expected an INSERT");
+        };
+        assert_eq!(insert.on_conflict, None, "{sql}");
+    }
+}
+
+#[test]
+fn on_conflict_takes_a_target_a_do_update_and_a_where() {
+    let Statement::Insert(insert) = parse_statement(
+        "INSERT INTO t (a, b) VALUES (1, 2) \
+         ON CONFLICT (a, b) DO UPDATE SET b = excluded.b WHERE t.b < excluded.b",
+    )
+    .unwrap() else {
+        panic!("expected an INSERT");
+    };
+    let clause = insert.on_conflict.unwrap();
+    assert_eq!(clause.target, ["a", "b"]);
+    let InsertConflictAction::Update {
+        assignments,
+        selection,
+    } = clause.action
+    else {
+        panic!("expected DO UPDATE");
+    };
+    assert_eq!(assignments.len(), 1);
+    assert!(selection.is_some());
+}
+
+#[test]
+fn ilike_and_collate_parse_as_their_own_nodes() {
+    let Statement::Query(query) =
+        parse_statement("SELECT * FROM t WHERE a ILIKE 'x%' AND b = 'y' COLLATE NOCASE").unwrap()
+    else {
+        panic!("expected a query");
+    };
+    let rendered = format!("{query:?}");
+    assert!(rendered.contains("case_insensitive: true"), "{rendered}");
+    assert!(rendered.contains("Collate"), "{rendered}");
+}
+
+#[test]
+fn a_column_level_collate_is_recorded_on_the_column() {
+    let Statement::CreateTable(create) =
+        parse_statement("CREATE TABLE t (username TEXT NOT NULL UNIQUE COLLATE NOCASE)").unwrap()
+    else {
+        panic!("expected a CREATE TABLE");
+    };
+    assert!(create.columns[0]
+        .constraints
+        .contains(&ColumnConstraint::Collate("nocase".into())));
+    assert_eq!(create.unique_keys(), vec![vec!["username".to_string()]]);
+}
+
+#[test]
+fn table_level_primary_key_and_unique_are_both_unique_keys() {
+    let Statement::CreateTable(create) =
+        parse_statement("CREATE TABLE t (a INT, b TEXT, c TEXT, PRIMARY KEY (a, b), UNIQUE (c))")
+            .unwrap()
+    else {
+        panic!("expected a CREATE TABLE");
+    };
+    assert_eq!(
+        create.unique_keys(),
+        vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string()]
+        ]
+    );
+}

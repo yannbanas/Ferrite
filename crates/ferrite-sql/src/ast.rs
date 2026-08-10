@@ -88,6 +88,49 @@ impl CreateTable {
                 .collect::<Result<_, _>>()?,
         })
     }
+
+    /// Every set of columns this definition declares unique, whether
+    /// written column-level (`id TEXT PRIMARY KEY`, `code TEXT UNIQUE`) or
+    /// table-level (`PRIMARY KEY (a, b)`, `UNIQUE (a, b)`), primary key
+    /// first.
+    ///
+    /// These are what `INSERT OR IGNORE` and `INSERT OR REPLACE` conflict
+    /// on when no `ON CONFLICT` target is written, so they have to be
+    /// recorded rather than dropped after `to_schema` has used the primary
+    /// key for nullability.
+    pub fn unique_keys(&self) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for constraint in &self.constraints {
+            if let TableConstraint::PrimaryKey(cols) = constraint {
+                out.push(cols.clone());
+            }
+        }
+        for column in &self.columns {
+            if column
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey))
+            {
+                out.push(vec![column.name.clone()]);
+            }
+        }
+        for constraint in &self.constraints {
+            if let TableConstraint::Unique(cols) = constraint {
+                out.push(cols.clone());
+            }
+        }
+        for column in &self.columns {
+            if column
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::Unique))
+            {
+                out.push(vec![column.name.clone()]);
+            }
+        }
+        out.dedup();
+        out
+    }
 }
 
 /// `ALTER TABLE [IF EXISTS] name <action>`. Ferrite v1 has one action —
@@ -366,6 +409,78 @@ pub struct Insert {
     pub columns: Vec<String>,
     pub source: InsertSource,
     pub returning: Vec<SelectItem>,
+    pub on_conflict: Option<OnConflict>,
+}
+
+/// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET …`.
+///
+/// SQLite's `INSERT OR IGNORE` and `INSERT OR REPLACE` parse into this
+/// same shape with no target, so the planner has one code path — see
+/// [`InsertConflictAction`] for where the `OR REPLACE` translation is not
+/// exact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// The conflicting columns. Empty means "whichever unique key the row
+    /// collides with", which the planner resolves against the catalog.
+    pub target: Vec<String>,
+    pub action: InsertConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertConflictAction {
+    Nothing,
+    /// `DO UPDATE SET …`, where an assignment may read `excluded.col` for
+    /// the value the failed insert would have written.
+    Update {
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    },
+}
+
+/// SQLite's `INSERT OR IGNORE` / `INSERT OR REPLACE`, before the rewrite
+/// into [`OnConflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteConflictPrefix {
+    Ignore,
+    Replace,
+}
+
+impl SqliteConflictPrefix {
+    /// Rewrite the prefix into the `ON CONFLICT` clause that comes
+    /// closest to it, given the columns the statement writes.
+    ///
+    /// `OR IGNORE` is exactly `DO NOTHING`.
+    ///
+    /// `OR REPLACE` is **not** exactly `DO UPDATE`: SQLite deletes the
+    /// conflicting row and inserts a new one, so columns the statement
+    /// omits are reset to their defaults, delete triggers and `ON DELETE
+    /// CASCADE` fire, and the row gets a fresh rowid. `DO UPDATE SET`
+    /// over the named columns preserves the omitted ones and fires
+    /// nothing. The difference is invisible only when the statement names
+    /// every column that matters — which is the case at all nine PawChat
+    /// call sites, but is not true in general. See
+    /// `docs/pawchat-sql-audit.md`.
+    pub fn into_on_conflict(self, columns: &[String]) -> OnConflict {
+        OnConflict {
+            target: Vec::new(),
+            action: match self {
+                SqliteConflictPrefix::Ignore => InsertConflictAction::Nothing,
+                SqliteConflictPrefix::Replace => InsertConflictAction::Update {
+                    assignments: columns
+                        .iter()
+                        .map(|column| Assignment {
+                            column: column.clone(),
+                            value: Expr::Column(ObjectName(vec![
+                                "excluded".to_string(),
+                                column.clone(),
+                            ])),
+                        })
+                        .collect(),
+                    selection: None,
+                },
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

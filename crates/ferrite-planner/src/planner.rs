@@ -7,14 +7,16 @@ use ferrite_sql::ast as sql;
 
 use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, Expr};
 use crate::logical::{
-    split_conjunction, JoinType, LogicalPlan, ProjectionItem, SortKey, TableSource,
+    split_conjunction, ConflictAction, JoinType, LogicalPlan, OnConflict, ProjectionItem, SortKey,
+    TableSource,
 };
 use crate::lower::{
     coerce, collect_aggregates, contains_aggregate, reject_ungrouped, row_count, single_select,
     substitute_group_keys, unsupported, AggregateSlots, Lowerer,
 };
 use crate::physical::{
-    aggregate_schema, bind, infer, PhysAggregate, PhysExpr, PhysSortKey, PhysicalPlan,
+    aggregate_schema, bind, infer, PhysAggregate, PhysConflictAction, PhysExpr, PhysOnConflict,
+    PhysSortKey, PhysicalPlan,
 };
 use crate::rules::optimize;
 use crate::scope::Scope;
@@ -357,7 +359,102 @@ impl<'a> Planner<'a> {
             rows.push(row);
         }
 
-        Ok(LogicalPlan::Insert { source, rows })
+        let on_conflict = stmt
+            .on_conflict
+            .as_ref()
+            .map(|clause| self.build_on_conflict(&source, clause))
+            .transpose()?;
+        Ok(LogicalPlan::Insert {
+            source,
+            rows,
+            on_conflict,
+        })
+    }
+
+    /// Resolve an `ON CONFLICT` clause against the target table.
+    ///
+    /// With no explicit target — which is how `INSERT OR IGNORE` and
+    /// `INSERT OR REPLACE` arrive — the conflict columns come from the
+    /// table's first unique key as the catalog records it. A table with no
+    /// unique key recorded is a plan error naming it, rather than an
+    /// insert that can never conflict and so silently duplicates rows.
+    fn build_on_conflict(
+        &self,
+        source: &TableSource,
+        clause: &sql::OnConflict,
+    ) -> Result<OnConflict, FerriteError> {
+        let names = match clause.target.is_empty() {
+            false => clause.target.clone(),
+            true => self
+                .indexes
+                .indexes_for(source.id)?
+                .into_iter()
+                .find(|index| index.unique)
+                .map(|index| index.columns)
+                .ok_or_else(|| {
+                    FerriteError::Plan(format!(
+                        "no unique key is recorded on {}, so ON CONFLICT has no target; \
+                         write ON CONFLICT (columns) explicitly",
+                        source.name
+                    ))
+                })?,
+        };
+        let target = names
+            .iter()
+            .map(|name| {
+                source
+                    .schema
+                    .column_index(name)
+                    .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let action = match &clause.action {
+            sql::InsertConflictAction::Nothing => ConflictAction::Nothing,
+            sql::InsertConflictAction::Update {
+                assignments,
+                selection,
+            } => {
+                // The row an assignment reads is the existing row followed
+                // by the one the insert would have written, so `excluded`
+                // is simply the second relation in scope.
+                let scope = Scope::concat(
+                    Scope::for_relation(&source.schema, std::slice::from_ref(&source.name)),
+                    Scope::for_relation(&source.schema, &["excluded".to_string()]),
+                );
+                let lowerer = Lowerer::new(self.params)
+                    .with_qualifiers(vec![source.name.clone(), "excluded".to_string()]);
+                let assignments =
+                    assignments
+                        .iter()
+                        .map(|assignment| {
+                            let position =
+                                source.schema.column_index(&assignment.column).ok_or_else(
+                                    || FerriteError::ColumnNotFound(assignment.column.clone()),
+                                )?;
+                            let value = coerce(
+                                lowerer.expr(&assignment.value)?,
+                                source.schema.columns[position].data_type,
+                            )?;
+                            Ok((position, value))
+                        })
+                        .collect::<Result<Vec<_>, FerriteError>>()?;
+                let selection = selection
+                    .as_ref()
+                    .map(|expr| lowerer.expr(expr))
+                    .transpose()?;
+                // Bind eagerly so an unresolvable `excluded.col` is a plan
+                // error here rather than a surprise at execution time.
+                for (_, value) in &assignments {
+                    bind(value, &scope)?;
+                }
+                ConflictAction::Update {
+                    assignments,
+                    selection,
+                }
+            }
+        };
+        Ok(OnConflict { target, action })
     }
 
     fn build_update(&self, stmt: &sql::Update) -> Result<LogicalPlan, FerriteError> {
@@ -603,18 +700,32 @@ impl<'a> Planner<'a> {
                 ))
             }
 
-            LogicalPlan::Insert { source, rows } => {
+            LogicalPlan::Insert {
+                source,
+                rows,
+                on_conflict,
+            } => {
                 let empty = Scope::empty();
                 let rows = rows
                     .iter()
                     .map(|row| row.iter().map(|e| bind(e, &empty)).collect())
                     .collect::<Result<Vec<Vec<_>>, _>>()?;
+                // `excluded.col` resolves against the second half of a row
+                // made of the existing row followed by the excluded one.
+                let conflict_scope = Scope::concat(
+                    Scope::for_relation(&source.schema, std::slice::from_ref(&source.name)),
+                    Scope::for_relation(&source.schema, &["excluded".to_string()]),
+                );
+                let on_conflict = on_conflict
+                    .map(|clause| bind_on_conflict(clause, &conflict_scope))
+                    .transpose()?;
                 Ok((
                     PhysicalPlan::Insert {
                         table: source.id,
                         table_name: source.name,
                         schema: source.schema,
                         rows,
+                        on_conflict,
                     },
                     Scope::empty(),
                 ))
@@ -1002,6 +1113,25 @@ fn pick_index<'i>(indexes: &'i [IndexDef], column: &str) -> Option<&'i IndexDef>
         .iter()
         .filter(|i| i.columns.len() == 1 && i.columns[0] == column)
         .max_by_key(|i| i.unique)
+}
+
+fn bind_on_conflict(clause: OnConflict, scope: &Scope) -> Result<PhysOnConflict, FerriteError> {
+    Ok(PhysOnConflict {
+        target: clause.target,
+        action: match clause.action {
+            ConflictAction::Nothing => PhysConflictAction::Nothing,
+            ConflictAction::Update {
+                assignments,
+                selection,
+            } => PhysConflictAction::Update {
+                assignments: assignments
+                    .iter()
+                    .map(|(position, value)| Ok((*position, bind(value, scope)?)))
+                    .collect::<Result<_, FerriteError>>()?,
+                selection: selection.as_ref().map(|e| bind(e, scope)).transpose()?,
+            },
+        },
+    })
 }
 
 #[cfg(test)]
