@@ -33,6 +33,8 @@ impl ObjectName {
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
     Query(Box<Query>),
     Insert(Insert),
     Update(Update),
@@ -114,6 +116,24 @@ pub struct DropTable {
     pub if_exists: bool,
     pub names: Vec<ObjectName>,
     pub cascade: bool,
+}
+
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols)`. There is
+/// no access-method clause (`USING gin`, …): `docs/architecture.md` keeps
+/// B-tree only in v1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub if_not_exists: bool,
+    pub unique: bool,
+    pub name: String,
+    pub table: ObjectName,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndex {
+    pub if_exists: bool,
+    pub name: String,
 }
 
 /// A `SELECT`, including any leading `WITH` clause and trailing

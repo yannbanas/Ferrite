@@ -51,6 +51,7 @@ pub enum Keyword {
     Having,
     If,
     In,
+    Index,
     Inner,
     Insert,
     Int,
@@ -128,6 +129,7 @@ impl Keyword {
                 | Keyword::First
                 | Keyword::Float8
                 | Keyword::Function
+                | Keyword::Index
                 | Keyword::Int
                 | Keyword::Int4
                 | Keyword::Int8
@@ -201,6 +203,7 @@ impl Keyword {
             Keyword::Having => "having",
             Keyword::If => "if",
             Keyword::In => "in",
+            Keyword::Index => "index",
             Keyword::Inner => "inner",
             Keyword::Insert => "insert",
             Keyword::Int => "int",
@@ -309,6 +312,7 @@ fn keyword_from_str(word: &str) -> Option<Keyword> {
         "having" => Keyword::Having,
         "if" => Keyword::If,
         "in" => Keyword::In,
+        "index" => Keyword::Index,
         "inner" => Keyword::Inner,
         "insert" => Keyword::Insert,
         "int" => Keyword::Int,

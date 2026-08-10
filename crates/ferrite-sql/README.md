@@ -39,7 +39,14 @@ CREATE TABLE [IF NOT EXISTS] [schema.]name (
     [, PRIMARY KEY (a, b)] [, UNIQUE (a)]
 );
 DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT];
+
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON [schema.]table (a, b);
+DROP INDEX [IF EXISTS] name;
 ```
+
+There is no access-method clause on `CREATE INDEX` (`USING gin`, …):
+`docs/architecture.md` keeps B-tree only in v1. Index names are not qualified —
+an index lives in the schema of its table, matching `ferrite-catalog`.
 
 Types map straight onto `ferrite_common::DataType`:
 
@@ -166,7 +173,7 @@ planner's job.
 
 All keywords are reserved except type names and a handful of noise words
 (`KEY`, `ROW`, `STATEMENT`, `EACH`, `WORK`, `TRANSACTION`, `FIRST`, `LAST`,
-`NULLS`, `CASCADE`, `RESTRICT`, `REPLACE`, `PROCEDURE`, `TRIGGER`,
+`NULLS`, `CASCADE`, `RESTRICT`, `REPLACE`, `PROCEDURE`, `TRIGGER`, `INDEX`,
 `FUNCTION`, `PRECISION`), so `SELECT text, key FROM t` works but
 `SELECT select FROM t` needs `"select"`.
 
@@ -177,9 +184,11 @@ Cut on purpose; several are cut project-wide by `docs/architecture.md`.
 - **Window functions** (`OVER`, `PARTITION BY`), `GROUPING SETS`, `ROLLUP`,
   `CUBE`, `FILTER`, `WITHIN GROUP`, `ORDER BY` inside an aggregate.
 - **Recursive CTEs** (`WITH RECURSIVE`), `LATERAL`, `NATURAL JOIN`.
-- `ALTER TABLE`, `CREATE INDEX`, `CREATE SCHEMA/VIEW/SEQUENCE/TYPE/ROLE`,
-  `GRANT`/`REVOKE`, `TRUNCATE`, `COPY`, `EXPLAIN`, `ANALYZE`, `VACUUM`,
-  `PREPARE`/`EXECUTE`, `SET`/`SHOW`, `COMMENT ON`.
+- `ALTER TABLE`, `CREATE SCHEMA/VIEW/SEQUENCE/TYPE/ROLE`, `GRANT`/`REVOKE`,
+  `TRUNCATE`, `COPY`, `EXPLAIN`, `ANALYZE`, `VACUUM`, `PREPARE`/`EXECUTE`,
+  `SET`/`SHOW`, `COMMENT ON`.
+- On indexes: partial (`WHERE`), expression and `CONCURRENTLY` indexes, plus
+  per-column `ASC`/`DESC`/`NULLS` ordering and access-method clauses.
 - `INSERT … ON CONFLICT`, `DEFAULT VALUES`, `UPDATE … FROM`,
   `DELETE … USING`, `SELECT … FOR UPDATE`, `FETCH FIRST`, cursors.
 - `REFERENCES`/foreign keys, `CHECK`, `GENERATED`/`IDENTITY`, `COLLATE`,

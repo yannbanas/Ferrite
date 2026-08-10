@@ -142,6 +142,44 @@ fn drop_table() {
 }
 
 #[test]
+fn create_and_drop_index() {
+    let created = match stmt(
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_email_idx ON public.users (email, age)",
+    ) {
+        Statement::CreateIndex(c) => c,
+        other => panic!("{other:?}"),
+    };
+    assert!(created.unique);
+    assert!(created.if_not_exists);
+    assert_eq!(created.name, "users_email_idx");
+    assert_eq!(created.table.split("public"), ("public", "users"));
+    assert_eq!(
+        created.columns,
+        vec!["email".to_string(), "age".to_string()]
+    );
+
+    let created = match stmt("CREATE INDEX i ON t (a)") {
+        Statement::CreateIndex(c) => c,
+        other => panic!("{other:?}"),
+    };
+    assert!(!created.unique);
+    assert!(!created.if_not_exists);
+
+    let dropped = match stmt("DROP INDEX IF EXISTS users_email_idx") {
+        Statement::DropIndex(d) => d,
+        other => panic!("{other:?}"),
+    };
+    assert!(dropped.if_exists);
+    assert_eq!(dropped.name, "users_email_idx");
+
+    rejects("CREATE INDEX i ON t");
+    rejects("CREATE INDEX i ON t ()");
+    rejects("CREATE INDEX ON t (a)");
+    rejects("CREATE OR REPLACE INDEX i ON t (a)");
+    rejects("DROP INDEX");
+}
+
+#[test]
 fn select_projection_forms() {
     assert_eq!(
         select("SELECT * FROM t").projection,

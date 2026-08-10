@@ -245,8 +245,28 @@ impl Parser {
                 self.parse_create_procedure(or_replace)
             }
             Token::Keyword(Keyword::Trigger) if !or_replace => self.parse_create_trigger(),
-            _ => self.expected("`TABLE`, `PROCEDURE` or `TRIGGER`"),
+            Token::Keyword(Keyword::Index) | Token::Keyword(Keyword::Unique) if !or_replace => {
+                self.parse_create_index()
+            }
+            _ => self.expected("`TABLE`, `INDEX`, `PROCEDURE` or `TRIGGER`"),
         }
+    }
+
+    fn parse_create_index(&mut self) -> Result<Statement, ParseError> {
+        let unique = self.eat_keyword(Keyword::Unique);
+        self.expect_keyword(Keyword::Index)?;
+        let if_not_exists = self.eat_keywords(&[Keyword::If, Keyword::Not, Keyword::Exists]);
+        let name = self.parse_identifier()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.parse_object_name()?;
+        let columns = self.parse_column_list()?;
+        Ok(Statement::CreateIndex(CreateIndex {
+            if_not_exists,
+            unique,
+            name,
+            table,
+            columns,
+        }))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement, ParseError> {
@@ -392,7 +412,13 @@ impl Parser {
                     table,
                 }))
             }
-            _ => self.expected("`TABLE`, `PROCEDURE` or `TRIGGER`"),
+            Token::Keyword(Keyword::Index) => {
+                self.advance();
+                let if_exists = self.eat_keywords(&[Keyword::If, Keyword::Exists]);
+                let name = self.parse_identifier()?;
+                Ok(Statement::DropIndex(DropIndex { if_exists, name }))
+            }
+            _ => self.expected("`TABLE`, `INDEX`, `PROCEDURE` or `TRIGGER`"),
         }
     }
 
