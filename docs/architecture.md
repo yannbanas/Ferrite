@@ -114,11 +114,11 @@ ce test fait ressortir :
    et le planificateur l'ignorait. Une colonne omise recevait `NULL`, ce qui
    échouait sur `NOT NULL` (visible) mais passait silencieusement sur une
    colonne nullable (invisible). C'était le plus dangereux des manques.
-3. **`JOIN`** — un schéma relationnel normalisé n'est lisible qu'à travers
-   des jointures ; c'est le manque le plus visible côté requêtes.
-4. **Agrégats (`count`/`sum`/…) et `ORDER BY`** — présents dans presque
-   toutes les pages de liste d'une application.
-5. **`LIKE`, sous-requêtes, index partiels** — ensuite.
+3. ~~**`JOIN`**~~ — *fait.* Un schéma relationnel normalisé n'est lisible qu'à
+   travers des jointures.
+4. ~~**Agrégats (`count`/`sum`/…) et `ORDER BY`**~~ — *faits*, avec
+   `GROUP BY`/`HAVING`, `DISTINCT` et `LIKE`.
+5. **Sous-requêtes, `CASE`, `CAST`, index partiels** — ensuite.
 
 Les contraintes que la traduction doit encore jeter faute d'équivalent :
 4 `FOREIGN KEY`, 13 `UNIQUE`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun `CHECK`,
@@ -156,6 +156,30 @@ raison pour laquelle `ADD COLUMN NOT NULL` sans défaut constant est refusé
 sur une table non vide plutôt que de publier un `NULL` dans une colonne
 déclarée sans.
 
+### Les deux passes ensemble (même mesure, même base)
+
+`_after.sql` enchaîne maintenant les deux jeux dans une seule exécution : le
+DDL d'index, les requêtes applicatives, les 313 énoncés de migration, puis
+**les mêmes requêtes une seconde fois**, contre des tables qui viennent de
+gagner deux colonnes. C'est le seul endroit où les deux fonctionnalités se
+croisent pour de vrai — une ligne écrite avant l'`ADD COLUMN` arrive dans la
+jointure, le tri et l'agrégat plus courte que son schéma si le scan ne
+réconcilie pas l'arité d'abord.
+
+```
+72/72 tables, 938/938 lignes, 337/337 énoncés `_after` acceptés
+```
+
+`count(*)` sur `vr_room_objects` rend 394 avant les migrations et 395 après,
+la ligne de plus étant l'`INSERT` qui ne nomme que les colonnes obligatoires
+et laisse le reste aux `DEFAULT`. La même bascule se lit sur le
+`LEFT JOIN ... GROUP BY ... HAVING` de `vr_room_members` (2 groupes puis 3).
+
+Une limite connue, sans rapport avec les migrations : un scope atteint une
+relation par son nom *et* par son alias, donc `FROM t JOIN t t2` laisse `t.a`
+désigner deux colonnes et l'auto-jointure est refusée comme ambiguë. En
+PostgreSQL l'alias masque le nom de la table.
+
 ## Extensions syntaxiques envisagées (après la priorité PawChat, pas avant)
 
 Proposition de l'utilisateur (août 2026) : au-delà de la couverture SQL standard, un jeu de mots-clés qui n'existent dans aucune base grand public, pensés pour éliminer l'imbrication et exploiter ce que Ferrite a déjà (MVCC, identité, modèle procédural). Séquencé explicitement **après** que `ALTER TABLE`/`DEFAULT`/`JOIN`/agrégats fassent tourner PawChat pour de vrai — ce n'est pas la priorité actuelle, c'est la suite. Tri par faisabilité réelle, pas par ordre de préférence :
@@ -190,6 +214,26 @@ Proposition de l'utilisateur (août 2026) : au-delà de la couverture SQL standa
 
 - **`EXPLAIN` réel avec le plan choisi** — le planificateur est à règles, pas à coûts, donc un `EXPLAIN` fidèle (quel access path retenu, index utilisé ou non) est peu coûteux à exposer maintenant et donne aux utilisateurs un moyen de comprendre/optimiser leurs requêtes sans attendre le reste de cette liste.
 - **`current_identity()`** — équivalent de `current_user` côté Postgres, mais renvoyant une vraie `ferrite_common::Identity` exploitable dans une procédure/un trigger appelé depuis une requête, cohérent avec le modèle de sécurité déjà acté (§Modèle de sécurité).
+
+### Côté lecture (mesuré après la passe JOIN/agrégats)
+
+`sqlite_to_ferrite.py` dérive maintenant du schéma un `_after.sql` : le DDL
+d'index, plus une requête par forme que toute application écrit. Rejouées
+contre le vrai serveur, **15/15 sont acceptées, contre 6/15 avant cette
+passe** — les 6 étant les `CREATE INDEX`, c'est-à-dire qu'aucune requête ne
+passait. Et elles répondent, elles ne sont pas seulement acceptées :
+`count(*)` sur `vr_room_objects` rend 394, exactement ce que rend SQLite ;
+`ORDER BY created_at DESC LIMIT 20` rend ses 20 lignes ; le `JOIN` réel
+`user_badges`/`users` et le `LEFT JOIN ... GROUP BY ... HAVING count(*) > 1`
+rendent le même nombre de groupes que la requête équivalente sur la base
+d'origine.
+
+Une différence de sémantique à connaître avant de migrer : `LIKE` est
+**sensible à la casse** dans Ferrite, comme dans PostgreSQL, alors qu'il est
+insensible dans SQLite. Sur la même donnée, `WHERE name LIKE '%a%'` rend 136
+lignes ici et 144 dans SQLite — l'écart est exactement ce que SQLite rend
+avec `GLOB '*a*'`. Toute recherche `LIKE` de PawChat changera de résultat ;
+il n'y a pas encore de `ILIKE`.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 

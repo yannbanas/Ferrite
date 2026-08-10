@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use ferrite_common::{FerriteError, Row, Value};
+use ferrite_common::{DataType, FerriteError, Row, Value};
 use ferrite_planner::BinaryOp;
 use ferrite_planner::PhysExpr;
 
@@ -21,7 +21,31 @@ pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
             None => Value::Null,
             Some(b) => Value::Boolean(!b),
         }),
+        PhysExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let (subject, pattern) = (eval(expr, row)?, eval(pattern, row)?);
+            Ok(match (&subject, &pattern) {
+                (Value::Null, _) | (_, Value::Null) => Value::Null,
+                (Value::Text(subject), Value::Text(pattern)) => {
+                    Value::Boolean(like_matches(subject, pattern) != *negated)
+                }
+                _ => {
+                    return Err(FerriteError::TypeMismatch {
+                        expected: DataType::Text,
+                        actual: subject
+                            .data_type()
+                            .filter(|t| *t != DataType::Text)
+                            .or_else(|| pattern.data_type())
+                            .expect("nulls were matched above"),
+                    })
+                }
+            })
+        }
         PhysExpr::Binary { left, op, right } => match op {
+            op if op.is_arithmetic() => arithmetic(*op, eval(left, row)?, eval(right, row)?),
             BinaryOp::And => {
                 let (l, r) = (as_bool(&eval(left, row)?)?, as_bool(&eval(right, row)?)?);
                 Ok(match (l, r) {
@@ -63,7 +87,7 @@ fn matches(op: BinaryOp, ordering: Ordering) -> bool {
         BinaryOp::LtEq => ordering != Ordering::Greater,
         BinaryOp::Gt => ordering == Ordering::Greater,
         BinaryOp::GtEq => ordering != Ordering::Less,
-        BinaryOp::And | BinaryOp::Or => unreachable!("handled before comparison"),
+        other => unreachable!("{other:?} is not a comparison"),
     }
 }
 
@@ -72,12 +96,140 @@ fn as_bool(value: &Value) -> Result<Option<bool>, FerriteError> {
         Value::Null => Ok(None),
         Value::Boolean(b) => Ok(Some(*b)),
         other => Err(FerriteError::TypeMismatch {
-            expected: ferrite_common::DataType::Boolean,
+            expected: DataType::Boolean,
             actual: other
                 .data_type()
                 .expect("Null was matched above, so a type exists"),
         }),
     }
+}
+
+/// `+ - * / %` and `||`. Null propagates; the result type is the wider of
+/// the two operands, matching the type the planner wrote into the output
+/// schema.
+fn arithmetic(op: BinaryOp, left: Value, right: Value) -> Result<Value, FerriteError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let mismatch = |expected: DataType| {
+        let actual = match left.data_type() {
+            Some(actual) if actual != expected => actual,
+            _ => right.data_type().expect("nulls were handled above"),
+        };
+        FerriteError::TypeMismatch { expected, actual }
+    };
+    if op == BinaryOp::Concat {
+        return match (&left, &right) {
+            (Value::Text(a), Value::Text(b)) => Ok(Value::Text(format!("{a}{b}"))),
+            _ => Err(mismatch(DataType::Text)),
+        };
+    }
+    match (&left, &right) {
+        (Value::Float8(_), _) | (_, Value::Float8(_)) => {
+            let (a, b) = (as_float(&left), as_float(&right));
+            match (a, b) {
+                (Some(a), Some(b)) => Ok(Value::Float8(float_op(op, a, b)?)),
+                _ => Err(mismatch(DataType::Float8)),
+            }
+        }
+        (Value::Int4(a), Value::Int4(b)) => {
+            integer_op(op, i64::from(*a), i64::from(*b)).and_then(|v| {
+                i32::try_from(v)
+                    .map(Value::Int4)
+                    .map_err(|_| FerriteError::Exec("integer out of range".into()))
+            })
+        }
+        (Value::Int4(_) | Value::Int8(_), Value::Int4(_) | Value::Int8(_)) => {
+            let (a, b) = (as_int(&left), as_int(&right));
+            Ok(Value::Int8(integer_op(op, a.unwrap(), b.unwrap())?))
+        }
+        _ => Err(mismatch(DataType::Float8)),
+    }
+}
+
+fn integer_op(op: BinaryOp, a: i64, b: i64) -> Result<i64, FerriteError> {
+    let overflow = || FerriteError::Exec("integer out of range".to_string());
+    match op {
+        BinaryOp::Plus => a.checked_add(b).ok_or_else(overflow),
+        BinaryOp::Minus => a.checked_sub(b).ok_or_else(overflow),
+        BinaryOp::Multiply => a.checked_mul(b).ok_or_else(overflow),
+        BinaryOp::Divide => a
+            .checked_div(b)
+            .ok_or_else(|| FerriteError::Exec("division by zero".to_string())),
+        BinaryOp::Modulo => a
+            .checked_rem(b)
+            .ok_or_else(|| FerriteError::Exec("division by zero".to_string())),
+        other => Err(FerriteError::Exec(format!("{other:?} is not arithmetic"))),
+    }
+}
+
+fn float_op(op: BinaryOp, a: f64, b: f64) -> Result<f64, FerriteError> {
+    match op {
+        BinaryOp::Plus => Ok(a + b),
+        BinaryOp::Minus => Ok(a - b),
+        BinaryOp::Multiply => Ok(a * b),
+        BinaryOp::Divide if b == 0.0 => Err(FerriteError::Exec("division by zero".to_string())),
+        BinaryOp::Divide => Ok(a / b),
+        BinaryOp::Modulo if b == 0.0 => Err(FerriteError::Exec("division by zero".to_string())),
+        BinaryOp::Modulo => Ok(a % b),
+        other => Err(FerriteError::Exec(format!("{other:?} is not arithmetic"))),
+    }
+}
+
+fn as_int(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int4(v) => Some(i64::from(*v)),
+        Value::Int8(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// SQL `LIKE`: `%` matches any run of characters, `_` exactly one, and a
+/// backslash escapes either. Backtracking on `%` only, which is linear in
+/// practice and needs no allocation beyond the two character vectors.
+pub fn like_matches(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let (mut t, mut p) = (0, 0);
+    let (mut wildcard, mut resume) = (None, 0);
+
+    while t < text.len() {
+        if p < pattern.len() {
+            match pattern[p] {
+                '%' => {
+                    wildcard = Some(p);
+                    resume = t;
+                    p += 1;
+                    continue;
+                }
+                '_' => {
+                    t += 1;
+                    p += 1;
+                    continue;
+                }
+                '\\' if p + 1 < pattern.len() && pattern[p + 1] == text[t] => {
+                    t += 1;
+                    p += 2;
+                    continue;
+                }
+                c if c != '\\' && c == text[t] => {
+                    t += 1;
+                    p += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match wildcard {
+            Some(position) => {
+                p = position + 1;
+                resume += 1;
+                t = resume;
+            }
+            None => return false,
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '%')
 }
 
 /// `None` means "the comparison is `NULL`", i.e. at least one side was

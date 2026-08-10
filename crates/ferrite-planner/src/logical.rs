@@ -4,7 +4,8 @@
 
 use ferrite_common::{Schema, TableId};
 
-use crate::expr::{BinaryOp, Expr};
+use crate::expr::{AggregateCall, BinaryOp, Expr};
+use crate::scope::Scope;
 
 /// Which table a scan reads, resolved against the catalog once so later
 /// stages never touch name resolution again.
@@ -12,7 +13,46 @@ use crate::expr::{BinaryOp, Expr};
 pub struct TableSource {
     pub id: TableId,
     pub name: String,
+    pub alias: Option<String>,
     pub schema: Schema,
+}
+
+impl TableSource {
+    /// The names a column reference may use to reach this relation. An
+    /// alias does not hide the table name in Ferrite v1; both work.
+    pub fn qualifiers(&self) -> Vec<String> {
+        let mut out = vec![self.name.clone()];
+        out.extend(self.alias.clone());
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+impl JoinType {
+    /// `true` when a row from this side survives without a match on the
+    /// other, and therefore may be padded with nulls.
+    pub fn preserves_left(self) -> bool {
+        matches!(self, JoinType::Left | JoinType::Full)
+    }
+
+    pub fn preserves_right(self) -> bool {
+        matches!(self, JoinType::Right | JoinType::Full)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    pub expr: Expr,
+    pub asc: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,17 +64,39 @@ pub enum LogicalPlan {
         source: TableSource,
         filter: Option<Expr>,
     },
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        join_type: JoinType,
+        on: Option<Expr>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: Expr,
+    },
+    /// One output row per distinct `group_by` tuple, or exactly one row
+    /// when `group_by` is empty. The output row is the group keys in
+    /// order, then the aggregate results.
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_by: Vec<Expr>,
+        aggregates: Vec<AggregateCall>,
     },
     Projection {
         input: Box<LogicalPlan>,
         items: Vec<ProjectionItem>,
     },
+    Sort {
+        input: Box<LogicalPlan>,
+        keys: Vec<SortKey>,
+    },
+    Distinct {
+        input: Box<LogicalPlan>,
+    },
     Limit {
         input: Box<LogicalPlan>,
-        count: u64,
+        count: Option<u64>,
+        offset: u64,
     },
     Insert {
         source: TableSource,
@@ -70,11 +132,50 @@ impl LogicalPlan {
             LogicalPlan::Scan { .. } | LogicalPlan::Insert { .. } | LogicalPlan::Call { .. } => {
                 Vec::new()
             }
+            LogicalPlan::Join { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Projection { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Update { input, .. }
             | LogicalPlan::Delete { input, .. } => vec![input.as_ref()],
+        }
+    }
+
+    /// The names a predicate sitting directly above this node may use.
+    ///
+    /// `None` for the nodes that reshape their output — a projection or an
+    /// aggregate — and for statement roots. The rule engine only ever asks
+    /// this of the `FROM` tree, which is scans and joins, and treats
+    /// everything else as a barrier anyway.
+    pub fn scope(&self) -> Option<Scope> {
+        match self {
+            LogicalPlan::Scan { source, .. } => {
+                Some(Scope::for_relation(&source.schema, &source.qualifiers()))
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
+                let mut left = left.scope()?;
+                let mut right = right.scope()?;
+                if join_type.preserves_right() {
+                    left = left.nullable();
+                }
+                if join_type.preserves_left() {
+                    right = right.nullable();
+                }
+                Some(Scope::concat(left, right))
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Limit { input, .. } => input.scope(),
+            _ => None,
         }
     }
 }

@@ -458,6 +458,133 @@ async fn alter_table_adds_columns_and_defaults_are_applied() {
     assert_eq!(row.get::<_, i64>("banned"), 0);
 }
 
+/// The two features meeting: a table that has just grown a column, read
+/// back through a `JOIN`, a `GROUP BY`, an `ORDER BY` and a `LIKE`.
+///
+/// Nothing rewrites the rows written before an `ADD COLUMN`, so they reach
+/// the join, the sort and the aggregate one value short of the schema
+/// unless the scan reconciles the arity first. Half the rows here predate
+/// each added column and half do not, on both sides of the join, so a
+/// missing reconciliation shows up as a wrong value rather than a crash —
+/// which is the only reason to check the values and not just the shapes.
+#[tokio::test]
+async fn a_table_that_just_grew_a_column_still_joins_groups_and_sorts() {
+    let data = scratch("alter-then-select");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+    let client = connect(port).await;
+
+    client
+        .batch_execute("CREATE TABLE authors (id BIGINT NOT NULL, name TEXT NOT NULL)")
+        .await
+        .expect("CREATE TABLE authors");
+    client
+        .batch_execute("CREATE TABLE posts (id BIGINT NOT NULL, author BIGINT NOT NULL)")
+        .await
+        .expect("CREATE TABLE posts");
+    client
+        .execute("INSERT INTO authors VALUES (1, 'Ada'), (2, 'Alan')", &[])
+        .await
+        .expect("INSERT authors");
+    client
+        .execute("INSERT INTO posts VALUES (10, 1), (11, 1), (12, 2)", &[])
+        .await
+        .expect("INSERT posts");
+
+    client
+        .batch_execute("ALTER TABLE authors ADD COLUMN rank BIGINT NOT NULL DEFAULT 7")
+        .await
+        .expect("ADD COLUMN rank");
+    client
+        .batch_execute("ALTER TABLE posts ADD COLUMN title TEXT")
+        .await
+        .expect("ADD COLUMN title");
+
+    // Rows written after the migration, so the two tables now mix short and
+    // full-width rows.
+    client
+        .execute("INSERT INTO authors VALUES (3, 'Grace', 1)", &[])
+        .await
+        .expect("INSERT a full-width author");
+    client
+        .execute("INSERT INTO posts VALUES (13, 3, 'about a bug')", &[])
+        .await
+        .expect("INSERT a full-width post");
+
+    let rows = client
+        .query(
+            "SELECT authors.name, authors.rank, posts.id FROM posts \
+             JOIN authors ON authors.id = posts.author \
+             ORDER BY authors.rank DESC, posts.id ASC",
+            &[],
+        )
+        .await
+        .expect("JOIN + ORDER BY across a column added after the rows");
+    let joined: Vec<(String, i64, i64)> = rows
+        .iter()
+        .map(|r| (r.get("name"), r.get("rank"), r.get("id")))
+        .collect();
+    assert_eq!(
+        joined,
+        vec![
+            ("Ada".to_string(), 7, 10),
+            ("Ada".to_string(), 7, 11),
+            ("Alan".to_string(), 7, 12),
+            ("Grace".to_string(), 1, 13),
+        ],
+        "the backfilled DEFAULT is what the join reads and what the sort orders on"
+    );
+
+    let rows = client
+        .query(
+            "SELECT authors.rank, count(*) FROM authors \
+             LEFT JOIN posts ON posts.author = authors.id \
+             GROUP BY authors.rank ORDER BY authors.rank",
+            &[],
+        )
+        .await
+        .expect("GROUP BY on a column added after the rows");
+    let grouped: Vec<(i64, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(grouped, vec![(1, 1), (7, 3)]);
+
+    // A column added with no DEFAULT reads back NULL on the old rows, so a
+    // `LIKE` must not match them and `count()` must not count them.
+    let row = client
+        .query_one(
+            "SELECT count(*), count(title) FROM posts WHERE title LIKE '%bug%'",
+            &[],
+        )
+        .await
+        .expect("LIKE over a column added after the rows");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, i64>(1), 1);
+
+    let rows = client
+        .query("SELECT DISTINCT rank FROM authors ORDER BY rank DESC", &[])
+        .await
+        .expect("DISTINCT on a column added after the rows");
+    assert_eq!(
+        rows.iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>(),
+        vec![7, 1]
+    );
+
+    // And an `INSERT` that omits the added column still takes its DEFAULT
+    // once every read path above has run against the same table.
+    client
+        .execute("INSERT INTO authors (id, name) VALUES (4, 'Edsger')", &[])
+        .await
+        .expect("INSERT omitting the added column");
+    let row = client
+        .query_one(
+            "SELECT rank FROM authors WHERE name LIKE 'Eds%' ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("read the defaulted row back through LIKE + ORDER BY");
+    assert_eq!(row.get::<_, i64>("rank"), 7);
+}
+
 /// Two connections writing the same row: MVCC has to answer
 /// `SerializationFailure` (SQLSTATE 40001), not corrupt anything and not
 /// take the server down.
@@ -517,8 +644,10 @@ async fn a_write_conflict_is_reported_as_serialization_failure() {
     );
 }
 
-/// Everything `ferrite-sql` parses but `ferrite-exec` cannot run has to come
-/// back as a clean error on a connection that stays usable.
+/// Two things at once, through the real wire: the query shapes an
+/// application actually writes run end to end, and everything `ferrite-sql`
+/// parses but `ferrite-exec` still cannot run comes back as a clean error on
+/// a connection that stays usable.
 #[tokio::test]
 async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
     let data = scratch("unsupported");
@@ -535,13 +664,40 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         .execute("INSERT INTO t VALUES (1, 'x')", &[])
         .await
         .expect("INSERT");
+    client
+        .batch_execute("CREATE TABLE u (a BIGINT NOT NULL, tag TEXT)")
+        .await
+        .expect("CREATE TABLE u");
+    client
+        .execute("INSERT INTO u VALUES (1, 'tag')", &[])
+        .await
+        .expect("INSERT u");
 
     for sql in [
         "SELECT count(*) FROM t",
-        "SELECT * FROM t ORDER BY a",
-        "SELECT * FROM t GROUP BY a",
-        "SELECT * FROM t JOIN t t2 ON t2.a = t.a",
+        "SELECT * FROM t ORDER BY a DESC",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 0",
+        "SELECT t.a, u.tag FROM t JOIN u ON u.a = t.a",
+        "SELECT t.a, u.tag FROM t LEFT JOIN u ON u.a = t.a",
+        "SELECT DISTINCT b FROM t WHERE b LIKE 'x%'",
+        "SELECT b FROM t LIMIT 1 OFFSET 0",
+        "SELECT * FROM t JOIN u ON u.a = t.a",
         "SELECT * FROM t WHERE b LIKE 'x%'",
+    ] {
+        client
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|err| panic!("{sql:?} should run now: {err}"));
+    }
+
+    for sql in [
+        // `*` has no meaning once the rows have been collapsed into groups.
+        "SELECT * FROM t GROUP BY a",
+        // A scope reaches a relation through its name *and* its alias, so a
+        // self-join leaves `t.a` naming two columns.
+        "SELECT * FROM t JOIN t t2 ON t2.a = t.a",
+        "SELECT (SELECT a FROM t) FROM t",
+        "SELECT CAST(a AS TEXT) FROM t",
         "ALTER TABLE t DROP COLUMN b",
         "ALTER TABLE t RENAME TO u",
         "SELECT * FROM nope",

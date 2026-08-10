@@ -1,13 +1,16 @@
 //! Single-threaded physical plan executor.
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use ferrite_common::{
     Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Row, RowId, Schema,
     StorageEngine, TableId, TxnId, Value,
 };
-use ferrite_planner::{PhysExpr, PhysicalPlan};
+use ferrite_planner::{JoinType, PhysExpr, PhysSortKey, PhysicalPlan};
 use ferrite_proc::{ProcDecision, ProcRegistry, TriggerEvent};
 
-use crate::eval::{eval, eval_predicate};
+use crate::eval::{compare, eval, eval_predicate};
 use crate::index::IndexProvider;
 
 /// A row as it flows through the plan. `rid` is present only while the row
@@ -222,9 +225,53 @@ impl<'a> Session<'a> {
                 })
                 .collect(),
 
-            PhysicalPlan::Limit { input, count } => {
+            PhysicalPlan::NestedLoopJoin {
+                left,
+                right,
+                join_type,
+                predicate,
+                ..
+            } => {
+                let outer = self.stream(txn, left)?;
+                let inner = self.stream(txn, right)?;
+                nested_loop_join(&outer, &inner, *join_type, predicate.as_ref())
+            }
+
+            PhysicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } => crate::aggregate::run(&self.stream(txn, input)?, group_by, aggregates),
+
+            PhysicalPlan::Sort { input, keys } => {
                 let mut rows = self.stream(txn, input)?;
-                rows.truncate(usize::try_from(*count).unwrap_or(usize::MAX));
+                sort(&mut rows, keys)?;
+                Ok(rows)
+            }
+
+            PhysicalPlan::Distinct { input } => {
+                let mut seen = HashSet::new();
+                Ok(self
+                    .stream(txn, input)?
+                    .into_iter()
+                    .filter(|tuple| seen.insert(row_key(&tuple.row)))
+                    .collect())
+            }
+
+            PhysicalPlan::Limit {
+                input,
+                count,
+                offset,
+            } => {
+                let mut rows = self.stream(txn, input)?;
+                let offset = usize::try_from(*offset)
+                    .unwrap_or(usize::MAX)
+                    .min(rows.len());
+                rows.drain(..offset);
+                if let Some(count) = count {
+                    rows.truncate(usize::try_from(*count).unwrap_or(usize::MAX));
+                }
                 Ok(rows)
             }
 
@@ -466,8 +513,12 @@ fn node_name(plan: &PhysicalPlan) -> &'static str {
     match plan {
         PhysicalPlan::SeqScan { .. } => "SeqScan",
         PhysicalPlan::IndexScan { .. } => "IndexScan",
+        PhysicalPlan::NestedLoopJoin { .. } => "NestedLoopJoin",
         PhysicalPlan::Filter { .. } => "Filter",
+        PhysicalPlan::Aggregate { .. } => "Aggregate",
         PhysicalPlan::Projection { .. } => "Projection",
+        PhysicalPlan::Sort { .. } => "Sort",
+        PhysicalPlan::Distinct { .. } => "Distinct",
         PhysicalPlan::Limit { .. } => "Limit",
         PhysicalPlan::Insert { .. } => "Insert",
         PhysicalPlan::Update { .. } => "Update",
@@ -509,6 +560,141 @@ fn fill_added_columns(schema: &Schema, row: &mut Row) {
             },
         );
     }
+}
+
+/// A value's identity for grouping and de-duplication.
+///
+/// `ferrite_common::Value` cannot be `Hash`/`Eq` — it carries an `f64` —
+/// so the key is its `Debug` rendering, which distinguishes both values
+/// and variants: `Int4(1)` and `Float8(1.0)` are different groups, which is
+/// what SQL says about `1` and `1.0` of different declared types.
+pub(crate) fn row_key(row: &Row) -> String {
+    format!("{:?}", row.values)
+}
+
+pub(crate) fn value_key(values: &[Value]) -> String {
+    format!("{values:?}")
+}
+
+/// Every join type in one loop. `docs/architecture.md` cuts the cost model,
+/// so there is nothing to choose a hash or merge join *with*; a nested loop
+/// is correct for all five and needs no build phase.
+///
+/// Outer rows are emitted in input order; a preserved row with no match is
+/// padded with nulls, and for a `RIGHT`/`FULL` join the unmatched inner
+/// rows follow at the end.
+fn nested_loop_join(
+    outer: &[Tuple],
+    inner: &[Tuple],
+    join_type: JoinType,
+    predicate: Option<&PhysExpr>,
+) -> Result<Vec<Tuple>, FerriteError> {
+    let outer_width = outer.first().map(|t| t.row.values.len()).unwrap_or(0);
+    let inner_width = inner.first().map(|t| t.row.values.len()).unwrap_or(0);
+    let mut matched = vec![false; inner.len()];
+    let mut out = Vec::new();
+
+    for left in outer {
+        let mut any = false;
+        for (position, right) in inner.iter().enumerate() {
+            let joined = concat(&left.row.values, &right.row.values);
+            let keep = match predicate {
+                None => true,
+                Some(predicate) => eval_predicate(predicate, &joined)?,
+            };
+            if keep {
+                any = true;
+                matched[position] = true;
+                out.push(Tuple {
+                    rid: None,
+                    row: joined,
+                });
+            }
+        }
+        if !any && join_type.preserves_left() {
+            out.push(Tuple {
+                rid: None,
+                row: concat(&left.row.values, &vec![Value::Null; inner_width]),
+            });
+        }
+    }
+
+    if join_type.preserves_right() {
+        for (position, right) in inner.iter().enumerate() {
+            if !matched[position] {
+                out.push(Tuple {
+                    rid: None,
+                    row: concat(&vec![Value::Null; outer_width], &right.row.values),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn concat(left: &[Value], right: &[Value]) -> Row {
+    let mut values = Vec::with_capacity(left.len() + right.len());
+    values.extend_from_slice(left);
+    values.extend_from_slice(right);
+    Row::new(values)
+}
+
+/// Sort keys are evaluated once per row rather than once per comparison,
+/// which also gives the comparator somewhere to fail: `Ord` cannot return
+/// an error, so a type mismatch between two keys is caught here instead.
+fn sort(rows: &mut [Tuple], keys: &[PhysSortKey]) -> Result<(), FerriteError> {
+    let mut evaluated = Vec::with_capacity(rows.len());
+    for tuple in rows.iter() {
+        evaluated.push(
+            keys.iter()
+                .map(|key| eval(&key.expr, &tuple.row))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let mut failure = None;
+    order.sort_by(|a, b| {
+        compare_keys(&evaluated[*a], &evaluated[*b], keys).unwrap_or_else(|err| {
+            failure.get_or_insert(err);
+            Ordering::Equal
+        })
+    });
+    if let Some(err) = failure {
+        return Err(err);
+    }
+
+    let sorted: Vec<Tuple> = order.into_iter().map(|i| rows[i].clone()).collect();
+    rows.clone_from_slice(&sorted);
+    Ok(())
+}
+
+fn compare_keys(
+    left: &[Value],
+    right: &[Value],
+    keys: &[PhysSortKey],
+) -> Result<Ordering, FerriteError> {
+    for ((left, right), key) in left.iter().zip(right).zip(keys) {
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) if key.nulls_first => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            (false, true) if key.nulls_first => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                let ordering = compare(left, right)?.expect("neither side is null");
+                if key.asc {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            }
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(Ordering::Equal)
 }
 
 /// Arity, nullability and type check before a row reaches storage, plus the

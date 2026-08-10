@@ -11,10 +11,11 @@
 //! triggers first — which is where Ferrite's access control lives, since
 //! there is no declarative RLS (see `ferrite-proc`'s README).
 
+mod aggregate;
 mod eval;
 mod executor;
 mod index;
 
-pub use eval::{compare, eval, eval_predicate};
+pub use eval::{compare, eval, eval_predicate, like_matches};
 pub use executor::{QueryResult, Session, Tuple};
 pub use index::IndexProvider;

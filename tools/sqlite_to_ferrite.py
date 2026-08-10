@@ -5,9 +5,19 @@
 
 Emits one `<table>.sql` per table under `out/`: the `CREATE TABLE`, then one
 `INSERT` per row, separated by a sentinel line so a statement may itself
-contain newlines. `types.md` records every type decision and everything that
-had to be dropped; `crates/ferrite-server/tests/replay.rs` replays the result
-and reports what got in.
+contain newlines. `_after.sql` holds what only makes sense once every table
+exists — the index DDL, one query per shape a real application reads through
+(`count(*)`, `ORDER BY ... LIMIT`, `LIKE`, a `JOIN` across a `<x>_id` column,
+`GROUP BY ... HAVING`, `DISTINCT`), the `ALTER TABLE ... ADD COLUMN`
+migrations an application replays at boot together with an `INSERT` that
+leans on the `DEFAULT`s, and then the same queries again against the widened
+tables. All of it derived from this schema rather than hand-written.
+`types.md` records every type decision and
+everything that had to be dropped; `crates/ferrite-server/tests/replay.rs`
+replays the result and reports what got in and what answered.
+
+Note when migrating off SQLite: `LIKE` is case-insensitive there and
+case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ.
 
 Type mapping, and why:
 
@@ -158,6 +168,155 @@ def ferrite_type(decl, values, name):
     return "TEXT", "TEXT -> TEXT"
 
 
+INDEX_DDL = re.compile(
+    r"^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+(\S+)\s+ON\s+(\S+?)\s*\((.*?)\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def index_ddl(cur, notes):
+    """The index DDL, which can only run once."""
+    by_name = {n["table"]: n for n in notes}
+    out = []
+
+    for row in cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+    ).fetchall():
+        ddl = row[0].decode() if isinstance(row[0], bytes) else row[0]
+        match = INDEX_DDL.match(" ".join(ddl.split()))
+        # A partial index (`... WHERE status = 'paid'`) does not match, and
+        # Ferrite v1 has no equivalent, so it is left out rather than
+        # silently widened into a total one.
+        if not match:
+            continue
+        unique, name, table, columns = match.groups()
+        table = table.strip('"')
+        if table not in by_name:
+            continue
+        columns = [c.strip().strip('"') for c in columns.split(",")]
+        if any(c not in by_name[table]["types"] for c in columns):
+            continue
+        out.append(
+            f'CREATE {"UNIQUE " if unique else ""}INDEX {quote(name.strip(chr(34)))} '
+            f'ON {quote(table)} ({", ".join(quote(c) for c in columns)})'
+        )
+
+    return out
+
+
+def query_shapes(notes):
+    """The query shapes a real application runs.
+
+    Loading rows only proves the write path. An application also reads, and
+    it reads through joins, counts and sorts — so the replay ends with a
+    representative query per shape, derived from this schema rather than
+    hand-written, and reports which ones the server accepts.
+
+    Every shape here is replayed twice: once against the loaded rows, and
+    once after the migrations below have widened every table. A table that
+    just received a column has to stay readable through a `JOIN`, an
+    `ORDER BY` and a `GROUP BY`, which is exactly where the two features
+    meet.
+    """
+    by_name = {n["table"]: n for n in notes}
+    out = []
+
+    def columns_of(note, *types):
+        return [c for c, ty in note["types"].items() if ty in types]
+
+    ranked = sorted(notes, key=lambda n: -(n["rows"] - n["skipped_rows"]))
+    populated = [n for n in ranked if n["rows"] - n["skipped_rows"] > 0]
+    if not populated:
+        return out
+
+    biggest = populated[0]
+    out.append(f'SELECT count(*) FROM {quote(biggest["table"])}')
+
+    for note in populated:
+        stamps = columns_of(note, "TIMESTAMP")
+        if stamps:
+            out.append(
+                f'SELECT * FROM {quote(note["table"])} '
+                f'ORDER BY {quote(stamps[0])} DESC LIMIT 20'
+            )
+            break
+
+    for note in populated:
+        texts = columns_of(note, "TEXT")
+        if texts:
+            out.append(
+                f'SELECT count(*) FROM {quote(note["table"])} '
+                f"WHERE {quote(texts[0])} LIKE '%a%'"
+            )
+            break
+
+    # A `<x>_id` column naming a table whose single-column primary key it
+    # can be compared against is the closest thing to a foreign key left
+    # after the translation drops them.
+    joins = 0
+    for note in populated:
+        for column in note["types"]:
+            if not column.endswith("_id") or joins >= 2:
+                continue
+            stem = column[:-3]
+            target = next(
+                (
+                    by_name[c]
+                    for c in (stem, stem + "s", stem + "es")
+                    if c in by_name
+                    and by_name[c]["pk"]
+                    and by_name[c]["types"].get(by_name[c]["pk"])
+                    == note["types"][column]
+                ),
+                None,
+            )
+            if target is None or target["table"] == note["table"]:
+                continue
+            left, right = note["table"], target["table"]
+            key = target["pk"]
+            out.append(
+                f"SELECT {quote(left)}.{quote(column)}, {quote(right)}.{quote(key)} "
+                f"FROM {quote(left)} JOIN {quote(right)} "
+                f"ON {quote(right)}.{quote(key)} = {quote(left)}.{quote(column)} LIMIT 20"
+            )
+            out.append(
+                f"SELECT {quote(right)}.{quote(key)}, count(*) "
+                f"FROM {quote(right)} LEFT JOIN {quote(left)} "
+                f"ON {quote(left)}.{quote(column)} = {quote(right)}.{quote(key)} "
+                f"GROUP BY {quote(right)}.{quote(key)} "
+                f"HAVING count(*) > 1"
+            )
+            out.append(
+                f"SELECT DISTINCT {quote(column)} FROM {quote(left)} "
+                f"ORDER BY {quote(column)}"
+            )
+            joins += 1
+
+    return out
+
+
+def migrations(notes):
+    """The migration an application replays at boot, then a write that leans
+    on the defaults: a nullable column, a `NOT NULL DEFAULT` one, the same
+    migration re-run, a read of the rows written before both existed, and an
+    `INSERT` naming only the columns the application has no choice but to
+    supply.
+    """
+    out = []
+    for n in notes:
+        t = quote(n["table"])
+        out.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
+        out.append(
+            f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added_flag" '
+            "BIGINT NOT NULL DEFAULT 0"
+        )
+        out.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
+        out.append(f'SELECT "ferrite_added", "ferrite_added_flag" FROM {t}')
+        if n["probe"]:
+            out.append(n["probe"])
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     db = sqlite3.connect(DB)
@@ -286,26 +445,13 @@ def main():
                 "skipped_rows": skipped_rows,
                 "decisions": decisions,
                 "probe": probe,
+                "types": {c["name"]: ty for _, c, ty in kept},
+                "pk": pk[0] if len(pk) == 1 else None,
             }
         )
 
-    # Everything that only makes sense once every table is there, and holds
-    # rows: the migration an application replays at boot, then a write that
-    # leans on the defaults.
-    after = []
-    for n in notes:
-        t = quote(n["table"])
-        after.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
-        after.append(
-            f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added_flag" '
-            "BIGINT NOT NULL DEFAULT 0"
-        )
-        # Re-running a migration list has to be a no-op, not an error.
-        after.append(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS "ferrite_added" TEXT')
-        # Rows written before the two columns existed still have to read.
-        after.append(f'SELECT "ferrite_added", "ferrite_added_flag" FROM {t}')
-        if n["probe"]:
-            after.append(n["probe"])
+    reads = query_shapes(notes)
+    after = index_ddl(cur, notes) + reads + migrations(notes) + reads
     with open(os.path.join(OUT, "_after.sql"), "w", encoding="utf-8") as f:
         f.write(("\n" + SENTINEL + "\n").join(after))
 

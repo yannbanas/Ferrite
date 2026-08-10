@@ -4,6 +4,10 @@
 //! (Agent 2) provide the real ones. There is no MVCC visibility here —
 //! writes are immediately visible to everyone — because these tests are
 //! about the executor's control flow, not about isolation.
+//!
+//! Each integration test binary compiles this module separately, so
+//! whatever that one binary does not use looks dead to the compiler.
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};

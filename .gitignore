@@ -9,3 +9,7 @@ crates/*/fuzz/coverage
 # The server default data directory (FERRITE_DATA), if it is ever run
 # from inside the repository.
 data/
+
+# Default output of tools/sqlite_to_ferrite.py: a translated copy of
+# somebody's real database, which has no business in the repository.
+out/

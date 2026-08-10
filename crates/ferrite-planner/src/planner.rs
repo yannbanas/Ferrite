@@ -1,16 +1,23 @@
 //! Rule-based planner: `ferrite-sql` AST -> logical plan -> physical plan.
 
 use ferrite_common::{
-    Catalog, ColumnDef, ColumnDefault, DataType, FerriteError, IndexCatalog, IndexDef, Schema,
-    Value,
+    Catalog, ColumnDef, ColumnDefault, FerriteError, IndexCatalog, IndexDef, Schema, Value,
 };
 use ferrite_sql::ast as sql;
 
-use crate::expr::{BinaryOp, Expr};
-use crate::logical::{split_conjunction, LogicalPlan, ProjectionItem, TableSource};
-use crate::lower::{coerce, single_relation, single_select, Lowerer};
-use crate::physical::{bind, PhysExpr, PhysicalPlan};
+use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, Expr};
+use crate::logical::{
+    split_conjunction, JoinType, LogicalPlan, ProjectionItem, SortKey, TableSource,
+};
+use crate::lower::{
+    coerce, collect_aggregates, contains_aggregate, reject_ungrouped, row_count, single_select,
+    substitute_group_keys, unsupported, AggregateSlots, Lowerer,
+};
+use crate::physical::{
+    aggregate_schema, bind, infer, PhysAggregate, PhysExpr, PhysSortKey, PhysicalPlan,
+};
 use crate::rules::optimize;
+use crate::scope::Scope;
 
 /// Schema names resolve here when a statement writes an unqualified table
 /// name, matching PostgreSQL's default search path.
@@ -52,8 +59,8 @@ impl<'a> Planner<'a> {
     /// pushdown rule can be tested against the shape it actually receives.
     ///
     /// This is the only method that knows the AST type. Everything
-    /// `ferrite-sql` can parse but `ferrite-exec` cannot run — joins,
-    /// aggregates, `ORDER BY`, DDL, transaction control — leaves here as a
+    /// `ferrite-sql` can parse but `ferrite-exec` cannot run — subqueries,
+    /// set operations, DDL, transaction control — leaves here as a
     /// [`FerriteError::Plan`]; see [`crate::lower`].
     pub fn build_logical(&self, stmt: &sql::Statement) -> Result<LogicalPlan, FerriteError> {
         match stmt {
@@ -87,45 +94,205 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// `FROM` → `WHERE` → grouping → `HAVING` → `ORDER BY` → projection →
+    /// `DISTINCT` → `LIMIT`, which is SQL's own evaluation order and the
+    /// order the names become available in.
+    ///
+    /// `ORDER BY` sits *below* the projection so it can sort on columns the
+    /// select list does not carry; select-list aliases and ordinals are
+    /// resolved against the projection first, so both spellings work.
     fn build_select(&self, query: &sql::Query) -> Result<LogicalPlan, FerriteError> {
-        let (select, limit) = single_select(query)?;
-        let (name, qualifiers) = single_relation(&select.from)?;
+        let tail = single_select(query)?;
+        let select = tail.select;
+
+        let (mut plan, qualifiers) = self.build_from(&select.from)?;
+        let from_scope = plan
+            .scope()
+            .expect("a FROM tree is made of scans and joins, which both have a scope");
         let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers.clone());
 
-        let source = self.resolve(name)?;
-        let schema = source.schema.clone();
-
-        let mut plan = LogicalPlan::Scan {
-            source,
-            filter: None,
-        };
-
         if let Some(predicate) = &select.selection {
+            if contains_aggregate(predicate) {
+                return Err(FerriteError::Plan(
+                    "aggregates are not allowed in WHERE; use HAVING".into(),
+                ));
+            }
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate: lowerer.expr(predicate)?,
             };
         }
 
-        if let Some(items) = projection_items(&select.projection, &qualifiers, &lowerer)? {
-            let items = items
-                .into_iter()
-                .map(|item| resolve_output_name(item, &schema))
-                .collect();
+        let mut calls = Vec::new();
+        for item in &select.projection {
+            if let sql::SelectItem::Expr { expr, .. } = item {
+                collect_aggregates(expr, &mut calls)?;
+            }
+        }
+        if let Some(having) = &select.having {
+            collect_aggregates(having, &mut calls)?;
+        }
+        for item in tail.order_by {
+            collect_aggregates(&item.expr, &mut calls)?;
+        }
+
+        let grouped = !select.group_by.is_empty() || !calls.is_empty() || select.having.is_some();
+        let mut group_keys = Vec::new();
+        let scope = if grouped {
+            for key in &select.group_by {
+                group_keys.push(lowerer.expr(key)?);
+            }
+            let aggregates = calls
+                .iter()
+                .map(|call| lower_aggregate(call, &lowerer))
+                .collect::<Result<Vec<_>, _>>()?;
+            let schema = aggregate_schema(&group_keys, &aggregates, &from_scope)?;
+            plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by: group_keys.clone(),
+                aggregates,
+            };
+            Scope::anonymous(&schema)
+        } else {
+            from_scope
+        };
+
+        let slots = AggregateSlots {
+            calls: &calls,
+            offset: group_keys.len(),
+        };
+        let upper = Lowerer::new(self.params)
+            .with_qualifiers(qualifiers)
+            .with_aggregates(slots);
+        let rewrite = |expr: &sql::Expr| -> Result<Expr, FerriteError> {
+            let lowered = substitute_group_keys(upper.expr(expr)?, &group_keys);
+            if grouped {
+                reject_ungrouped(&lowered)?;
+            }
+            Ok(lowered)
+        };
+
+        if let Some(having) = &select.having {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: rewrite(having)?,
+            };
+        }
+
+        let items = projection_items(&select.projection, &scope, grouped, &rewrite)?;
+
+        let keys = sort_keys(tail.order_by, items.as_deref(), &rewrite)?;
+        if !keys.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys,
+            };
+        }
+
+        if let Some(items) = items {
             plan = LogicalPlan::Projection {
                 input: Box::new(plan),
                 items,
             };
         }
 
-        if let Some(count) = limit {
+        if select.distinct {
+            plan = LogicalPlan::Distinct {
+                input: Box::new(plan),
+            };
+        }
+
+        let count = row_count(tail.limit, &lowerer, "LIMIT")?;
+        let offset = row_count(tail.offset, &lowerer, "OFFSET")?.unwrap_or(0);
+        if count.is_some() || offset > 0 {
             plan = LogicalPlan::Limit {
                 input: Box::new(plan),
                 count,
+                offset,
             };
         }
 
         Ok(plan)
+    }
+
+    /// A comma-separated `FROM` list is a cross join, which is what the
+    /// standard says it is; a `WHERE` that relates the two is then turned
+    /// into the join predicate by [`crate::rules`].
+    fn build_from(
+        &self,
+        from: &[sql::TableWithJoins],
+    ) -> Result<(LogicalPlan, Vec<String>), FerriteError> {
+        let mut items = from.iter();
+        let Some(first) = items.next() else {
+            return Err(unsupported("a SELECT without FROM"));
+        };
+        let (mut plan, mut qualifiers) = self.build_joins(first)?;
+        for next in items {
+            let (right, right_qualifiers) = self.build_joins(next)?;
+            qualifiers.extend(right_qualifiers);
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(right),
+                join_type: JoinType::Cross,
+                on: None,
+            };
+        }
+        Ok((plan, qualifiers))
+    }
+
+    fn build_joins(
+        &self,
+        item: &sql::TableWithJoins,
+    ) -> Result<(LogicalPlan, Vec<String>), FerriteError> {
+        let (mut plan, mut qualifiers) = self.table_factor(&item.relation)?;
+        for join in &item.joins {
+            let (right, right_qualifiers) = self.table_factor(&join.relation)?;
+            let left_scope = plan.scope().expect("a FROM tree always has a scope");
+            let right_scope = right.scope().expect("a FROM tree always has a scope");
+            qualifiers.extend(right_qualifiers);
+
+            let on = match &join.constraint {
+                sql::JoinConstraint::None => None,
+                sql::JoinConstraint::On(expr) => {
+                    if contains_aggregate(expr) {
+                        return Err(unsupported("an aggregate in a join condition"));
+                    }
+                    let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers.clone());
+                    Some(lowerer.expr(expr)?)
+                }
+                sql::JoinConstraint::Using(columns) => {
+                    Some(using_predicate(columns, &left_scope, &right_scope)?)
+                }
+            };
+
+            plan = LogicalPlan::Join {
+                left: Box::new(plan),
+                right: Box::new(right),
+                join_type: join_type(join.join_type),
+                on,
+            };
+        }
+        Ok((plan, qualifiers))
+    }
+
+    fn table_factor(
+        &self,
+        factor: &sql::TableFactor,
+    ) -> Result<(LogicalPlan, Vec<String>), FerriteError> {
+        match factor {
+            sql::TableFactor::Table { name, alias } => {
+                let source = self.resolve(name, alias.clone())?;
+                let qualifiers = source.qualifiers();
+                Ok((
+                    LogicalPlan::Scan {
+                        source,
+                        filter: None,
+                    },
+                    qualifiers,
+                ))
+            }
+            sql::TableFactor::Derived { .. } => Err(unsupported("a subquery in FROM")),
+        }
     }
 
     fn build_insert(&self, stmt: &sql::Insert) -> Result<LogicalPlan, FerriteError> {
@@ -140,7 +307,7 @@ impl<'a> Planner<'a> {
             ));
         };
 
-        let source = self.resolve(&stmt.table)?;
+        let source = self.resolve(&stmt.table, None)?;
         let width = source.schema.columns.len();
         let lowerer = Lowerer::new(self.params);
 
@@ -199,10 +366,8 @@ impl<'a> Planner<'a> {
                 "RETURNING is not supported by the v1 planner".into(),
             ));
         }
-        let source = self.resolve(&stmt.table)?;
-        let mut qualifiers = vec![stmt.table.base().to_string()];
-        qualifiers.extend(stmt.alias.clone());
-        let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers);
+        let source = self.resolve(&stmt.table, stmt.alias.clone())?;
+        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
 
         let mut assignments = Vec::with_capacity(stmt.assignments.len());
         for sql::Assignment { column, value } in &stmt.assignments {
@@ -231,10 +396,8 @@ impl<'a> Planner<'a> {
                 "RETURNING is not supported by the v1 planner".into(),
             ));
         }
-        let source = self.resolve(&stmt.table)?;
-        let mut qualifiers = vec![stmt.table.base().to_string()];
-        qualifiers.extend(stmt.alias.clone());
-        let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers);
+        let source = self.resolve(&stmt.table, stmt.alias.clone())?;
+        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
 
         let input = self.filtered_scan(&source, stmt.selection.as_ref(), &lowerer)?;
         Ok(LogicalPlan::Delete {
@@ -277,57 +440,184 @@ impl<'a> Planner<'a> {
     /// Lower an optimized logical plan, choosing an access path for every
     /// scan on the way down.
     pub fn to_physical(&self, plan: LogicalPlan) -> Result<PhysicalPlan, FerriteError> {
+        Ok(self.lower_plan(plan)?.0)
+    }
+
+    /// The scope travels back up with the plan: a node binds its own
+    /// expressions against the shape its input produces, which for a join
+    /// is neither side's schema on its own.
+    fn lower_plan(&self, plan: LogicalPlan) -> Result<(PhysicalPlan, Scope), FerriteError> {
         match plan {
-            LogicalPlan::Scan { source, filter } => self.access_path(&source, filter),
+            LogicalPlan::Scan { source, filter } => {
+                let scope = Scope::for_relation(&source.schema, &source.qualifiers());
+                let physical = self.access_path(&source, filter, &scope)?;
+                Ok((physical, scope))
+            }
+
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+            } => {
+                let (left_plan, mut left_scope) = self.lower_plan(*left)?;
+                let (right_plan, mut right_scope) = self.lower_plan(*right)?;
+                if join_type.preserves_right() {
+                    left_scope = left_scope.nullable();
+                }
+                if join_type.preserves_left() {
+                    right_scope = right_scope.nullable();
+                }
+                let scope = Scope::concat(left_scope, right_scope);
+                let predicate = on.map(|e| bind(&e, &scope)).transpose()?;
+                let output = scope.schema();
+                Ok((
+                    PhysicalPlan::NestedLoopJoin {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        join_type,
+                        predicate,
+                        output,
+                    },
+                    scope,
+                ))
+            }
 
             LogicalPlan::Filter { input, predicate } => {
-                let input = self.to_physical(*input)?;
-                let schema = input.output_schema().cloned().ok_or_else(|| {
-                    FerriteError::Plan("cannot filter a statement that produces no rows".into())
-                })?;
-                Ok(PhysicalPlan::Filter {
-                    predicate: bind(&predicate, &schema)?,
-                    input: Box::new(input),
-                })
+                let (input, scope) = self.lower_plan(*input)?;
+                Ok((
+                    PhysicalPlan::Filter {
+                        predicate: bind(&predicate, &scope)?,
+                        input: Box::new(input),
+                    },
+                    scope,
+                ))
+            }
+
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                let (input, input_scope) = self.lower_plan(*input)?;
+                let output = aggregate_schema(&group_by, &aggregates, &input_scope)?;
+                let group_by = group_by
+                    .iter()
+                    .map(|e| bind(e, &input_scope))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let aggregates = aggregates
+                    .iter()
+                    .map(|call| {
+                        Ok(PhysAggregate {
+                            func: call.func,
+                            arg: call
+                                .arg
+                                .as_ref()
+                                .map(|e| bind(e, &input_scope))
+                                .transpose()?,
+                            distinct: call.distinct,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, FerriteError>>()?;
+                let scope = Scope::anonymous(&output);
+                Ok((
+                    PhysicalPlan::Aggregate {
+                        input: Box::new(input),
+                        group_by,
+                        aggregates,
+                        output,
+                    },
+                    scope,
+                ))
             }
 
             LogicalPlan::Projection { input, items } => {
-                let input = self.to_physical(*input)?;
-                let schema = input.output_schema().cloned().ok_or_else(|| {
-                    FerriteError::Plan("cannot project a statement that produces no rows".into())
-                })?;
+                let (input, input_scope) = self.lower_plan(*input)?;
                 let mut exprs = Vec::with_capacity(items.len());
                 let mut columns = Vec::with_capacity(items.len());
                 for item in &items {
-                    exprs.push(bind(&item.expr, &schema)?);
-                    columns.push(output_column(item, &schema)?);
+                    exprs.push(bind(&item.expr, &input_scope)?);
+                    let (data_type, nullable) = infer(&item.expr, &input_scope)?;
+                    columns.push(ColumnDef::new(
+                        item.output_name.clone(),
+                        data_type,
+                        nullable,
+                    ));
                 }
-                Ok(PhysicalPlan::Projection {
-                    input: Box::new(input),
-                    exprs,
-                    output: Schema { columns },
-                })
+                let output = Schema { columns };
+                let scope = Scope::anonymous(&output);
+                Ok((
+                    PhysicalPlan::Projection {
+                        input: Box::new(input),
+                        exprs,
+                        output,
+                    },
+                    scope,
+                ))
             }
 
-            LogicalPlan::Limit { input, count } => Ok(PhysicalPlan::Limit {
-                input: Box::new(self.to_physical(*input)?),
+            LogicalPlan::Sort { input, keys } => {
+                let (input, scope) = self.lower_plan(*input)?;
+                let keys = keys
+                    .iter()
+                    .map(|key| {
+                        Ok(PhysSortKey {
+                            expr: bind(&key.expr, &scope)?,
+                            asc: key.asc,
+                            nulls_first: key.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, FerriteError>>()?;
+                Ok((
+                    PhysicalPlan::Sort {
+                        input: Box::new(input),
+                        keys,
+                    },
+                    scope,
+                ))
+            }
+
+            LogicalPlan::Distinct { input } => {
+                let (input, scope) = self.lower_plan(*input)?;
+                Ok((
+                    PhysicalPlan::Distinct {
+                        input: Box::new(input),
+                    },
+                    scope,
+                ))
+            }
+
+            LogicalPlan::Limit {
+                input,
                 count,
-            }),
+                offset,
+            } => {
+                let (input, scope) = self.lower_plan(*input)?;
+                Ok((
+                    PhysicalPlan::Limit {
+                        input: Box::new(input),
+                        count,
+                        offset,
+                    },
+                    scope,
+                ))
+            }
 
             LogicalPlan::Insert { source, rows } => {
-                let empty = Schema {
-                    columns: Vec::new(),
-                };
+                let empty = Scope::empty();
                 let rows = rows
                     .iter()
                     .map(|row| row.iter().map(|e| bind(e, &empty)).collect())
                     .collect::<Result<Vec<Vec<_>>, _>>()?;
-                Ok(PhysicalPlan::Insert {
-                    table: source.id,
-                    table_name: source.name,
-                    schema: source.schema,
-                    rows,
-                })
+                Ok((
+                    PhysicalPlan::Insert {
+                        table: source.id,
+                        table_name: source.name,
+                        schema: source.schema,
+                        rows,
+                    },
+                    Scope::empty(),
+                ))
             }
 
             LogicalPlan::Update {
@@ -336,38 +626,43 @@ impl<'a> Planner<'a> {
                 assignments,
             } => {
                 let scan = self.row_identity_source(*input, &source.name)?;
+                let scope = Scope::for_relation(&source.schema, &source.qualifiers());
                 let assignments = assignments
                     .iter()
-                    .map(|(position, expr)| Ok((*position, bind(expr, &source.schema)?)))
+                    .map(|(position, expr)| Ok((*position, bind(expr, &scope)?)))
                     .collect::<Result<Vec<_>, FerriteError>>()?;
-                Ok(PhysicalPlan::Update {
-                    table: source.id,
-                    table_name: source.name,
-                    schema: source.schema,
-                    source: Box::new(scan),
-                    assignments,
-                })
+                Ok((
+                    PhysicalPlan::Update {
+                        table: source.id,
+                        table_name: source.name,
+                        schema: source.schema,
+                        source: Box::new(scan),
+                        assignments,
+                    },
+                    Scope::empty(),
+                ))
             }
 
             LogicalPlan::Delete { source, input } => {
                 let scan = self.row_identity_source(*input, &source.name)?;
-                Ok(PhysicalPlan::Delete {
-                    table: source.id,
-                    table_name: source.name,
-                    schema: source.schema,
-                    source: Box::new(scan),
-                })
+                Ok((
+                    PhysicalPlan::Delete {
+                        table: source.id,
+                        table_name: source.name,
+                        schema: source.schema,
+                        source: Box::new(scan),
+                    },
+                    Scope::empty(),
+                ))
             }
 
             LogicalPlan::Call { name, args } => {
-                let empty = Schema {
-                    columns: Vec::new(),
-                };
+                let empty = Scope::empty();
                 let args = args
                     .iter()
                     .map(|e| bind(e, &empty))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(PhysicalPlan::CallProcedure { name, args })
+                Ok((PhysicalPlan::CallProcedure { name, args }, Scope::empty()))
             }
         }
     }
@@ -395,12 +690,13 @@ impl<'a> Planner<'a> {
         &self,
         source: &TableSource,
         filter: Option<Expr>,
+        scope: &Scope,
     ) -> Result<PhysicalPlan, FerriteError> {
         let mut conjuncts = filter.map(split_conjunction).unwrap_or_default();
         let indexes = self.indexes.indexes_for(source.id)?;
 
         let chosen = conjuncts.iter().enumerate().find_map(|(position, expr)| {
-            let (column, key) = index_equality(expr, &source.schema)?;
+            let (column, key) = index_equality(expr, scope)?;
             let index = pick_index(&indexes, &source.schema.columns[column].name)?;
             Some((position, index.clone(), column, key))
         });
@@ -409,7 +705,7 @@ impl<'a> Planner<'a> {
             Some((position, index, column, key)) => {
                 conjuncts.remove(position);
                 let residual = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, &source.schema))
+                    .map(|e| bind(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::IndexScan {
                     table: source.id,
@@ -423,7 +719,7 @@ impl<'a> Planner<'a> {
             }
             None => {
                 let filter = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, &source.schema))
+                    .map(|e| bind(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::SeqScan {
                     table: source.id,
@@ -435,7 +731,11 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn resolve(&self, table: &sql::ObjectName) -> Result<TableSource, FerriteError> {
+    fn resolve(
+        &self,
+        table: &sql::ObjectName,
+        alias: Option<String>,
+    ) -> Result<TableSource, FerriteError> {
         let (namespace, name) = table.split(DEFAULT_NAMESPACE);
         let id = self
             .catalog
@@ -444,6 +744,7 @@ impl<'a> Planner<'a> {
         Ok(TableSource {
             id,
             name: name.to_string(),
+            alias,
             schema: self.catalog.table_schema(id)?,
         })
     }
@@ -473,97 +774,186 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// A projection item before its output name has been decided; `None` there
-/// means "name it after the column it reads".
-struct RawItem {
-    expr: Expr,
-    alias: Option<String>,
+fn join_type(parsed: sql::JoinType) -> JoinType {
+    match parsed {
+        sql::JoinType::Inner => JoinType::Inner,
+        sql::JoinType::Left => JoinType::Left,
+        sql::JoinType::Right => JoinType::Right,
+        sql::JoinType::Full => JoinType::Full,
+        sql::JoinType::Cross => JoinType::Cross,
+    }
 }
 
+/// `USING (a, b)` is `left.a = right.a AND left.b = right.b`, resolved to
+/// positions here because the two sides may each be a join of several
+/// relations, so neither name alone would be unambiguous.
+fn using_predicate(columns: &[String], left: &Scope, right: &Scope) -> Result<Expr, FerriteError> {
+    let mut conjuncts = Vec::with_capacity(columns.len());
+    for name in columns {
+        let reference = crate::expr::ColumnRef::new(name.clone());
+        let left_position = left.resolve(&reference)?;
+        let right_position = right.resolve(&reference)?;
+        conjuncts.push(Expr::eq(
+            Expr::Slot(left_position),
+            Expr::Slot(left.len() + right_position),
+        ));
+    }
+    crate::logical::combine_conjunction(conjuncts)
+        .ok_or_else(|| FerriteError::Plan("USING needs at least one column".into()))
+}
+
+fn lower_aggregate(
+    call: &sql::FunctionCall,
+    lowerer: &Lowerer<'_>,
+) -> Result<AggregateCall, FerriteError> {
+    let func = AggregateFunc::parse(&call.name)
+        .ok_or_else(|| unsupported(&format!("the aggregate {}", call.name)))?;
+    let arg = match &call.args {
+        sql::FunctionArgs::Wildcard => {
+            if func != AggregateFunc::Count {
+                return Err(FerriteError::Plan(format!(
+                    "{}(*) is not defined; only count(*) is",
+                    call.name
+                )));
+            }
+            None
+        }
+        sql::FunctionArgs::List(args) => match args.as_slice() {
+            [only] => Some(lowerer.expr(only)?),
+            _ => {
+                return Err(FerriteError::Plan(format!(
+                    "{}() takes exactly one argument",
+                    call.name
+                )))
+            }
+        },
+    };
+    Ok(AggregateCall {
+        func,
+        arg,
+        distinct: call.distinct,
+    })
+}
+
+/// A projection item before its output name has been decided.
 /// `None` means "no projection node needed" (bare `SELECT *`).
 fn projection_items(
     projection: &[sql::SelectItem],
-    qualifiers: &[String],
-    lowerer: &Lowerer<'_>,
-) -> Result<Option<Vec<RawItem>>, FerriteError> {
+    scope: &Scope,
+    grouped: bool,
+    rewrite: &impl Fn(&sql::Expr) -> Result<Expr, FerriteError>,
+) -> Result<Option<Vec<ProjectionItem>>, FerriteError> {
     if projection.is_empty() {
         return Err(FerriteError::Plan("empty SELECT list".into()));
     }
+    if projection.len() == 1 && matches!(projection[0], sql::SelectItem::Wildcard) && !grouped {
+        return Ok(None);
+    }
 
-    let mut wildcards = 0;
+    let mut items = Vec::with_capacity(projection.len());
     for item in projection {
         match item {
-            sql::SelectItem::Wildcard => wildcards += 1,
+            sql::SelectItem::Wildcard | sql::SelectItem::QualifiedWildcard(_) if grouped => {
+                return Err(FerriteError::Plan(
+                    "* cannot be used with GROUP BY or an aggregate".into(),
+                ))
+            }
+            sql::SelectItem::Wildcard => {
+                items.extend(expand(0..scope.len(), scope)?);
+            }
             sql::SelectItem::QualifiedWildcard(name) => {
-                if !qualifiers.iter().any(|q| q == name.base()) {
+                let positions = scope.positions_for(name.base());
+                if positions.is_empty() {
                     return Err(FerriteError::Plan(format!(
                         "no relation named {} in this statement",
                         name.base()
                     )));
                 }
-                wildcards += 1;
+                items.extend(expand(positions, scope)?);
             }
-            sql::SelectItem::Expr { .. } => {}
+            sql::SelectItem::Expr { expr, alias } => items.push(ProjectionItem {
+                expr: rewrite(expr)?,
+                output_name: alias.clone().unwrap_or_else(|| output_name(expr)),
+            }),
         }
     }
-    if wildcards == 1 && projection.len() == 1 {
-        return Ok(None);
-    }
-    if wildcards > 0 {
-        return Err(FerriteError::Plan(
-            "mixing `*` with explicit select items is not supported in v1".into(),
-        ));
-    }
-
-    let items = projection
-        .iter()
-        .map(|item| {
-            let sql::SelectItem::Expr { expr, alias } = item else {
-                unreachable!("wildcards were rejected above");
-            };
-            Ok(RawItem {
-                expr: lowerer.expr(expr)?,
-                alias: alias.clone(),
-            })
-        })
-        .collect::<Result<_, FerriteError>>()?;
     Ok(Some(items))
 }
 
-fn resolve_output_name(item: RawItem, _schema: &Schema) -> ProjectionItem {
-    let output_name = item.alias.unwrap_or_else(|| match &item.expr {
-        Expr::Column(name) => name.clone(),
+fn expand(
+    positions: impl IntoIterator<Item = usize>,
+    scope: &Scope,
+) -> Result<Vec<ProjectionItem>, FerriteError> {
+    positions
+        .into_iter()
+        .map(|position| {
+            Ok(ProjectionItem {
+                expr: Expr::Slot(position),
+                output_name: scope.column(position)?.name.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What PostgreSQL calls the column when the select item has no alias: the
+/// column's own name, the function's name, or `?column?`.
+fn output_name(expr: &sql::Expr) -> String {
+    match expr {
+        sql::Expr::Column(name) => name.base().to_string(),
+        sql::Expr::Function(call) => call.name.clone(),
+        sql::Expr::Cast { data_type, .. } => format!("{data_type:?}").to_lowercase(),
         _ => "?column?".to_string(),
-    });
-    ProjectionItem {
-        expr: item.expr,
-        output_name,
     }
 }
 
-/// Output column metadata for one projection item. v1 projects columns and
-/// literals only; computed expressions would need a type inference pass
-/// that does not exist yet.
-fn output_column(item: &ProjectionItem, input: &Schema) -> Result<ColumnDef, FerriteError> {
-    match &item.expr {
-        Expr::Column(name) => {
-            let position = input
-                .column_index(name)
-                .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))?;
-            Ok(ColumnDef {
-                name: item.output_name.clone(),
-                default: None,
-                ..input.columns[position].clone()
-            })
+/// `ORDER BY` resolves an ordinal or a bare select-list alias against the
+/// projection, and anything else against the row the projection reads —
+/// which is why the sort node sits below it.
+///
+/// A missing `NULLS FIRST`/`NULLS LAST` follows PostgreSQL: nulls sort as
+/// if larger than any value, so they come last ascending and first
+/// descending.
+fn sort_keys(
+    order_by: &[sql::OrderByItem],
+    items: Option<&[ProjectionItem]>,
+    rewrite: &impl Fn(&sql::Expr) -> Result<Expr, FerriteError>,
+) -> Result<Vec<SortKey>, FerriteError> {
+    let mut keys = Vec::with_capacity(order_by.len());
+    for item in order_by {
+        let expr = match select_list_reference(&item.expr, items)? {
+            Some(expr) => expr,
+            None => rewrite(&item.expr)?,
+        };
+        keys.push(SortKey {
+            expr,
+            asc: item.asc,
+            nulls_first: item.nulls_first.unwrap_or(!item.asc),
+        });
+    }
+    Ok(keys)
+}
+
+fn select_list_reference(
+    expr: &sql::Expr,
+    items: Option<&[ProjectionItem]>,
+) -> Result<Option<Expr>, FerriteError> {
+    let items = items.unwrap_or_default();
+    match expr {
+        sql::Expr::Literal(sql::Literal::Int(n)) => {
+            let position = usize::try_from(*n)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .filter(|n| *n < items.len())
+                .ok_or_else(|| {
+                    FerriteError::Plan(format!("ORDER BY position {n} is not in the select list"))
+                })?;
+            Ok(Some(items[position].expr.clone()))
         }
-        Expr::Literal(value) => Ok(ColumnDef::new(
-            item.output_name.clone(),
-            value.data_type().unwrap_or(DataType::Text),
-            true,
-        )),
-        other => Err(FerriteError::Plan(format!(
-            "computed select expressions are not supported in v1: {other:?}"
-        ))),
+        sql::Expr::Column(name) if name.qualifier().is_none() => Ok(items
+            .iter()
+            .find(|item| item.output_name == name.base())
+            .map(|item| item.expr.clone())),
+        _ => Ok(None),
     }
 }
 
@@ -575,7 +965,7 @@ fn output_column(item: &ProjectionItem, input: &Schema) -> Result<ColumnDef, Fer
 /// match nothing at all rather than fall back to a scan. A literal that
 /// cannot be coerced yields `None`, leaving the conjunct as an ordinary
 /// filter whose evaluation reports the type error.
-fn index_equality(expr: &Expr, schema: &Schema) -> Option<(usize, Value)> {
+fn index_equality(expr: &Expr, scope: &Scope) -> Option<(usize, Value)> {
     let Expr::Binary {
         left,
         op: BinaryOp::Eq,
@@ -584,18 +974,18 @@ fn index_equality(expr: &Expr, schema: &Schema) -> Option<(usize, Value)> {
     else {
         return None;
     };
-    let (name, value) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(name), Expr::Literal(value)) => (name, value),
-        (Expr::Literal(value), Expr::Column(name)) => (name, value),
+    let (reference, value) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(reference), Expr::Literal(value)) => (reference, value),
+        (Expr::Literal(value), Expr::Column(reference)) => (reference, value),
         _ => return None,
     };
     if value.is_null() {
         return None;
     }
-    let position = schema.column_index(name)?;
+    let position = scope.resolve(reference).ok()?;
     match coerce(
         Expr::Literal(value.clone()),
-        schema.columns[position].data_type,
+        scope.column(position).ok()?.data_type,
     ) {
         Ok(Expr::Literal(key)) => Some((position, key)),
         _ => None,
@@ -615,466 +1005,4 @@ fn pick_index<'i>(indexes: &'i [IndexDef], column: &str) -> Option<&'i IndexDef>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ferrite_common::{IndexId, TableId};
-    use std::collections::HashMap;
-
-    struct TestCatalog {
-        tables: HashMap<String, (TableId, Schema)>,
-    }
-
-    impl TestCatalog {
-        fn users() -> Self {
-            let schema = Schema {
-                columns: vec![
-                    ColumnDef::new("id", DataType::Int8, false),
-                    ColumnDef::new("name", DataType::Text, true),
-                    ColumnDef::new("age", DataType::Int4, true),
-                ],
-            };
-            let mut tables = HashMap::new();
-            tables.insert("public.users".to_string(), (1, schema));
-            Self { tables }
-        }
-    }
-
-    impl Catalog for TestCatalog {
-        fn table_id(&self, schema: &str, name: &str) -> Result<Option<TableId>, FerriteError> {
-            Ok(self.tables.get(&format!("{schema}.{name}")).map(|t| t.0))
-        }
-        fn table_schema(&self, table: TableId) -> Result<Schema, FerriteError> {
-            self.tables
-                .values()
-                .find(|(id, _)| *id == table)
-                .map(|(_, s)| s.clone())
-                .ok_or(FerriteError::RowNotFound)
-        }
-        fn create_table(
-            &self,
-            _schema: &str,
-            _name: &str,
-            _columns: Schema,
-        ) -> Result<TableId, FerriteError> {
-            unimplemented!("not needed for planner tests")
-        }
-        fn drop_table(&self, _table: TableId) -> Result<(), FerriteError> {
-            unimplemented!("not needed for planner tests")
-        }
-        fn list_tables(&self, _schema: &str) -> Result<Vec<(TableId, String)>, FerriteError> {
-            unimplemented!("not needed for planner tests")
-        }
-    }
-
-    #[derive(Default)]
-    struct TestIndexes(Vec<IndexDef>);
-
-    impl IndexCatalog for TestIndexes {
-        fn create_index(
-            &self,
-            _name: &str,
-            _table: TableId,
-            _columns: &[String],
-            _unique: bool,
-        ) -> Result<IndexId, FerriteError> {
-            unimplemented!("not needed for planner tests")
-        }
-        fn drop_index(&self, _index: IndexId) -> Result<(), FerriteError> {
-            unimplemented!("not needed for planner tests")
-        }
-        fn index(&self, index: IndexId) -> Result<Option<IndexDef>, FerriteError> {
-            Ok(self.0.iter().find(|i| i.id == index).cloned())
-        }
-        fn index_by_name(
-            &self,
-            _namespace: &str,
-            name: &str,
-        ) -> Result<Option<IndexDef>, FerriteError> {
-            Ok(self.0.iter().find(|i| i.name == name).cloned())
-        }
-        fn indexes_for(&self, table: TableId) -> Result<Vec<IndexDef>, FerriteError> {
-            Ok(self
-                .0
-                .iter()
-                .filter(|i| i.table == table)
-                .cloned()
-                .collect())
-        }
-    }
-
-    fn id_index() -> TestIndexes {
-        TestIndexes(vec![IndexDef {
-            id: 20,
-            name: "users_pkey".into(),
-            table: 1,
-            columns: vec!["id".into()],
-            unique: true,
-        }])
-    }
-
-    fn plan_with(indexes: &TestIndexes, sql: &str) -> Result<PhysicalPlan, FerriteError> {
-        let catalog = TestCatalog::users();
-        let planner = Planner::new(&catalog, indexes);
-        planner.plan(&ferrite_sql::parse_statement(sql)?)
-    }
-
-    fn plan(sql: &str) -> Result<PhysicalPlan, FerriteError> {
-        plan_with(&id_index(), sql)
-    }
-
-    fn plan_unindexed(sql: &str) -> Result<PhysicalPlan, FerriteError> {
-        plan_with(&TestIndexes::default(), sql)
-    }
-
-    #[test]
-    fn equality_on_an_indexed_column_selects_an_index_scan() {
-        match plan("SELECT * FROM users WHERE id = 42").unwrap() {
-            PhysicalPlan::IndexScan {
-                index,
-                column,
-                key,
-                residual,
-                ..
-            } => {
-                assert_eq!(index, "users_pkey");
-                assert_eq!(column, 0);
-                assert_eq!(
-                    key,
-                    PhysExpr::Literal(Value::Int8(42)),
-                    "the key is coerced to the indexed column's declared type"
-                );
-                assert!(residual.is_none());
-            }
-            other => panic!("expected an IndexScan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn equality_on_an_unindexed_column_falls_back_to_a_seq_scan() {
-        match plan("SELECT * FROM users WHERE name = 'ada'").unwrap() {
-            PhysicalPlan::SeqScan { filter, .. } => assert_eq!(
-                filter,
-                Some(PhysExpr::binary(
-                    PhysExpr::Column(1),
-                    BinaryOp::Eq,
-                    PhysExpr::Literal(Value::Text("ada".into()))
-                ))
-            ),
-            other => panic!("expected a SeqScan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_range_predicate_never_selects_an_index() {
-        assert!(matches!(
-            plan("SELECT * FROM users WHERE id > 10").unwrap(),
-            PhysicalPlan::SeqScan { .. }
-        ));
-    }
-
-    #[test]
-    fn no_index_catalog_entry_means_seq_scan() {
-        assert!(matches!(
-            plan_unindexed("SELECT * FROM users WHERE id = 42").unwrap(),
-            PhysicalPlan::SeqScan { .. }
-        ));
-    }
-
-    #[test]
-    fn the_non_indexable_conjunct_survives_as_a_residual() {
-        match plan("SELECT * FROM users WHERE id = 42 AND age > 18").unwrap() {
-            PhysicalPlan::IndexScan { residual, .. } => assert_eq!(
-                residual,
-                Some(PhysExpr::binary(
-                    PhysExpr::Column(2),
-                    BinaryOp::Gt,
-                    PhysExpr::Literal(Value::Int4(18))
-                ))
-            ),
-            other => panic!("expected an IndexScan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn equality_against_null_does_not_probe_an_index() {
-        assert!(matches!(
-            plan("SELECT * FROM users WHERE id = NULL").unwrap(),
-            PhysicalPlan::SeqScan { .. }
-        ));
-    }
-
-    #[test]
-    fn pushdown_and_index_selection_compose() {
-        let plan = plan("SELECT name FROM users WHERE id = 1 LIMIT 5").unwrap();
-
-        let PhysicalPlan::Limit { input, count } = plan else {
-            panic!("expected a Limit at the root");
-        };
-        assert_eq!(count, 5);
-        let PhysicalPlan::Projection { input, output, .. } = *input else {
-            panic!("expected a Projection under the Limit");
-        };
-        assert_eq!(output.columns.len(), 1);
-        assert_eq!(output.columns[0].name, "name");
-        assert!(
-            matches!(*input, PhysicalPlan::IndexScan { .. }),
-            "the pushed-down predicate should have selected an index"
-        );
-    }
-
-    #[test]
-    fn update_lowers_to_an_index_scan_source() {
-        let plan = plan("UPDATE users SET name = 'grace' WHERE id = 3").unwrap();
-
-        let PhysicalPlan::Update {
-            source,
-            assignments,
-            ..
-        } = plan
-        else {
-            panic!("expected an Update at the root");
-        };
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].0, 1);
-        assert!(matches!(*source, PhysicalPlan::IndexScan { .. }));
-    }
-
-    #[test]
-    fn insert_pads_omitted_columns_with_null() {
-        let plan = plan_unindexed("INSERT INTO users (name) VALUES ('ada')").unwrap();
-
-        let PhysicalPlan::Insert { rows, .. } = plan else {
-            panic!("expected an Insert");
-        };
-        assert_eq!(
-            rows[0],
-            vec![
-                PhysExpr::Literal(Value::Null),
-                PhysExpr::Literal(Value::Text("ada".into())),
-                PhysExpr::Literal(Value::Null),
-            ]
-        );
-    }
-
-    /// A column an `INSERT` leaves out takes its `DEFAULT`, not `NULL` —
-    /// the case that used to write a silently wrong value into a nullable
-    /// column and a hard failure into a `NOT NULL` one.
-    #[test]
-    fn insert_fills_omitted_columns_with_their_default() {
-        let mut schema = Schema {
-            columns: vec![
-                ColumnDef::new("id", DataType::Int8, false),
-                ColumnDef::new("name", DataType::Text, true),
-                ColumnDef::new("totp_enabled", DataType::Int8, false)
-                    .with_default(ColumnDefault::Constant(Value::Int4(0))),
-                ColumnDef::new("visibility", DataType::Text, false)
-                    .with_default(ColumnDefault::Constant(Value::Text("everyone".into()))),
-                ColumnDef::new("created_at", DataType::Timestamp, false)
-                    .with_default(ColumnDefault::CurrentTimestamp),
-            ],
-        };
-        // The constant leaves `ferrite-sql` untyped; this is the step that
-        // pins it to the column's declared type.
-        crate::typecheck_defaults(&mut schema).unwrap();
-        assert_eq!(
-            schema.columns[2].default,
-            Some(ColumnDefault::Constant(Value::Int8(0))),
-            "the literal widens to the column's type at DDL time"
-        );
-
-        let mut tables = HashMap::new();
-        tables.insert("public.users".to_string(), (1, schema));
-        let catalog = TestCatalog { tables };
-        let indexes = TestIndexes::default();
-        let stmt = ferrite_sql::parse_statement("INSERT INTO users (id) VALUES (7)").unwrap();
-        let PhysicalPlan::Insert { rows, .. } =
-            Planner::new(&catalog, &indexes).plan(&stmt).unwrap()
-        else {
-            panic!("expected an Insert");
-        };
-        assert_eq!(rows[0][0], PhysExpr::Literal(Value::Int8(7)));
-        assert_eq!(rows[0][1], PhysExpr::Literal(Value::Null));
-        assert_eq!(rows[0][2], PhysExpr::Literal(Value::Int8(0)));
-        assert_eq!(
-            rows[0][3],
-            PhysExpr::Literal(Value::Text("everyone".into()))
-        );
-        assert!(
-            matches!(rows[0][4], PhysExpr::Literal(Value::Timestamp(t)) if t > 0),
-            "CURRENT_TIMESTAMP is folded to one literal for the whole statement"
-        );
-    }
-
-    #[test]
-    fn a_default_that_cannot_hold_is_refused_at_ddl_time() {
-        let checked = |column: ColumnDef| {
-            crate::typecheck_defaults(&mut Schema {
-                columns: vec![column],
-            })
-        };
-        assert!(checked(
-            ColumnDef::new("a", DataType::Int8, false)
-                .with_default(ColumnDefault::Constant(Value::Null))
-        )
-        .is_err());
-        assert!(checked(
-            ColumnDef::new("a", DataType::Int8, true)
-                .with_default(ColumnDefault::Constant(Value::Text("x".into())))
-        )
-        .is_err());
-        assert!(checked(
-            ColumnDef::new("a", DataType::Text, true).with_default(ColumnDefault::CurrentTimestamp)
-        )
-        .is_err());
-        assert!(checked(
-            ColumnDef::new("a", DataType::Int8, true)
-                .with_default(ColumnDefault::Constant(Value::Null))
-        )
-        .is_ok());
-        assert!(checked(
-            ColumnDef::new("a", DataType::Timestamp, false).with_default(ColumnDefault::Constant(
-                Value::Text("2026-08-10T12:00:00Z".into())
-            ))
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn an_unknown_table_is_a_planning_error() {
-        assert!(matches!(
-            plan("SELECT * FROM ghosts"),
-            Err(FerriteError::TableNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn an_unknown_column_is_a_planning_error() {
-        assert!(matches!(
-            plan("SELECT * FROM users WHERE nope = 1"),
-            Err(FerriteError::ColumnNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn parameters_are_substituted_as_literals() {
-        let catalog = TestCatalog::users();
-        let indexes = id_index();
-        let params = [Value::Int8(7)];
-        let planner = Planner::new(&catalog, &indexes).with_params(&params);
-        let stmt = ferrite_sql::parse_statement("SELECT * FROM users WHERE id = $1").unwrap();
-
-        match planner.plan(&stmt).unwrap() {
-            PhysicalPlan::IndexScan { key, .. } => {
-                assert_eq!(key, PhysExpr::Literal(Value::Int8(7)))
-            }
-            other => panic!("expected an IndexScan, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_unbound_parameter_is_a_planning_error() {
-        assert!(matches!(
-            plan("SELECT * FROM users WHERE id = $1"),
-            Err(FerriteError::Plan(_))
-        ));
-    }
-
-    #[test]
-    fn a_table_alias_qualifies_column_references() {
-        assert!(plan("SELECT u.name FROM users u WHERE u.id = 1").is_ok());
-        assert!(matches!(
-            plan("SELECT * FROM users u WHERE other.id = 1"),
-            Err(FerriteError::Plan(_))
-        ));
-    }
-
-    #[test]
-    fn between_and_in_expand_into_comparisons() {
-        assert!(plan("SELECT * FROM users WHERE age BETWEEN 18 AND 99").is_ok());
-        assert!(plan("SELECT * FROM users WHERE age IN (1, 2, 3)").is_ok());
-    }
-
-    #[test]
-    fn everything_outside_the_executable_subset_is_a_plan_error() {
-        for sql in [
-            "SELECT * FROM users JOIN users u2 ON u2.id = users.id",
-            "SELECT * FROM users, users u2",
-            "SELECT count(*) FROM users",
-            "SELECT * FROM users GROUP BY id",
-            "SELECT * FROM users ORDER BY id",
-            "SELECT DISTINCT name FROM users",
-            "SELECT * FROM users LIMIT 1 OFFSET 2",
-            "SELECT * FROM users UNION SELECT * FROM users",
-            "WITH x (id) AS (SELECT id FROM users) SELECT * FROM x",
-            "SELECT * FROM (SELECT id FROM users) s",
-            "SELECT * FROM users WHERE name LIKE 'a%'",
-            "SELECT * FROM users WHERE id IN (SELECT id FROM users)",
-            "SELECT age + 1 FROM users",
-            "INSERT INTO users (name) VALUES ('a') RETURNING id",
-            "INSERT INTO users SELECT id, name, age FROM users",
-            "UPDATE users SET name = 'a' RETURNING id",
-            "DELETE FROM users RETURNING id",
-            "BEGIN",
-            "CREATE TABLE t (a INT)",
-            "DROP TABLE users",
-            "CREATE INDEX i ON users (name)",
-        ] {
-            assert!(
-                matches!(plan(sql), Err(FerriteError::Plan(_))),
-                "{sql:?} should be a Plan error, got {:?}",
-                plan(sql)
-            );
-        }
-    }
-
-    #[test]
-    fn a_text_literal_is_coerced_to_the_target_column_type() {
-        struct Events;
-        impl Catalog for Events {
-            fn table_id(&self, _ns: &str, name: &str) -> Result<Option<TableId>, FerriteError> {
-                Ok((name == "events").then_some(2))
-            }
-            fn table_schema(&self, _table: TableId) -> Result<Schema, FerriteError> {
-                Ok(Schema {
-                    columns: vec![
-                        ColumnDef::new("id", DataType::Uuid, false),
-                        ColumnDef::new("at", DataType::Timestamp, false),
-                    ],
-                })
-            }
-            fn create_table(
-                &self,
-                _ns: &str,
-                _name: &str,
-                _columns: Schema,
-            ) -> Result<TableId, FerriteError> {
-                unimplemented!()
-            }
-            fn drop_table(&self, _table: TableId) -> Result<(), FerriteError> {
-                unimplemented!()
-            }
-            fn list_tables(&self, _ns: &str) -> Result<Vec<(TableId, String)>, FerriteError> {
-                unimplemented!()
-            }
-        }
-
-        let indexes = TestIndexes::default();
-        let planner = Planner::new(&Events, &indexes);
-        let stmt = ferrite_sql::parse_statement(
-            "INSERT INTO events VALUES ('0190f0d8-4b1a-7c3e-9d2f-1a2b3c4d5e6f', \
-             '2024-02-29T12:00:00Z')",
-        )
-        .unwrap();
-
-        let PhysicalPlan::Insert { rows, .. } = planner.plan(&stmt).unwrap() else {
-            panic!("expected an Insert");
-        };
-        assert_eq!(
-            rows[0],
-            vec![
-                PhysExpr::Literal(Value::Uuid(0x0190_f0d8_4b1a_7c3e_9d2f_1a2b_3c4d_5e6f)),
-                PhysExpr::Literal(Value::Timestamp(1_709_208_000_000_000)),
-            ]
-        );
-    }
-}
+mod tests;
