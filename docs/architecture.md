@@ -125,6 +125,41 @@ KEY`, 13 `UNIQUE`, 239 `DEFAULT`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun
 `CHECK`, aucun trigger, aucune vue dans ce schéma. 6 des 7 index se créent ;
 le septième est partiel (`WHERE status = 'paid'`).
 
+## Extensions syntaxiques envisagées (après la priorité PawChat, pas avant)
+
+Proposition de l'utilisateur (août 2026) : au-delà de la couverture SQL standard, un jeu de mots-clés qui n'existent dans aucune base grand public, pensés pour éliminer l'imbrication et exploiter ce que Ferrite a déjà (MVCC, identité, modèle procédural). Séquencé explicitement **après** que `ALTER TABLE`/`DEFAULT`/`JOIN`/agrégats fassent tourner PawChat pour de vrai — ce n'est pas la priorité actuelle, c'est la suite. Tri par faisabilité réelle, pas par ordre de préférence :
+
+**Contrainte transverse, non négociable** : aucun de ces mots ne doit être réservé. `user`, `session`, `live`, `why` sont des noms de colonne plausibles dans un vrai schéma (PawChat en a plusieurs). Postgres résout ça avec des mots-clés *contextuels* — reconnus seulement à la position grammaticale où ils ont un sens, jamais en conflit avec un identifiant. `ferrite-sql` doit suivre le même principe pour chaque mot-clé ajouté ci-dessous, sans exception.
+
+**Investissement à faire en premier, avant les mots-clés eux-mêmes** : la syntaxe pipeline `|>` (Google, *"SQL Has Problems. We Can Fix Them"*, VLDB 2024 ; PRQL en a fait tout son projet) — `FROM t |> WHERE ... |> AGGREGATE ...` au lieu de l'imbrication classique. Ça change la forme de l'AST de façon à rendre plusieurs mots-clés ci-dessous optionnels (leur intérêt principal était justement de tuer l'imbrication) plutôt que de les traiter un par un. À évaluer avant de committer sur la liste complète : peut-être qu'une partie de la Famille A devient inutile une fois `|>` en place.
+
+### Faisable à court/moyen terme (sucre syntaxique ou builtin borné)
+
+- **`TOP n PER x ORDER BY ...`** — top-N par groupe, généralisation du `DISTINCT ON` déjà présent en Postgres (cas dégénéré n=1). Se désucre vers une passe partition+tri+limite-par-partition ; pas besoin de fonctions de fenêtrage génériques pour livrer *ce* mot-clé spécifiquement, seulement pour l'opérateur qu'il implique.
+- **`SESSIONIZE BY ... GAP ...`** — gaps-and-islands. Opérateur spécialisé de la même famille que PER (partition + tri + rupture sur un seuil).
+- **`DECAY(half_life => ...)` / `FORGET FROM ... WHERE weight < ...`** — poids qui décroît avec le temps (`exp(-Δt/τ)`) comme fonction native utilisable dans `ORDER BY`/`RANK BY`, et `FORGET` comme sucre pour un `DELETE` sur ce poids calculé. Pas de nouvel opérateur d'exécution, juste une fonction builtin + réutilisation de `DELETE`.
+- **`UNIT`** — typage dimensionnel sur les colonnes numériques (`NUMERIC UNIT meters`), vérifié/inféré à travers les expressions arithmétiques au moment du plan. Borné : une passe de vérification de type en plus, pas un changement de moteur d'exécution.
+- **`INSERT ... ON CONFLICT DO UPDATE/NOTHING`** (ajout hors liste utilisateur, standard Postgres) — déjà noté comme non couvert par `ferrite-sql`. Pas exotique, mais c'est l'opération la plus demandée en pratique (upsert) et absente de la liste ci-dessus ; à prioriser au même niveau que PER en termes de valeur réelle.
+- **`QUALIFY`** (ajout, façon Snowflake/DuckDB) — filtrer sur le résultat d'une fonction de fenêtre sans sous-requête. Même esprit que PER, généralise au cas où la fonction de fenêtre n'est pas un simple top-N.
+
+### Faisable mais plus gros (touche le moteur de stockage, pas juste le parseur/planificateur)
+
+- **`AS OF` (point-in-time)** — Ferrite garde déjà les versions MVCC d'une ligne dans une seule charge utile B-tree, mais avec élagage local dès qu'aucun snapshot actif n'en a besoin (voir `ferrite-storage/README.md`) : pas de rétention longue durée par défaut. `AS OF` demande une vraie politique de rétention configurable (garder N jours d'historique avant élagage) — c'est un changement de politique de stockage, pas juste un mot-clé. Prior art sérieux : SQL:2011 (system-versioned tables), Datomic, XTDB.
+- **`DIFF ... BETWEEN`** — le « git diff » des données, dérivé d'`AS OF` une fois la rétention en place. Rare en pratique (pas seulement dans les bases grand public) ; vaut le coup précisément parce que c'est rare.
+- **`TRAVERSE ... DEPTH n..m ACYCLIC`** — remplace `WITH RECURSIVE` pour les traversées de graphe. Standardisé récemment (SQL:2023 SQL/PGQ, `GRAPH_TABLE`) donc pas une invention isolée, mais demande une vraie stratégie d'exécution itérative avec détection de cycle dans `ferrite-exec`, distincte du reste du moteur à règles.
+- **`SHAPE` / projection imbriquée façon GraphQL** (`SELECT user { name, posts: { title } }`) — nécessite que le catalogue connaisse les relations de clé étrangère pour dérivation automatique des jointures. Bloqué tant que les `FOREIGN KEY` restent jetées à l'import (voir plus haut, 4 FK jetées sur le schéma PawChat) : ce mot-clé a une vraie dépendance amont à poser avant lui — stocker et exposer les FK dans `ferrite-catalog`.
+
+### Recherche, honnêtement — pas un chantier de sprint
+
+- **`LIVE SELECT` / `MAINTAIN VIEW`** — flux de deltas en continu / vue matérialisée à maintenance incrémentale (differential dataflow, façon Materialize `SUBSCRIBE`). C'est un moteur de calcul incrémental entier, pas une fonctionnalité qu'on ajoute à un exécuteur à plans matérialisants comme celui de `ferrite-exec` v1 aujourd'hui. Intéressant précisément parce que Ferrite a déjà un modèle d'identité proche de SpacetimeDB (souscriptions par salle) — mais soyons clairs : ça se compte en mois d'ingénierie de recherche, pas en semaines, et ça suppose probablement de revoir l'exécuteur pour du dataflow incrémental plutôt que du pull matérialisant.
+- **`EXPLAIN WHY` (provenance)** — chaque tuple résultat porterait un polynôme de provenance (Green, Karvounarakis & Tannen, PODS 2007) au lieu d'un plan d'exécution classique. Fondement théorique solide, mais jamais industrialisé dans une base grand public pour une bonne raison : ça demande d'instrumenter chaque opérateur pour propager la provenance, pas juste d'ajouter une commande.
+- **`CONFIDENCE` / `MAYBE` (bases probabilistes)** — étendre le modèle de valeur pour porter une probabilité et la propager à travers les opérateurs (MayBMS, MystiQ). Change `ferrite_common::Value` en profondeur ; à ne considérer que si un vrai cas d'usage (données de classifieur/capteur) apparaît, pas en spéculatif.
+
+### Autres pistes (proposées ici, pas dans la liste initiale)
+
+- **`EXPLAIN` réel avec le plan choisi** — le planificateur est à règles, pas à coûts, donc un `EXPLAIN` fidèle (quel access path retenu, index utilisé ou non) est peu coûteux à exposer maintenant et donne aux utilisateurs un moyen de comprendre/optimiser leurs requêtes sans attendre le reste de cette liste.
+- **`current_identity()`** — équivalent de `current_user` côté Postgres, mais renvoyant une vraie `ferrite_common::Identity` exploitable dans une procédure/un trigger appelé depuis une requête, cohérent avec le modèle de sécurité déjà acté (§Modèle de sécurité).
+
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 
 - Endpoint de métriques Prometheus — pas encore de crate/emplacement défini.
