@@ -1113,15 +1113,83 @@ impl Parser {
     fn parse_subexpr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         self.enter()?;
         let mut left = self.parse_prefix()?;
+        let mut folds = 0u32;
         loop {
             let precedence = match self.peek_precedence() {
                 Some(p) if p > min_precedence => p,
                 _ => break,
             };
+            // `a OR b OR c …` is parsed as one run and folded into a
+            // balanced tree rather than a chain. What has to stay bounded
+            // is the *height* of the tree, not the parser's recursion:
+            // the planner, the executor and `Drop` all walk it
+            // recursively, and a chain grows one level per term without
+            // the parser ever recursing. Two hundred terms — a few
+            // kilobytes of SQL — used to be enough to overflow the stack
+            // and abort the process. `AND`/`OR` are associative, so the
+            // balanced tree means the same thing.
+            if let Some(op) = self.peek_boolean_run(min_precedence) {
+                left = self.parse_boolean_run(left, op, precedence)?;
+                continue;
+            }
+            // Anything else folds left-deep, so its height is counted
+            // against the same budget as recursion.
+            self.enter()?;
+            folds += 1;
             left = self.parse_infix(left, precedence)?;
+        }
+        for _ in 0..folds {
+            self.leave();
         }
         self.leave();
         Ok(left)
+    }
+
+    /// The associative boolean operator starting here, if this position
+    /// begins a run of them.
+    fn peek_boolean_run(&self, min_precedence: u8) -> Option<BinaryOp> {
+        match self.peek() {
+            Token::Keyword(Keyword::Or) if min_precedence < 1 => Some(BinaryOp::Or),
+            Token::Keyword(Keyword::And) if min_precedence < 2 => Some(BinaryOp::And),
+            _ => None,
+        }
+    }
+
+    /// Reads every operand of one `AND`/`OR` run and folds them into a
+    /// balanced tree, so a thousand terms are ten levels rather than a
+    /// thousand.
+    fn parse_boolean_run(
+        &mut self,
+        first: Expr,
+        op: BinaryOp,
+        precedence: u8,
+    ) -> Result<Expr, ParseError> {
+        let keyword = match op {
+            BinaryOp::Or => Keyword::Or,
+            _ => Keyword::And,
+        };
+        let mut operands = vec![first];
+        while self.eat_keyword(keyword) {
+            operands.push(self.parse_subexpr(precedence)?);
+        }
+        while operands.len() > 1 {
+            let mut folded = Vec::with_capacity(operands.len().div_ceil(2));
+            let mut pairs = operands.into_iter();
+            while let Some(left) = pairs.next() {
+                folded.push(match pairs.next() {
+                    Some(right) => Expr::BinaryOp {
+                        left: Box::new(left),
+                        op,
+                        right: Box::new(right),
+                    },
+                    None => left,
+                });
+            }
+            operands = folded;
+        }
+        operands
+            .pop()
+            .ok_or_else(|| self.err::<Expr>("a boolean operand").unwrap_err())
     }
 
     fn peek_precedence(&self) -> Option<u8> {

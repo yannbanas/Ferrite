@@ -278,26 +278,25 @@ pub fn infer(expr: &Expr, scope: &Scope) -> Result<(DataType, bool), FerriteErro
         }
         // The branch results decide the type; a `CASE` with no `ELSE`
         // yields null when nothing matches, so it is always nullable.
+        //
+        // Each branch is inferred exactly once. Inferring the first branch
+        // for the type and then every branch again for nullability reads
+        // more naturally and costs `2^depth` on nested `CASE`s, which a
+        // client reaches with thirty levels of nesting and a few hundred
+        // bytes of SQL.
         Expr::Case {
             branches,
             else_result,
             ..
         } => {
-            let data_type = match branches.first() {
-                Some((_, then)) => infer(then, scope)?.0,
-                None => DataType::Text,
-            };
-            let exhaustive = else_result
-                .as_ref()
-                .map(|e| infer(e, scope).map(|(_, n)| !n))
-                .transpose()?
-                .unwrap_or(false);
-            let any_branch_nullable = branches
+            let inferred = branches
                 .iter()
-                .map(|(_, then)| infer(then, scope).map(|(_, n)| n))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .any(|n| n);
+                .map(|(_, then)| infer(then, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let else_inferred = else_result.as_ref().map(|e| infer(e, scope)).transpose()?;
+            let data_type = inferred.first().map_or(DataType::Text, |(t, _)| *t);
+            let exhaustive = else_inferred.map(|(_, n)| !n).unwrap_or(false);
+            let any_branch_nullable = inferred.iter().any(|(_, n)| *n);
             (data_type, !exhaustive || any_branch_nullable)
         }
         Expr::Binary { left, op, right } if op.is_arithmetic() => {

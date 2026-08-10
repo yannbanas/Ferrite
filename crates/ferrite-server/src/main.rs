@@ -24,8 +24,26 @@ mod settings;
 use engine::Engine;
 use settings::Settings;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Stack every runtime thread gets.
+///
+/// The planner and the executor walk an expression tree recursively, and
+/// so does dropping one. `ferrite-sql` caps how tall a client can make
+/// that tree (`MAX_DEPTH`), and this is the other half of the same
+/// guarantee: enough room that the capped depth is nowhere near the
+/// limit, on a platform whose default is 1–2 MiB. A stack overflow is not
+/// a panic — it aborts the process, so no `catch_unwind` and no per-task
+/// isolation can contain one.
+const THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(THREAD_STACK_SIZE)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     banner::banner();
 
     tracing_subscriber::fmt()

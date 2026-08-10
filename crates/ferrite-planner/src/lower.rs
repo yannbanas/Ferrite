@@ -282,15 +282,11 @@ impl<'a> Lowerer<'a> {
                     return Err(unsupported("an empty IN list"));
                 }
                 let subject = self.expr(expr)?;
-                let mut disjunction: Option<Expr> = None;
+                let mut tests = Vec::with_capacity(list.len());
                 for item in list {
-                    let test = Expr::eq(subject.clone(), self.expr(item)?);
-                    disjunction = Some(match disjunction {
-                        None => test,
-                        Some(acc) => Expr::binary(acc, BinaryOp::Or, test),
-                    });
+                    tests.push(Expr::eq(subject.clone(), self.expr(item)?));
                 }
-                let any = disjunction.expect("the list was checked non-empty");
+                let any = balanced_or(tests);
                 Ok(if *negated {
                     Expr::Not(Box::new(any))
                 } else {
@@ -456,6 +452,30 @@ impl<'a> Lowerer<'a> {
 /// An aggregate inside another aggregate has no meaning — there is no inner
 /// grouping for it to run over — and is refused here rather than producing
 /// a slot that refers to itself.
+/// Folds `tests` into a single `OR`, halving rather than chaining.
+///
+/// A left-deep chain of a thousand `OR`s is a tree a thousand levels tall,
+/// and every later pass — binding, optimizing, evaluating, dropping —
+/// walks it recursively. Balanced, the same thousand terms are ten levels.
+/// `OR` is associative, so the two trees mean the same thing.
+fn balanced_or(mut tests: Vec<Expr>) -> Expr {
+    debug_assert!(!tests.is_empty(), "callers reject an empty IN list");
+    while tests.len() > 1 {
+        let mut folded = Vec::with_capacity(tests.len().div_ceil(2));
+        let mut pairs = tests.into_iter();
+        while let Some(left) = pairs.next() {
+            folded.push(match pairs.next() {
+                Some(right) => Expr::binary(left, BinaryOp::Or, right),
+                None => left,
+            });
+        }
+        tests = folded;
+    }
+    tests
+        .pop()
+        .unwrap_or(Expr::Literal(ferrite_common::Value::Boolean(false)))
+}
+
 pub(crate) fn collect_aggregates(
     expr: &sql::Expr,
     out: &mut Vec<sql::FunctionCall>,

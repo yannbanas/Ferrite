@@ -129,7 +129,7 @@ fn encode_binary(value: &Value) -> Vec<u8> {
         Value::Int8(v) => v.to_be_bytes().to_vec(),
         Value::Float8(v) => v.to_be_bytes().to_vec(),
         Value::Text(v) => v.as_bytes().to_vec(),
-        Value::Timestamp(us) => (us - PG_EPOCH_OFFSET_US).to_be_bytes().to_vec(),
+        Value::Timestamp(us) => us.saturating_sub(PG_EPOCH_OFFSET_US).to_be_bytes().to_vec(),
         Value::Uuid(v) => v.to_be_bytes().to_vec(),
         Value::Json(v) => v.as_bytes().to_vec(),
     }
@@ -198,7 +198,14 @@ fn decode_binary(ty: DataType, raw: &[u8]) -> Result<Value> {
         }
         DataType::Timestamp => {
             width(8)?;
-            Value::Timestamp(i64::from_be_bytes(raw.try_into().unwrap()) + PG_EPOCH_OFFSET_US)
+            // Saturating, not wrapping: a client is free to send
+            // `i64::MIN`, and `+ offset` on it is an overflow panic in a
+            // debug build and a silent wrap in a release one. Neither is
+            // an answer; clamping puts the value at the end of the
+            // representable range, where a comparison still behaves.
+            Value::Timestamp(
+                i64::from_be_bytes(raw.try_into().unwrap()).saturating_add(PG_EPOCH_OFFSET_US),
+            )
         }
         DataType::Uuid => {
             width(16)?;

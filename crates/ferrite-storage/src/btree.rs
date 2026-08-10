@@ -46,12 +46,30 @@ fn corrupt(msg: &str) -> FerriteError {
     FerriteError::Storage(format!("btree: {msg}"))
 }
 
+/// Reads a fixed-width little-endian field out of an item, as if the item
+/// were zero-padded to the end of the field.
+///
+/// Both fields below are read by offset from a slot whose length comes off
+/// the disk. `Page::validate_layout` proves the slot lies inside its page;
+/// it cannot prove the slot is long enough to hold what a B-tree node puts
+/// there, so a corrupt file can still present a two-byte "key". Reading it
+/// total rather than panicking is safe because nothing indexes memory with
+/// the result: a wrong key makes `lookup` miss and `payload_of` reject the
+/// item, and a wrong child id sends `descend` at a page whose kind it
+/// checks. Every one of those is an error, and none of them is a panic.
+fn le_field<const N: usize>(item: &[u8], at: usize) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let available = item.len().saturating_sub(at).min(N);
+    buf[..available].copy_from_slice(&item[at..at + available]);
+    buf
+}
+
 fn item_key(item: &[u8]) -> u64 {
-    u64::from_le_bytes(item[..KEY_LEN].try_into().expect("item shorter than a key"))
+    u64::from_le_bytes(le_field(item, 0))
 }
 
 fn internal_child(item: &[u8]) -> PageId {
-    u32::from_le_bytes(item[KEY_LEN..INTERNAL_ITEM].try_into().expect("short item"))
+    u32::from_le_bytes(le_field(item, KEY_LEN))
 }
 
 fn make_internal_item(key: u64, child: PageId) -> Vec<u8> {
@@ -146,7 +164,7 @@ fn read_overflow(pager: &mut Pager, first: PageId, total: usize) -> Result<Vec<u
                 return Err(corrupt("overflow chain points at a non-overflow page"));
             }
             let body = p.body();
-            let len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(le_field(body, 0)) as usize;
             if len > OVERFLOW_CHUNK {
                 return Err(corrupt("overflow chunk length out of range"));
             }
@@ -176,7 +194,7 @@ fn free_overflow(pager: &mut Pager, first: PageId) -> Result<(), FerriteError> {
 /// Frees the overflow chain an existing leaf item points at, if any.
 fn release_item(pager: &mut Pager, item: &[u8]) -> Result<(), FerriteError> {
     if item.len() >= OVERFLOW_DESCRIPTOR && item[KEY_LEN] == FLAG_OVERFLOW {
-        let first = u32::from_le_bytes(item[KEY_LEN + 5..OVERFLOW_DESCRIPTOR].try_into().unwrap());
+        let first = u32::from_le_bytes(le_field(item, KEY_LEN + 5));
         free_overflow(pager, first)?;
     }
     Ok(())
@@ -207,12 +225,8 @@ fn payload_of(pager: &mut Pager, item: &[u8]) -> Result<Vec<u8>, FerriteError> {
             if item.len() < OVERFLOW_DESCRIPTOR {
                 return Err(corrupt("truncated overflow descriptor"));
             }
-            let total = u32::from_le_bytes(item[LEAF_HEADER..LEAF_HEADER + 4].try_into().unwrap());
-            let first = u32::from_le_bytes(
-                item[LEAF_HEADER + 4..OVERFLOW_DESCRIPTOR]
-                    .try_into()
-                    .unwrap(),
-            );
+            let total = u32::from_le_bytes(le_field(item, LEAF_HEADER));
+            let first = u32::from_le_bytes(le_field(item, LEAF_HEADER + 4));
             read_overflow(pager, first, total as usize)
         }
         other => Err(corrupt(&format!("unknown leaf item flag {other}"))),
