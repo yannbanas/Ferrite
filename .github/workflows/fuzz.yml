@@ -33,7 +33,7 @@ jobs:
       matrix:
         target: [parse_sql, lex_sql]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, toolchain: nightly
         with:
           toolchain: nightly
@@ -46,15 +46,20 @@ jobs:
         run: |
           mkdir -p "corpus/${{ matrix.target }}"
           cp seeds/* "corpus/${{ matrix.target }}/"
+      # cargo-fuzz choisit par defaut x86_64-unknown-linux-musl sur ce
+      # runner, dont le crt statique est incompatible avec les sanitizers
+      # ("sanitizer is incompatible with statically linked libc") — le
+      # runner n'a de toute facon pas ce target installe. On force le host
+      # standard gnu.
       - name: Fuzz
         working-directory: crates/ferrite-sql
         run: |
-          cargo fuzz run "${{ matrix.target }}" -- \
+          cargo fuzz run "${{ matrix.target }}" --target x86_64-unknown-linux-gnu -- \
             -max_total_time="${{ github.event.inputs.seconds || '300' }}" \
             -max_len=4096
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: crates/ferrite-sql/fuzz/artifacts
@@ -66,7 +71,7 @@ jobs:
       matrix:
         target: [message_decode, session]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cargo-fuzz a besoin de nightly (sanitizers + libFuzzer).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, toolchain: nightly
         with:
@@ -77,6 +82,9 @@ jobs:
       - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-fuzz
+      # Meme correctif que le job "sql" : force le target gnu plutot que le
+      # musl par defaut de cargo-fuzz, non installe sur ce runner et
+      # incompatible avec les sanitizers en crt statique.
       # 60 s par cible sur PR/push, 15 min la nuit.
       - name: Fuzz ${{ matrix.target }}
         working-directory: crates/ferrite-protocol
@@ -86,10 +94,10 @@ jobs:
           else
             SECONDS_TO_RUN=60
           fi
-          cargo fuzz run ${{ matrix.target }} -- -max_total_time=$SECONDS_TO_RUN
+          cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=$SECONDS_TO_RUN
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: crates/ferrite-protocol/fuzz/artifacts

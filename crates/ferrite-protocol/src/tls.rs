@@ -7,10 +7,10 @@
 //! with a fatal `ErrorResponse` — the password mechanism in
 //! [`crate::auth`] assumes the channel is encrypted.
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -87,10 +87,13 @@ impl TlsMode {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let certs: std::result::Result<Vec<_>, _> =
-        rustls_pemfile::certs(&mut BufReader::new(file)).collect();
-    let certs = certs?;
+    // `rustls_pemfile` is gone (RUSTSEC-2025-0134, unmaintained): PEM
+    // parsing for certificates/keys lives in `rustls-pki-types` itself
+    // now, already a transitive dependency of `rustls`.
+    let certs: std::result::Result<Vec<_>, _> = CertificateDer::pem_file_iter(path)
+        .map_err(|err| ProtocolError::Tls(format!("{}: {err}", path.display())))?
+        .collect();
+    let certs = certs.map_err(|err| ProtocolError::Tls(format!("{}: {err}", path.display())))?;
     if certs.is_empty() {
         return Err(ProtocolError::Tls(format!(
             "{} contains no certificate",
@@ -101,9 +104,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))?
-        .ok_or_else(|| ProtocolError::Tls(format!("{} contains no private key", path.display())))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|err| ProtocolError::Tls(format!("{}: {err}", path.display())))
 }
 
 #[cfg(test)]
