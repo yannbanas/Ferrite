@@ -2,8 +2,10 @@
 //! authentication, then the simple and extended query flows.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferrite_common::{DataType, Identity, Row, Value};
 use rand::Rng;
@@ -50,7 +52,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let mut framed = Framed::new(stream, config.max_message_size);
-    match negotiate(&mut framed, &config, false).await? {
+    match within("startup", negotiate(&mut framed, &config, false)).await? {
         Negotiated::Startup(params) => run_session(framed, params, peer, config).await,
         Negotiated::Closed => Ok(()),
         Negotiated::UpgradeTls => {
@@ -60,18 +62,50 @@ where
                 .ok_or_else(|| ProtocolError::Tls("no TLS acceptor configured".into()))?
                 .clone();
             framed.write_raw(b"S").await?;
-            let stream = acceptor
-                .accept(framed.into_inner())
-                .await
-                .map_err(|e| ProtocolError::Tls(e.to_string()))?;
+            let stream = within("tls handshake", async {
+                acceptor
+                    .accept(framed.into_inner())
+                    .await
+                    .map_err(|e| ProtocolError::Tls(e.to_string()))
+            })
+            .await?;
             let mut framed = Framed::new(stream, config.max_message_size);
-            match negotiate(&mut framed, &config, true).await? {
+            match within("startup", negotiate(&mut framed, &config, true)).await? {
                 Negotiated::Startup(params) => run_session(framed, params, peer, config).await,
                 Negotiated::Closed => Ok(()),
                 // Unreachable: `negotiate` refuses a second SSLRequest once
                 // the channel is already encrypted.
                 Negotiated::UpgradeTls => Err(ProtocolError::malformed("nested SSLRequest")),
             }
+        }
+    }
+}
+
+/// How long every step before `ReadyForQuery` gets: the pre-startup
+/// packets, the TLS handshake, and authentication.
+///
+/// PostgreSQL calls this `authentication_timeout` and defaults it to 60 s.
+/// Without one, a peer that opens a socket and then says nothing holds a
+/// task and a file descriptor for as long as it likes, which is a cheaper
+/// way to exhaust a server than guessing passwords. An established session
+/// is *not* bounded — an idle client is a normal thing.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds one handshake step.
+async fn within<T>(step: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => {
+            ferrite_metrics::metrics().connections_rejected_total.inc();
+            warn!(
+                step,
+                timeout_s = HANDSHAKE_TIMEOUT.as_secs(),
+                "closing a connection that never finished its handshake"
+            );
+            Err(ProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{step} did not complete within {HANDSHAKE_TIMEOUT:?}"),
+            )))
         }
     }
 }
@@ -147,7 +181,12 @@ async fn run_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let outcome = match authenticate(&mut framed, &params, peer, &config).await {
+    let outcome = match within(
+        "authentication",
+        authenticate(&mut framed, &params, peer, &config),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(err) => {
             ferrite_metrics::metrics().connections_rejected_total.inc();
