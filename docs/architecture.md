@@ -314,6 +314,20 @@ remarche ». Ce qui a été trouvé et corrigé, dans l'ordre de gravité :
    exclusif tenu par le noyau sur un handle ouvert — donc relâché même si
    le process est tué, ce qu'un fichier-verrou ne fait pas.
 
+7. **Le catalogue lui-même n'avait aucune clé unique appliquée.** Il est
+   stocké dans des tables ordinaires, donc rien ne distinguait ses lignes
+   des autres, et la seule garde contre deux lignes nommant une même table
+   était une `HashMap` en mémoire privée à une instance de `SystemCatalog`
+   — laquelle ne peut de toute façon en voir qu'une des deux, et se
+   reconstruit depuis le stockage où le doublon gagne ou perd selon
+   l'ordre d'itération. Le symptôme est déroutant plutôt que
+   manifestement fatal : un `DROP TABLE` qui a l'air de marcher, puis un
+   `CREATE TABLE` refusé en `42710`, parce que le drop a supprimé une
+   ligne et le rechargement a trouvé l'autre. `ferrite_tables`,
+   `ferrite_columns` et `ferrite_indexes` déclarent maintenant leurs clés
+   et passent par la même application atomique que n'importe quelle table
+   utilisateur. Cf. le rapport pour ce que ça ne prouve pas.
+
 Plus : isolation d'un panic à la connexion fautive (avec un vrai
 `ErrorResponse` plutôt qu'une socket qui tombe), timeout d'énoncé et de
 transaction, borne sur le jeu de résultats matérialisé, plafond de
