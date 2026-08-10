@@ -89,6 +89,14 @@ pub enum Expr {
         func: ScalarFunc,
         args: Vec<Expr>,
     },
+    /// `expr IN (SELECT …)` over a subquery that does not mention the
+    /// outer row. The subquery is a plan of its own, run once before the
+    /// enclosing node — see [`crate::logical::LogicalPlan`].
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<crate::logical::LogicalPlan>,
+        negated: bool,
+    },
 }
 
 impl Expr {
@@ -156,6 +164,9 @@ impl Expr {
                     arg.collect_columns(out);
                 }
             }
+            // The subquery's own column references belong to its own
+            // scope, so only the tested expression contributes here.
+            Expr::InSubquery { expr, .. } => expr.collect_columns(out),
         }
     }
 }

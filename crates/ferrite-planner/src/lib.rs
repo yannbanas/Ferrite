@@ -46,7 +46,8 @@ pub use logical::{
 };
 pub use lower::typecheck_defaults;
 pub use physical::{
-    bind, PhysAggregate, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey, PhysicalPlan,
+    bind, bind_with, PhysAggregate, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey,
+    PhysicalPlan,
 };
 pub use planner::{Planner, DEFAULT_NAMESPACE};
 pub use rules::optimize;

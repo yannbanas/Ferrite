@@ -4,7 +4,7 @@
 use ferrite_common::{ColumnDef, DataType, FerriteError, Schema, TableId, Value};
 
 use crate::expr::{AggregateFunc, BinaryOp, Expr};
-use crate::logical::JoinType;
+use crate::logical::{JoinType, LogicalPlan};
 use crate::scalar::ScalarFunc;
 use crate::scope::Scope;
 
@@ -39,6 +39,16 @@ pub enum PhysExpr {
     Function {
         func: ScalarFunc,
         args: Vec<PhysExpr>,
+    },
+    /// `expr IN (SELECT …)`, still holding its subplan. The executor runs
+    /// the subplan once and rewrites this node into the equivalent value
+    /// test before evaluating any row — see
+    /// `ferrite_exec::Session::execute`. Reaching [`crate::PhysExpr`]
+    /// evaluation with this variant still in place is a bug, and says so.
+    InSubquery {
+        expr: Box<PhysExpr>,
+        subquery: Box<PhysicalPlan>,
+        negated: bool,
     },
 }
 
@@ -95,6 +105,25 @@ pub struct PhysSortKey {
 /// a `BIGINT` column has to carry an `Int8`, not the `Int4` the literal
 /// parsed as — otherwise the probe silently matches nothing.
 pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
+    bind_with(expr, scope, &|_| {
+        Err(FerriteError::Plan(
+            "a subquery is not allowed here".to_string(),
+        ))
+    })
+}
+
+/// How a subquery's logical plan becomes a physical one. Only the planner
+/// can do it — choosing an access path needs the index catalog — so it is
+/// handed in rather than reached for.
+pub type SubPlanLowerer<'a> = &'a dyn Fn(&LogicalPlan) -> Result<PhysicalPlan, FerriteError>;
+
+/// [`bind`], plus the ability to lower a subquery's plan.
+pub fn bind_with(
+    expr: &Expr,
+    scope: &Scope,
+    lower: SubPlanLowerer,
+) -> Result<PhysExpr, FerriteError> {
+    let bind = |expr: &Expr, scope: &Scope| bind_with(expr, scope, lower);
     Ok(match expr {
         Expr::Column(reference) => PhysExpr::Column(scope.resolve(reference)?),
         Expr::Slot(position) => {
@@ -103,7 +132,7 @@ pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
         }
         Expr::Literal(v) => PhysExpr::Literal(v.clone()),
         Expr::Binary { left, op, right } if op.is_comparison() => {
-            let (left, right) = align_comparison(left, right, scope)?;
+            let (left, right) = align_comparison(left, right, scope, lower)?;
             PhysExpr::binary(left, *op, right)
         }
         Expr::Binary { left, op, right } => {
@@ -154,6 +183,27 @@ pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
                 None => PhysExpr::Function { func: *func, args },
             }
         }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let subquery = lower(subquery)?;
+            // `x IN (SELECT ...)` compares one value against one column;
+            // a wider subquery is a row constructor, which v1 has no
+            // comparison for.
+            let width = subquery.output_schema().map_or(0, |s| s.columns.len());
+            if width != 1 {
+                return Err(FerriteError::Plan(format!(
+                    "the subquery of IN must select exactly one column, not {width}"
+                )));
+            }
+            PhysExpr::InSubquery {
+                expr: Box::new(bind(expr, scope)?),
+                subquery: Box::new(subquery),
+                negated: *negated,
+            }
+        }
     })
 }
 
@@ -188,7 +238,9 @@ fn align_comparison(
     left: &Expr,
     right: &Expr,
     scope: &Scope,
+    lower: SubPlanLowerer,
 ) -> Result<(PhysExpr, PhysExpr), FerriteError> {
+    let bind = |expr: &Expr, scope: &Scope| bind_with(expr, scope, lower);
     let target = match (left, right) {
         (Expr::Column(_), Expr::Literal(_)) => Some(infer(left, scope)?.0),
         (Expr::Literal(_), Expr::Column(_)) => Some(infer(right, scope)?.0),
@@ -233,7 +285,9 @@ pub fn infer(expr: &Expr, scope: &Scope) -> Result<(DataType, bool), FerriteErro
         // An untyped `NULL` has to be given some type for the wire; `Text`
         // is what PostgreSQL falls back to as well.
         Expr::Literal(value) => (value.data_type().unwrap_or(DataType::Text), value.is_null()),
-        Expr::Not(_) | Expr::IsNull(_) | Expr::Like { .. } => (DataType::Boolean, true),
+        Expr::Not(_) | Expr::IsNull(_) | Expr::Like { .. } | Expr::InSubquery { .. } => {
+            (DataType::Boolean, true)
+        }
         Expr::Cast { data_type, .. } => (*data_type, true),
         // `coalesce` and `nocase` take the type of their first argument;
         // for the rest the argument's type is irrelevant, so inferring it

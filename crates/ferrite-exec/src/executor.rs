@@ -94,6 +94,30 @@ impl<'a> Session<'a> {
     /// Run one statement under `txn`. Permission checks happen first, so a
     /// denied statement never reaches storage.
     pub fn execute(&self, txn: TxnId, plan: &PhysicalPlan) -> Result<QueryResult, FerriteError> {
+        // An uncorrelated `IN (SELECT ...)` has one answer for the whole
+        // statement, so its subplan runs once here and becomes a plain
+        // value test. Plans without one are left untouched.
+        if crate::subquery::present_in(plan) {
+            let mut resolved = plan.clone();
+            crate::subquery::resolve(&mut resolved, &mut |subplan| {
+                self.procs
+                    .authorize(self.identity, txn, Permission::Select)?;
+                Ok(self
+                    .stream(txn, subplan)?
+                    .into_iter()
+                    .filter_map(|t| t.row.values.into_iter().next())
+                    .collect())
+            })?;
+            return self.execute_resolved(txn, &resolved);
+        }
+        self.execute_resolved(txn, plan)
+    }
+
+    fn execute_resolved(
+        &self,
+        txn: TxnId,
+        plan: &PhysicalPlan,
+    ) -> Result<QueryResult, FerriteError> {
         match plan {
             PhysicalPlan::Insert {
                 table,

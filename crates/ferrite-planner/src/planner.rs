@@ -15,8 +15,8 @@ use crate::lower::{
     substitute_group_keys, unsupported, AggregateSlots, Lowerer,
 };
 use crate::physical::{
-    aggregate_schema, bind, infer, PhysAggregate, PhysConflictAction, PhysExpr, PhysOnConflict,
-    PhysSortKey, PhysicalPlan,
+    aggregate_schema, bind, bind_with, infer, PhysAggregate, PhysConflictAction, PhysExpr,
+    PhysOnConflict, PhysSortKey, PhysicalPlan,
 };
 use crate::rules::optimize;
 use crate::scope::Scope;
@@ -111,7 +111,10 @@ impl<'a> Planner<'a> {
         let from_scope = plan
             .scope()
             .expect("a FROM tree is made of scans and joins, which both have a scope");
-        let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers.clone());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(qualifiers.clone())
+            .with_subqueries(&subplanner);
 
         if let Some(predicate) = &select.selection {
             if contains_aggregate(predicate) {
@@ -165,7 +168,8 @@ impl<'a> Planner<'a> {
         };
         let upper = Lowerer::new(self.params)
             .with_qualifiers(qualifiers)
-            .with_aggregates(slots);
+            .with_aggregates(slots)
+            .with_subqueries(&subplanner);
         let rewrite = |expr: &sql::Expr| -> Result<Expr, FerriteError> {
             let lowered = substitute_group_keys(upper.expr(expr)?, &group_keys);
             if grouped {
@@ -464,7 +468,10 @@ impl<'a> Planner<'a> {
             ));
         }
         let source = self.resolve(&stmt.table, stmt.alias.clone())?;
-        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(source.qualifiers())
+            .with_subqueries(&subplanner);
 
         let mut assignments = Vec::with_capacity(stmt.assignments.len());
         for sql::Assignment { column, value } in &stmt.assignments {
@@ -494,7 +501,10 @@ impl<'a> Planner<'a> {
             ));
         }
         let source = self.resolve(&stmt.table, stmt.alias.clone())?;
-        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(source.qualifiers())
+            .with_subqueries(&subplanner);
 
         let input = self.filtered_scan(&source, stmt.selection.as_ref(), &lowerer)?;
         Ok(LogicalPlan::Delete {
@@ -534,6 +544,12 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// Bind an expression that may contain an uncorrelated `IN (SELECT
+    /// ...)`, lowering the subquery's plan through the same pipeline.
+    fn bind_expr(&self, expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
+        bind_with(expr, scope, &|plan| self.to_physical(plan.clone()))
+    }
+
     /// Lower an optimized logical plan, choosing an access path for every
     /// scan on the way down.
     pub fn to_physical(&self, plan: LogicalPlan) -> Result<PhysicalPlan, FerriteError> {
@@ -566,7 +582,7 @@ impl<'a> Planner<'a> {
                     right_scope = right_scope.nullable();
                 }
                 let scope = Scope::concat(left_scope, right_scope);
-                let predicate = on.map(|e| bind(&e, &scope)).transpose()?;
+                let predicate = on.map(|e| self.bind_expr(&e, &scope)).transpose()?;
                 let output = scope.schema();
                 Ok((
                     PhysicalPlan::NestedLoopJoin {
@@ -584,7 +600,7 @@ impl<'a> Planner<'a> {
                 let (input, scope) = self.lower_plan(*input)?;
                 Ok((
                     PhysicalPlan::Filter {
-                        predicate: bind(&predicate, &scope)?,
+                        predicate: self.bind_expr(&predicate, &scope)?,
                         input: Box::new(input),
                     },
                     scope,
@@ -600,7 +616,7 @@ impl<'a> Planner<'a> {
                 let output = aggregate_schema(&group_by, &aggregates, &input_scope)?;
                 let group_by = group_by
                     .iter()
-                    .map(|e| bind(e, &input_scope))
+                    .map(|e| self.bind_expr(e, &input_scope))
                     .collect::<Result<Vec<_>, _>>()?;
                 let aggregates = aggregates
                     .iter()
@@ -610,7 +626,7 @@ impl<'a> Planner<'a> {
                             arg: call
                                 .arg
                                 .as_ref()
-                                .map(|e| bind(e, &input_scope))
+                                .map(|e| self.bind_expr(e, &input_scope))
                                 .transpose()?,
                             distinct: call.distinct,
                         })
@@ -633,7 +649,7 @@ impl<'a> Planner<'a> {
                 let mut exprs = Vec::with_capacity(items.len());
                 let mut columns = Vec::with_capacity(items.len());
                 for item in &items {
-                    exprs.push(bind(&item.expr, &input_scope)?);
+                    exprs.push(self.bind_expr(&item.expr, &input_scope)?);
                     let (data_type, nullable) = infer(&item.expr, &input_scope)?;
                     columns.push(ColumnDef::new(
                         item.output_name.clone(),
@@ -659,7 +675,7 @@ impl<'a> Planner<'a> {
                     .iter()
                     .map(|key| {
                         Ok(PhysSortKey {
-                            expr: bind(&key.expr, &scope)?,
+                            expr: self.bind_expr(&key.expr, &scope)?,
                             asc: key.asc,
                             nulls_first: key.nulls_first,
                         })
@@ -816,7 +832,7 @@ impl<'a> Planner<'a> {
             Some((position, index, column, key)) => {
                 conjuncts.remove(position);
                 let residual = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, scope))
+                    .map(|e| self.bind_expr(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::IndexScan {
                     table: source.id,
@@ -830,7 +846,7 @@ impl<'a> Planner<'a> {
             }
             None => {
                 let filter = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, scope))
+                    .map(|e| self.bind_expr(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::SeqScan {
                     table: source.id,

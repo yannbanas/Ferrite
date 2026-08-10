@@ -602,7 +602,6 @@ fn everything_outside_the_executable_subset_is_a_plan_error() {
         "SELECT * FROM users UNION SELECT * FROM users",
         "WITH x (id) AS (SELECT id FROM users) SELECT * FROM x",
         "SELECT * FROM (SELECT id FROM users) s",
-        "SELECT * FROM users WHERE id IN (SELECT id FROM users)",
         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM users)",
         "SELECT strftime('%Y', name) FROM users",
         "SELECT lower(name, name) FROM users",
@@ -754,4 +753,23 @@ fn a_default_that_cannot_hold_is_refused_at_ddl_time() {
         ))
     )
     .is_ok());
+}
+
+#[test]
+fn an_uncorrelated_in_subquery_becomes_a_subplan_the_executor_runs() {
+    let PhysicalPlan::SeqScan { filter, .. } =
+        plan("SELECT * FROM users WHERE id IN (SELECT author FROM posts)").unwrap()
+    else {
+        panic!("expected a SeqScan");
+    };
+    assert!(matches!(filter, Some(PhysExpr::InSubquery { .. })));
+}
+
+#[test]
+fn a_correlated_in_subquery_is_refused_by_the_column_it_cannot_see() {
+    let error = plan(
+        "SELECT * FROM users WHERE id IN (SELECT author FROM posts WHERE posts.author = users.id)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("users"), "{error}");
 }

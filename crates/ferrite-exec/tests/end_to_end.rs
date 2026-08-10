@@ -706,3 +706,164 @@ fn on_conflict_without_a_target_needs_a_unique_key_to_be_known() {
     let error = plan_of(&catalog, "INSERT OR IGNORE INTO users VALUES (1, 'a', 2)").unwrap_err();
     assert!(error.to_string().contains("no unique key"), "{error}");
 }
+
+/// A second table, so a subquery has somewhere to read from.
+fn setup_with_posts() -> (MemStorage, MemCatalog, TableId) {
+    let (storage, catalog, users) = setup();
+    let posts = catalog
+        .create_table(
+            "public",
+            "posts",
+            Schema {
+                columns: vec![
+                    column("id", DataType::Int8, false),
+                    column("author", DataType::Int8, true),
+                ],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, posts).unwrap();
+    (storage, catalog, users)
+}
+
+#[test]
+fn in_a_subquery_keeps_only_the_rows_the_subquery_names() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 2)",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Text("grace".into()));
+}
+
+#[test]
+fn not_in_a_subquery_is_the_complement() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 2)",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id NOT IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Text("ada".into()));
+}
+
+#[test]
+fn an_empty_subquery_makes_in_match_nothing_and_not_in_match_everything() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let empty = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert!(empty.is_empty());
+
+    let all = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id NOT IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn delete_where_in_a_subquery_removes_exactly_those_rows() {
+    let (storage, catalog, users) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 1)",
+    )
+    .unwrap();
+
+    let deleted = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "DELETE FROM users WHERE id IN (SELECT author FROM posts)",
+    )
+    .unwrap();
+    assert_eq!(deleted, QueryResult::Affected(1));
+    assert_eq!(storage.dump(users).len(), 1);
+}
+
+#[test]
+fn a_subquery_selecting_more_than_one_column_is_refused() {
+    let (_, catalog, _) = setup_with_posts();
+    let error = plan_of(
+        &catalog,
+        "SELECT name FROM users WHERE id IN (SELECT id, author FROM posts)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exactly one column"), "{error}");
+}
+
+#[test]
+fn a_scalar_subquery_and_exists_are_still_refused_by_name() {
+    let (_, catalog, _) = setup_with_posts();
+    for (sql, wanted) in [
+        (
+            "SELECT (SELECT id FROM posts) FROM users",
+            "a scalar subquery",
+        ),
+        (
+            "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM posts)",
+            "EXISTS",
+        ),
+    ] {
+        let error = plan_of(&catalog, sql).unwrap_err();
+        assert!(error.to_string().contains(wanted), "{sql}: {error}");
+    }
+}

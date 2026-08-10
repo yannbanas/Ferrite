@@ -82,6 +82,11 @@ pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
                 })
             }
         },
+        // `Session::execute` replaces every one of these with the value
+        // test its subplan produced, before any row is evaluated.
+        PhysExpr::InSubquery { .. } => Err(FerriteError::Exec(
+            "a subquery reached evaluation without having been run".to_string(),
+        )),
         PhysExpr::Cast { expr, data_type } => scalar::cast(&eval(expr, row)?, *data_type),
         PhysExpr::Function { func, args } => {
             let args = args

@@ -16,6 +16,7 @@ mod eval;
 mod executor;
 mod index;
 mod scalar;
+mod subquery;
 
 pub use eval::{compare, eval, eval_predicate, like_matches};
 pub use executor::{QueryResult, Session, Tuple};

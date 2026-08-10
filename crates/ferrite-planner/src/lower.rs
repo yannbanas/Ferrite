@@ -11,7 +11,13 @@ use ferrite_common::{ColumnDefault, DataType, FerriteError, Schema, Value};
 use ferrite_sql::ast as sql;
 
 use crate::expr::{BinaryOp, ColumnRef, Expr};
+use crate::logical::LogicalPlan;
 use crate::scalar::ScalarFunc;
+
+/// How the lowerer turns a parsed subquery into a plan. The planner owns
+/// the catalog, so it hands this in rather than the lowerer reaching for
+/// metadata it has no access to.
+pub(crate) type SubPlanner<'a> = &'a dyn Fn(&sql::Query) -> Result<LogicalPlan, FerriteError>;
 
 pub(crate) fn unsupported(what: &str) -> FerriteError {
     FerriteError::Plan(format!("{what} is not supported by the v1 planner"))
@@ -140,6 +146,10 @@ pub(crate) struct Lowerer<'a> {
     /// node, where an aggregate call is a reference to an already-computed
     /// column rather than something to evaluate per row.
     aggregates: Option<AggregateSlots<'a>>,
+    /// Set where a subquery is legal, i.e. inside a `SELECT`. `INSERT ...
+    /// VALUES` and `CALL` arguments leave it unset, and a subquery there
+    /// is the plan error it should be.
+    subqueries: Option<SubPlanner<'a>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -148,7 +158,13 @@ impl<'a> Lowerer<'a> {
             params,
             qualifiers: Vec::new(),
             aggregates: None,
+            subqueries: None,
         }
+    }
+
+    pub(crate) fn with_subqueries(mut self, subqueries: SubPlanner<'a>) -> Self {
+        self.subqueries = Some(subqueries);
+        self
     }
 
     pub(crate) fn with_qualifiers(mut self, qualifiers: Vec<String>) -> Self {
@@ -305,9 +321,26 @@ impl<'a> Lowerer<'a> {
 
             sql::Expr::Function(call) => self.function(call),
 
-            sql::Expr::Subquery(_) | sql::Expr::InSubquery { .. } | sql::Expr::Exists { .. } => {
-                Err(unsupported("subqueries"))
+            sql::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let Some(build) = self.subqueries else {
+                    return Err(unsupported("a subquery here"));
+                };
+                Ok(Expr::InSubquery {
+                    expr: Box::new(self.expr(expr)?),
+                    subquery: Box::new(build(subquery)?),
+                    negated: *negated,
+                })
             }
+
+            // A scalar subquery and `EXISTS` both need the subplan run
+            // once per outer row, which the v1 executor has no shape for;
+            // `IN (SELECT ...)` above is the uncorrelated case, run once.
+            sql::Expr::Subquery(_) => Err(unsupported("a scalar subquery")),
+            sql::Expr::Exists { .. } => Err(unsupported("EXISTS")),
         }
     }
 
