@@ -139,26 +139,49 @@ fn resolve_expr(
     Ok(())
 }
 
-/// `x IN (v1, v2, …)` as a chain of equalities, matching how the planner
-/// already expands a literal `IN` list.
+/// `x IN (v1, v2, …)` as a balanced tree of equalities, matching how the
+/// planner already expands a literal `IN` list.
+///
+/// Balanced rather than chained for the reason `balanced_or` gives in
+/// `ferrite-planner`, and it matters more here than there: the width of
+/// this tree is the *row count of the subquery*, which no one wrote out and
+/// nothing caps below the result-set budget. Chained, a subquery returning
+/// a few thousand rows is a tree a few thousand levels tall, and evaluating
+/// or dropping it recurses once per level — a stack overflow, which aborts
+/// the process rather than unwinding into an error the connection could
+/// report.
 ///
 /// An empty result makes `IN` false and `NOT IN` true for every row,
 /// including rows where `x` is null — which is what SQL says, and the one
 /// case where the null-propagation rule below does not apply.
 fn value_test(tested: PhysExpr, values: &[Value], negated: bool) -> PhysExpr {
-    let Some((first, rest)) = values.split_first() else {
+    if values.is_empty() {
         return PhysExpr::Literal(Value::Boolean(negated));
-    };
-    let eq = |value: &Value| {
-        PhysExpr::binary(
-            tested.clone(),
-            BinaryOp::Eq,
-            PhysExpr::Literal(value.clone()),
-        )
-    };
-    let any = rest.iter().fold(eq(first), |acc, value| {
-        PhysExpr::binary(acc, BinaryOp::Or, eq(value))
-    });
+    }
+    let mut tests: Vec<PhysExpr> = values
+        .iter()
+        .map(|value| {
+            PhysExpr::binary(
+                tested.clone(),
+                BinaryOp::Eq,
+                PhysExpr::Literal(value.clone()),
+            )
+        })
+        .collect();
+    while tests.len() > 1 {
+        let mut folded = Vec::with_capacity(tests.len().div_ceil(2));
+        let mut pairs = tests.into_iter();
+        while let Some(left) = pairs.next() {
+            folded.push(match pairs.next() {
+                Some(right) => PhysExpr::binary(left, BinaryOp::Or, right),
+                None => left,
+            });
+        }
+        tests = folded;
+    }
+    let any = tests
+        .pop()
+        .expect("a non-empty value list folds to one test");
     match negated {
         false => any,
         true => PhysExpr::Not(Box::new(any)),
@@ -267,5 +290,27 @@ mod tests {
             panic!("expected a disjunction");
         };
         assert_eq!(op, BinaryOp::Or);
+    }
+
+    /// A subquery's row count is not something a client wrote out, so this
+    /// is the width that has to stay shallow: chained, these four thousand
+    /// values are four thousand levels, and merely dropping the tree
+    /// overflows the stack.
+    #[test]
+    fn a_wide_result_stays_a_shallow_tree() {
+        fn height(expr: &PhysExpr) -> usize {
+            match expr {
+                PhysExpr::Binary { left, right, .. } => 1 + height(left).max(height(right)),
+                PhysExpr::Not(inner) => 1 + height(inner),
+                _ => 1,
+            }
+        }
+        let values: Vec<Value> = (0..4000).map(Value::Int8).collect();
+        let test = value_test(PhysExpr::Column(0), &values, true);
+        assert!(
+            height(&test) <= 20,
+            "4000 values produced a tree {} levels tall",
+            height(&test)
+        );
     }
 }

@@ -207,6 +207,68 @@ fn a_very_long_in_list_is_answered_rather_than_refused() {
     assert!(matches!(result, ferrite_exec::QueryResult::Rows { ref rows, .. } if rows.len() == 1));
 }
 
+/// The same shape as the test above, but with the width supplied by a
+/// *subquery* rather than by the client.
+///
+/// This is the one an application reaches without writing anything long:
+/// `WHERE id IN (SELECT user_id FROM keys)` is a few dozen characters, and
+/// the tree it becomes is one level per row the subquery returns. Replaying
+/// a real application database — 2600 rows in that table — took the server
+/// down with a stack overflow, which aborts the process rather than
+/// unwinding into an error the connection could report.
+#[test]
+fn a_wide_in_subquery_is_answered_rather_than_overflowing_the_stack() {
+    const KEYS: i64 = 5000;
+
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let users = catalog
+        .create_table(
+            "public",
+            "users",
+            Schema {
+                columns: vec![column("id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    let keys = catalog
+        .create_table(
+            "public",
+            "keys",
+            Schema {
+                columns: vec![column("user_id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, users).unwrap();
+    storage.create_table(0, keys).unwrap();
+    storage
+        .insert(0, users, Row::new(vec![Value::Int8(KEYS - 1)]))
+        .unwrap();
+    for n in 0..KEYS {
+        storage
+            .insert(0, keys, Row::new(vec![Value::Int8(n)]))
+            .unwrap();
+    }
+    let procs = everything();
+
+    for sql in [
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM keys)",
+        "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM keys)",
+    ] {
+        let statement = ferrite_sql::parse_statement(sql).unwrap();
+        let plan = Planner::new(&catalog, &catalog).plan(&statement).unwrap();
+        let result = Session::new(&storage, &catalog, &procs, CALLER)
+            .execute(1, &plan)
+            .unwrap_or_else(|err| panic!("{sql} must answer: {err}"));
+        let ferrite_exec::QueryResult::Rows { rows, .. } = result else {
+            panic!("{sql} should return rows");
+        };
+        let expected = usize::from(!sql.contains("NOT IN"));
+        assert_eq!(rows.len(), expected, "{sql}");
+    }
+}
+
 #[test]
 fn values_outside_a_column_never_panic_on_the_way_in() {
     for sql in [

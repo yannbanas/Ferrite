@@ -446,12 +446,6 @@ impl<'a> Lowerer<'a> {
     }
 }
 
-/// Every aggregate call in `expr`, appended to `out` without duplicates so
-/// `count(*)` written twice is computed once.
-///
-/// An aggregate inside another aggregate has no meaning — there is no inner
-/// grouping for it to run over — and is refused here rather than producing
-/// a slot that refers to itself.
 /// Folds `tests` into a single `OR`, halving rather than chaining.
 ///
 /// A left-deep chain of a thousand `OR`s is a tree a thousand levels tall,
@@ -476,6 +470,12 @@ fn balanced_or(mut tests: Vec<Expr>) -> Expr {
         .unwrap_or(Expr::Literal(ferrite_common::Value::Boolean(false)))
 }
 
+/// Every aggregate call in `expr`, appended to `out` without duplicates so
+/// `count(*)` written twice is computed once.
+///
+/// An aggregate inside another aggregate has no meaning — there is no inner
+/// grouping for it to run over — and is refused here rather than producing
+/// a slot that refers to itself.
 pub(crate) fn collect_aggregates(
     expr: &sql::Expr,
     out: &mut Vec<sql::FunctionCall>,
