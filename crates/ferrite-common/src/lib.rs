@@ -15,7 +15,7 @@ mod storage;
 mod txn;
 mod value;
 
-pub use catalog::Catalog;
+pub use catalog::{Catalog, IndexCatalog, IndexDef, IndexId};
 pub use error::FerriteError;
 pub use identity::{Identity, Permission, Role};
 pub use schema::{ColumnDef, Schema, TableId};

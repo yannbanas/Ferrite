@@ -2,7 +2,7 @@ use crate::{FerriteError, Row, Snapshot, TableId, TxnId};
 
 pub type RowId = u64;
 
-pub type ScanIter<'a> = Box<dyn Iterator<Item = Result<(RowId, Row), FerriteError>> + 'a>;
+pub type ScanIter<'a> = Box<dyn Iterator<Item = Result<(RowId, Row), FerriteError>> + Send + 'a>;
 
 /// The contract the query executor is built against. `ferrite-storage`
 /// provides the implementation (pages, B-tree, MVCC row versions, crash
@@ -16,11 +16,16 @@ pub trait StorageEngine: Send + Sync {
     fn commit(&self, txn: TxnId) -> Result<(), FerriteError>;
     fn abort(&self, txn: TxnId) -> Result<(), FerriteError>;
 
-    /// Snapshot the storage engine will use to decide row visibility for
-    /// reads performed under `txn`. Call once per transaction (or once per
-    /// statement, for read-committed-style semantics) — the executor owns
-    /// when a fresh snapshot is taken, storage only serves reads against
-    /// whichever snapshot it's given.
+    /// (Re-)establishes `txn`'s active read snapshot and returns it. This
+    /// has a side effect, not just a read: the first call pins the
+    /// snapshot `get`/`scan` will use for the rest of the transaction;
+    /// calling it again *advances* that pinned snapshot to the engine's
+    /// current state. `get`/`scan` never take a `Snapshot` argument of
+    /// their own — they always read under whatever `txn` currently has
+    /// pinned. So: call once per transaction for repeatable-read
+    /// semantics, or once per statement for read-committed semantics —
+    /// the executor decides the cadence, storage just remembers whichever
+    /// snapshot was pinned last.
     fn snapshot(&self, txn: TxnId) -> Result<Snapshot, FerriteError>;
 
     fn insert(&self, txn: TxnId, table: TableId, row: Row) -> Result<RowId, FerriteError>;

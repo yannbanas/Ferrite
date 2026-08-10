@@ -94,6 +94,8 @@ fn ferrite_sqlstate(err: &FerriteError) -> &'static str {
         FerriteError::Parse(_) => sqlstate::SYNTAX_ERROR,
         FerriteError::Plan(_) | FerriteError::Exec(_) => sqlstate::INTERNAL_ERROR,
         FerriteError::Protocol(_) => sqlstate::PROTOCOL_VIOLATION,
+        FerriteError::ObjectAlreadyExists(_) => sqlstate::DUPLICATE_OBJECT,
+        FerriteError::InvalidDefinition(_) => sqlstate::INVALID_TABLE_DEFINITION,
     }
 }
 
@@ -116,6 +118,8 @@ pub mod sqlstate {
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const INTERNAL_ERROR: &str = "XX000";
+    pub const DUPLICATE_OBJECT: &str = "42710";
+    pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;

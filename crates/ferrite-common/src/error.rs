@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum FerriteError {
     #[error("table not found: {0}")]
     TableNotFound(String),
@@ -29,4 +29,16 @@ pub enum FerriteError {
     Exec(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A `CREATE` collided with something that already has this name
+    /// (table, index, procedure, trigger…). Distinct from `Storage` so a
+    /// protocol layer can map it to the right SQLSTATE (`42P07`-class)
+    /// instead of a generic internal error.
+    #[error("already exists: {0}")]
+    ObjectAlreadyExists(String),
+    /// A schema/DDL definition is well-formed SQL but not a valid object —
+    /// e.g. a `PRIMARY KEY` naming a column that doesn't exist, a `CHECK`
+    /// referencing an unknown function. Distinct from `Parse` (syntax) and
+    /// `Plan` (a query that can't be executed against existing schema).
+    #[error("invalid definition: {0}")]
+    InvalidDefinition(String),
 }
