@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod http;
 mod registry;
 
-pub use http::Endpoint;
+pub use http::{AlwaysHealthy, Endpoint, HealthProbe};
 pub use registry::{Counter, CounterVec, Encoder, Gauge, Histogram, Label};
 
 /// What kind of statement was executed, for `ferrite_queries_total`.

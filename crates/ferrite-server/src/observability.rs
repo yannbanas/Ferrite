@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrite_metrics::{metrics, Endpoint};
+use ferrite_metrics::{metrics, Endpoint, HealthProbe};
 use ferrite_storage::{DATA_FILE, JOURNAL_FILE, MAX_TXN_ID};
 use tracing::{info, warn};
 
@@ -25,12 +25,16 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// Binding failure is fatal at startup rather than logged and ignored: a
 /// deployment that asked for an endpoint and silently did not get one has
 /// no health check either, which is the opposite of what this is for.
-pub async fn serve(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve(listen: &str, engine: Arc<Engine>) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = Endpoint::bind(listen).await?;
-    info!(addr = %endpoint.local_addr()?, "metrics endpoint listening");
+    info!(
+        addr = %endpoint.local_addr()?,
+        "observability endpoint listening on /metrics and /health"
+    );
+    let probe: Arc<dyn HealthProbe> = engine;
     tokio::spawn(async move {
-        if let Err(err) = endpoint.run().await {
-            warn!(error = %err, "metrics endpoint stopped");
+        if let Err(err) = endpoint.run(probe).await {
+            warn!(error = %err, "observability endpoint stopped");
         }
     });
     Ok(())

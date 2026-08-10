@@ -10,3 +10,6 @@ description = "Prometheus metrics registry and the HTTP endpoint that exposes th
 async-trait = "0.1"
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

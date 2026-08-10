@@ -21,6 +21,7 @@
 //! park a runtime worker other connections need.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -54,6 +55,12 @@ struct Inner {
     storage: Arc<FerriteStorage>,
     catalog: Arc<SystemCatalog>,
     procs: Arc<ProcRegistry>,
+    /// Set while a health probe is on a blocking thread. A probe that never
+    /// returns must not be followed by another one every interval: the
+    /// threads would pile up, and the second probe would wait on the same
+    /// lock the first one is stuck behind. Seeing this still set *is* the
+    /// answer — the engine is wedged.
+    probing: AtomicBool,
 }
 
 impl Engine {
@@ -79,6 +86,7 @@ impl Engine {
                 storage,
                 catalog: Arc::new(catalog),
                 procs: Arc::new(procs),
+                probing: AtomicBool::new(false),
             }),
         })
     }
@@ -93,6 +101,30 @@ impl Engine {
     /// engine lock like any other storage call.
     pub fn stats(&self) -> Result<ferrite_storage::StorageStats, FerriteError> {
         self.inner.storage.stats()
+    }
+
+    /// A real round trip through the engine, for the health endpoint.
+    ///
+    /// Reads the catalog and then opens and commits a transaction. That
+    /// covers exactly what a port check cannot: the catalog lock is
+    /// obtainable, the engine-wide storage lock is obtainable, a commit
+    /// record reaches the journal, and the fsync behind it succeeds — so a
+    /// full or read-only data directory fails here, on a probe, instead of
+    /// later on a user's `INSERT`.
+    ///
+    /// Costs one transaction id per call. At the `Dockerfile`'s 30 s
+    /// interval that is about a million a year, against a ceiling of
+    /// 1.3 × 10^8 (`ferrite_storage::MAX_TXN_ID`).
+    fn health_blocking(&self) -> Result<(), FerriteError> {
+        self.inner.catalog.list_tables(DEFAULT_NAMESPACE)?;
+        let txn = self.inner.storage.begin()?;
+        match self.inner.storage.commit(txn) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = self.inner.storage.abort(txn);
+                Err(err)
+            }
+        }
     }
 
     fn session(&self) -> Connection {
@@ -505,6 +537,32 @@ impl Drop for SessionHandle {
                     let _ = self.inner.catalog.reload();
                 }
             }
+        }
+    }
+}
+
+#[async_trait]
+impl ferrite_metrics::HealthProbe for Engine {
+    async fn check(&self) -> Result<(), String> {
+        if self.inner.probing.swap(true, Ordering::SeqCst) {
+            return Err(
+                "the previous health probe has not returned: the engine is not answering".into(),
+            );
+        }
+        let engine = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let result = engine.health_blocking();
+            engine.inner.probing.store(false, Ordering::SeqCst);
+            result
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err.to_string()),
+            // The blocking thread panicked; `probing` stays set, and every
+            // later probe reports the engine as gone, which it is.
+            Err(err) => Err(format!("the health probe task failed: {err}")),
         }
     }
 }

@@ -53,10 +53,30 @@ COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-musl/release/ferrit
 RUN mkdir -p /data && chown ferrite:ferrite /data
 VOLUME ["/data"]
 
-EXPOSE 5432
+# 5432 : protocole PostgreSQL. 9187 : endpoint d'observabilite
+# (/metrics + /health), le port de postgres_exporter. A garder sur un
+# reseau interne : il n'est pas authentifie (voir crates/ferrite-metrics).
+EXPOSE 5432 9187
 ENV RUST_LOG=info \
-    FERRITE_DATA=/data
+    FERRITE_DATA=/data \
+    FERRITE_METRICS_LISTEN=0.0.0.0:9187 \
+    FERRITE_HEALTH_URL=http://127.0.0.1:9187/health
 USER ferrite
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD nc -z 127.0.0.1 5432 || exit 1
+
+# `nc -z 127.0.0.1 5432` ne prouvait que l'existence du listener. Un
+# serveur dont le moteur est bloque — verrou de stockage tenu, disque
+# plein, thread bloquant parti — accepte toujours la connexion TCP et
+# passait donc ce test pendant que plus aucune requete n'aboutissait.
+# /health fait un vrai aller-retour moteur (catalogue lu, transaction
+# ouverte et validee, donc fsync du journal) sous une echeance de 3 s, et
+# rend 503 avec la raison sinon.
+#
+# --retries=3 avec --interval=30s : le conteneur passe `unhealthy` apres
+# ~90 s d'echecs consecutifs, pas au premier hoquet. Docker ne redemarre
+# PAS sur un healthcheck rouge — c'est a l'orchestrateur de le faire
+# (Swarm/Kubernetes le font ; avec `docker run --restart` seul, le
+# healthcheck sert d'alerte et le redemarrage suit la mort du process).
+# Voir la section « Production » du README.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -q -O /dev/null "$FERRITE_HEALTH_URL" || exit 1
 ENTRYPOINT ["ferrite-server"]

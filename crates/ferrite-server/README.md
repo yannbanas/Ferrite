@@ -68,7 +68,30 @@ n'est signe par personne).
 | `FERRITE_PASSWORD` | genere aleatoirement | mot de passe de ce compte |
 | `FERRITE_TLS_CERT` / `FERRITE_TLS_KEY` | — | chaine PEM + cle privee ; les deux ou aucun |
 | `FERRITE_TLS_DISABLE` | non | `1` pour accepter du clair, **avec un avertissement** |
+| `FERRITE_METRICS_LISTEN` | `0.0.0.0:9187` | endpoint `/metrics` + `/health` |
+| `FERRITE_METRICS_DISABLE` | non | `1` pour ne pas ouvrir cet endpoint |
 | `FERRITE_LOG` | `info` | filtre `tracing-subscriber` |
+
+## Observabilite
+
+Un second listener, HTTP en clair, separe du port PostgreSQL :
+
+- `GET /metrics` — format d'exposition Prometheus (voir `ferrite-metrics`).
+- `GET /health` — un vrai aller-retour moteur : le catalogue est lu, une
+  transaction est ouverte et validee (donc le journal est ecrit et
+  `fsync`e). Rend `200` si le moteur repond, `503` avec la raison sinon,
+  et `503` sur echeance de 3 s s'il ne repond plus du tout. C'est ce que
+  le `HEALTHCHECK` de l'image interroge : `nc -z 5432` ne prouvait que
+  l'existence du listener, pas que le moteur repondait encore.
+
+Une sonde qui ne revient pas n'est pas suivie d'une autre — la suivante
+constate que la precedente est toujours en vol et rend `503`
+immediatement, au lieu d'empiler des threads bloquants derriere le meme
+verrou.
+
+L'echec de binding de cet endpoint est fatal au demarrage : un
+deploiement qui l'a demande et ne l'a pas obtenu n'a pas de healthcheck
+non plus.
 
 TLS est actif par defaut. `FERRITE_TLS_DISABLE` est une sortie de secours
 pour du loopback ou un transport deja securise, pas un mode normal.

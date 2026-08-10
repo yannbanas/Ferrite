@@ -1,0 +1,70 @@
+# Deploiement mono-noeud de reference. `docker compose up -d`.
+#
+# Ce fichier existe pour une raison precise : la politique de redemarrage
+# ne se declare pas dans le Dockerfile, elle se declare a l'execution. Une
+# image parfaite lancee sans `--restart` ne se releve jamais toute seule.
+#
+# Variables a fournir dans un `.env` a cote de ce fichier :
+#   FERRITE_PASSWORD=...        obligatoire (sinon mot de passe aleatoire
+#                               a chaque demarrage, journalise, donc les
+#                               clients ne se reconnectent pas apres un
+#                               redemarrage)
+#   FERRITE_PORT=5432           port publie cote hote (defaut 5432)
+
+services:
+  ferrite:
+    image: ghcr.io/mairie-creusot/ferrite:latest
+    # Construire localement plutot que tirer l'image :
+    # build: .
+    container_name: ferrite
+
+    # Le coeur du « juste un restart et tout remarche ». `unless-stopped`
+    # plutot qu'`always` : un `docker stop` explicite de l'operateur reste
+    # respecte apres un redemarrage du demon, une panne ne l'est pas.
+    restart: unless-stopped
+
+    environment:
+      FERRITE_DATA: /data
+      FERRITE_USER: ${FERRITE_USER:-ferrite}
+      FERRITE_PASSWORD: ${FERRITE_PASSWORD:?FERRITE_PASSWORD doit etre defini}
+      FERRITE_LISTEN: 0.0.0.0:5432
+      FERRITE_METRICS_LISTEN: 0.0.0.0:9187
+      FERRITE_LOG: info
+      # TLS est actif par defaut avec un certificat auto-signe ephemere,
+      # regenere a chaque demarrage : les clients doivent alors utiliser
+      # sslmode=require, pas verify-full. Pour un vrai certificat, monter
+      # la paire et decommenter les deux lignes ci-dessous (les deux ou
+      # aucune, le serveur refuse de demarrer sinon).
+      # FERRITE_TLS_CERT: /tls/server.crt
+      # FERRITE_TLS_KEY: /tls/server.key
+
+    volumes:
+      - ferrite-data:/data
+      # - ./tls:/tls:ro
+
+    ports:
+      # Le port SQL est publie ; 9187 ne l'est pas — l'endpoint n'est pas
+      # authentifie et n'a rien a faire sur l'hote. Un Prometheus dans le
+      # meme reseau Docker le scrape a `ferrite:9187`.
+      - "${FERRITE_PORT:-5432}:5432"
+
+    # Redondant avec le HEALTHCHECK de l'image, repete ici parce que c'est
+    # ce que lit un operateur qui n'ouvre pas le Dockerfile.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9187/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Assez pour que le process meure sur un OOM au lieu de faire ramer
+    # l'hote entier ; a ajuster selon la taille du cache de pages.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+    stop_grace_period: 30s
+
+volumes:
+  ferrite-data:

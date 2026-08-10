@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = build_handler(&settings, superuser)?;
 
     if let Some(listen) = &settings.metrics_listen {
-        observability::serve(listen).await?;
+        observability::serve(listen, Arc::clone(&engine)).await?;
         observability::spawn_sampler(Arc::clone(&engine), settings.data_dir.clone());
     }
 
