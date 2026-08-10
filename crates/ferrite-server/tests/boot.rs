@@ -48,6 +48,15 @@ fn spawn(port: u16, data: &Path, extra: &[(&str, &str)]) -> ServerProcess {
         .env("FERRITE_PASSWORD", "hunter2")
         .env("FERRITE_DATA", data)
         .env("FERRITE_LOG", "warn");
+    // The observability endpoint binds a fixed port by default, and these
+    // tests run several servers at once; a test that wants it names its own
+    // port through `extra`.
+    if !extra
+        .iter()
+        .any(|(key, _)| key.starts_with("FERRITE_METRICS"))
+    {
+        command.env("FERRITE_METRICS_DISABLE", "1");
+    }
     for (key, value) in extra {
         command.env(key, value);
     }
@@ -721,4 +730,103 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         .await
         .expect("the connection survived every refusal");
     assert_eq!(row.get::<_, i64>(0), 1);
+}
+
+/// Fetches one metric's value out of a Prometheus exposition body.
+fn metric(body: &str, name: &str) -> f64 {
+    body.lines()
+        .find(|line| line.starts_with(name) && line[name.len()..].starts_with(' '))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{name} is not in the exposition body:\n{body}"))
+}
+
+async fn scrape(port: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to the metrics endpoint");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: ferrite\r\n\r\n")
+        .await
+        .expect("send the scrape");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read the exposition");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected scrape response: {response}"
+    );
+    response
+}
+
+/// The endpoint answers on its own port, and its counters move because of
+/// traffic that crossed the *SQL* port — which is the only thing that makes
+/// them worth scraping.
+#[tokio::test]
+async fn the_metrics_endpoint_reports_real_traffic() {
+    let data = scratch("metrics");
+    let port = free_port();
+    let metrics_port = free_port();
+    let _server = spawn(
+        port,
+        &data,
+        &[
+            ("FERRITE_TLS_DISABLE", "1"),
+            (
+                "FERRITE_METRICS_LISTEN",
+                &format!("127.0.0.1:{metrics_port}"),
+            ),
+        ],
+    );
+    wait_for_port(port).await;
+    wait_for_port(metrics_port).await;
+
+    let before = scrape(metrics_port).await;
+    assert!(before.contains("# TYPE ferrite_queries_total counter"));
+    // Sampled, not counted: the data file exists from the first boot.
+    assert!(metric(&before, "ferrite_data_file_bytes") > 0.0);
+
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE TABLE m (id BIGINT NOT NULL, label TEXT)")
+        .await
+        .expect("create");
+    for i in 0..5i64 {
+        client
+            .execute("INSERT INTO m (id, label) VALUES ($1, $2)", &[&i, &"x"])
+            .await
+            .expect("insert");
+    }
+    client.query("SELECT id FROM m", &[]).await.expect("select");
+
+    let after = scrape(metrics_port).await;
+    assert_eq!(
+        metric(&after, "ferrite_queries_total{kind=\"insert\"}"),
+        metric(&before, "ferrite_queries_total{kind=\"insert\"}") + 5.0
+    );
+    assert!(
+        metric(&after, "ferrite_queries_total{kind=\"select\"}")
+            > metric(&before, "ferrite_queries_total{kind=\"select\"}")
+    );
+    assert!(metric(&after, "ferrite_queries_total{kind=\"ddl\"}") >= 1.0);
+    assert!(
+        metric(&after, "ferrite_transactions_committed_total")
+            >= metric(&before, "ferrite_transactions_committed_total") + 6.0
+    );
+    assert!(metric(&after, "ferrite_connections_total") >= 1.0);
+    assert!(metric(&after, "ferrite_query_duration_seconds_count") >= 7.0);
+    assert!(metric(&after, "ferrite_txn_id_ceiling") > 1.0e8);
+
+    // A statement that fails is counted under its own category, not lost.
+    let _ = client.query("SELECT * FROM absent", &[]).await;
+    let errors = scrape(metrics_port).await;
+    assert!(
+        metric(
+            &errors,
+            "ferrite_query_errors_total{category=\"table_not_found\"}"
+        ) >= 1.0
+    );
 }

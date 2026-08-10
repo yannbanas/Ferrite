@@ -19,13 +19,36 @@ use ferrite_common::{FerriteError, Row, RowId, ScanIter, Snapshot, StorageEngine
 
 use crate::btree;
 use crate::clog;
+use crate::clog::TXNS_PER_CLOG_PAGE;
 use crate::codec::{decode_row, encode_row};
 use crate::page::{PageId, PageKind, NO_PAGE};
-use crate::pager::{Pager, DEFAULT_CACHE_PAGES};
+use crate::pager::{Pager, CLOG_DIRECTORY_CAPACITY, DEFAULT_CACHE_PAGES};
 use crate::version::{decode_chain, encode_chain, Version, NO_TXN};
 
 pub const DATA_FILE: &str = "ferrite.db";
 pub const JOURNAL_FILE: &str = "ferrite.wal";
+
+/// The highest transaction id this format can address.
+///
+/// Transaction ids are `u64` and never wrap (see `docs/architecture.md`),
+/// but the commit bitmap that records their outcome is finite: a directory
+/// of [`CLOG_DIRECTORY_CAPACITY`] segments in the meta page, each covering
+/// 65 344 transactions. Running out is a hard stop, not a slowdown, so
+/// `ferrite-server` watches the distance to it.
+pub const MAX_TXN_ID: TxnId = (CLOG_DIRECTORY_CAPACITY * TXNS_PER_CLOG_PAGE) as TxnId;
+
+/// The counters an operator has to watch, read under the engine lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// The id the next transaction will get, i.e. how far into
+    /// [`MAX_TXN_ID`] this database has travelled.
+    pub next_txn_id: TxnId,
+    /// Transactions open right now, from storage's own bookkeeping rather
+    /// than the server's session state.
+    pub active_txns: usize,
+    /// Pages the data file uses, meta page included.
+    pub page_count: u32,
+}
 
 /// Tunables for [`FerriteStorage::open_with`].
 #[derive(Debug, Clone)]
@@ -105,6 +128,18 @@ impl FerriteStorage {
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// Reads the operational counters. Takes the engine lock, so a caller
+    /// that must not block — a metrics scrape, a health probe — should run
+    /// it off the async runtime like any other storage call.
+    pub fn stats(&self) -> Result<StorageStats, FerriteError> {
+        let inner = self.lock()?;
+        Ok(StorageStats {
+            next_txn_id: inner.pager.meta().next_txn_id,
+            active_txns: inner.active.len(),
+            page_count: inner.pager.meta().page_count,
+        })
     }
 
     /// Writes everything to the data file, fsyncs it, and truncates the

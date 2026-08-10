@@ -45,6 +45,11 @@ impl Server {
             let _ = stream.set_nodelay(true);
             let config = Arc::clone(&self.config);
             tokio::spawn(async move {
+                // Counted here rather than after authentication: a peer that
+                // opens a socket and never gets past the handshake still
+                // holds a connection, and that is exactly the shape an
+                // operator needs to see.
+                let _counted = ferrite_metrics::ConnectionGuard::new();
                 match serve_connection(stream, config).await {
                     Ok(()) => debug!(%peer, "connection closed"),
                     Err(err) => debug!(%peer, error = %err, "connection ended with an error"),

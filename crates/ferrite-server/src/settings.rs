@@ -11,6 +11,10 @@ pub const DEFAULT_USER: &str = "ferrite";
 /// that wants the data to survive the container points `FERRITE_DATA` at a
 /// volume.
 pub const DEFAULT_DATA_DIR: &str = "./data";
+/// The port `postgres_exporter` conventionally uses, so existing Prometheus
+/// scrape configurations and dashboards need no adjustment. Separate from
+/// 5432 on purpose — see the `ferrite-metrics` crate docs.
+pub const DEFAULT_METRICS_LISTEN: &str = "0.0.0.0:9187";
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -23,6 +27,8 @@ pub struct Settings {
     pub tls_disabled: bool,
     /// Directory holding `ferrite.db` and `ferrite.wal`.
     pub data_dir: PathBuf,
+    /// Where the Prometheus/health endpoint listens. `None` disables it.
+    pub metrics_listen: Option<String>,
 }
 
 impl Settings {
@@ -37,6 +43,14 @@ impl Settings {
             data_dir: var("FERRITE_DATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+            metrics_listen: if is_truthy("FERRITE_METRICS_DISABLE") {
+                None
+            } else {
+                Some(
+                    var("FERRITE_METRICS_LISTEN")
+                        .unwrap_or_else(|| DEFAULT_METRICS_LISTEN.to_owned()),
+                )
+            },
         };
         if settings.tls_cert.is_some() != settings.tls_key.is_some() {
             return Err("FERRITE_TLS_CERT and FERRITE_TLS_KEY must be set together".to_owned());
@@ -75,6 +89,7 @@ mod tests {
             tls_key: None,
             tls_disabled: false,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
+            metrics_listen: Some(DEFAULT_METRICS_LISTEN.to_owned()),
         };
         assert_eq!(
             settings.tls_description(),

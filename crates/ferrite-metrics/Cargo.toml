@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Prometheus metrics registry and the HTTP endpoint that exposes them, plus the application-level health probe used by container orchestrators."
+
+[dependencies]
+async-trait = "0.1"
+tokio.workspace = true
+tracing.workspace = true

@@ -101,6 +101,7 @@ where
             }
             StartupRequest::Startup(params) => {
                 if config.tls.is_required() && !encrypted {
+                    ferrite_metrics::metrics().connections_rejected_total.inc();
                     warn!(user = %params.user, "refused a cleartext startup: TLS is required");
                     framed.send(backend::error_response(
                         Severity::Fatal,
@@ -130,6 +131,7 @@ where
     let outcome = match authenticate(&mut framed, &params, &config).await {
         Ok(outcome) => outcome,
         Err(err) => {
+            ferrite_metrics::metrics().connections_rejected_total.inc();
             let (severity, state, message) = match &err {
                 ProtocolError::AuthFailed(user) => (
                     Severity::Fatal,
@@ -217,9 +219,13 @@ where
         .authenticator
         .authenticate(&params.user, &params.database, &password)
         .await
-        .inspect_err(|_| warn!(user = %params.user, "authentication failed"))?;
+        .inspect_err(|_| {
+            ferrite_metrics::metrics().auth_failures_total.inc();
+            warn!(user = %params.user, "authentication failed");
+        })?;
 
     if !may_connect(&outcome.role) {
+        ferrite_metrics::metrics().auth_failures_total.inc();
         warn!(
             user = %params.user,
             role = %outcome.role.name,

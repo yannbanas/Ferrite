@@ -22,6 +22,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use ferrite_catalog::SystemCatalog;
@@ -30,6 +31,7 @@ use ferrite_common::{
     Value,
 };
 use ferrite_exec::{QueryResult as ExecResult, Session};
+use ferrite_metrics::{metrics, ErrorKind, StatementKind};
 use ferrite_planner::{Planner, DEFAULT_NAMESPACE};
 use ferrite_proc::ProcRegistry;
 use ferrite_protocol::{
@@ -87,6 +89,12 @@ impl Engine {
         self.inner.storage.checkpoint()
     }
 
+    /// Storage counters, for the metrics sampler. Blocking: it takes the
+    /// engine lock like any other storage call.
+    pub fn stats(&self) -> Result<ferrite_storage::StorageStats, FerriteError> {
+        self.inner.storage.stats()
+    }
+
     fn session(&self) -> Connection {
         Connection {
             session: Arc::new(SessionHandle {
@@ -142,7 +150,30 @@ impl SessionHandle {
         Ok(last)
     }
 
+    /// Runs one statement and records what it was, how long it took and
+    /// how it failed. This is the only place with all three in hand, which
+    /// is why the instrumentation sits here rather than in the protocol
+    /// layer, where a multi-statement string is still one opaque query.
     fn run_one(
+        &self,
+        statement: &sql::Statement,
+        params: &[Value],
+        caller: Identity,
+    ) -> Result<QueryResult, FerriteError> {
+        let started = Instant::now();
+        let result = self.dispatch(statement, params, caller);
+
+        metrics().queries_total.inc(statement_kind(statement));
+        metrics()
+            .query_duration_seconds
+            .observe(started.elapsed().as_secs_f64());
+        if let Err(err) = &result {
+            metrics().query_errors_total.inc(error_kind(err));
+        }
+        result
+    }
+
+    fn dispatch(
         &self,
         statement: &sql::Statement,
         params: &[Value],
@@ -198,13 +229,26 @@ impl SessionHandle {
             return body(txn);
         }
         let txn = self.inner.storage.begin()?;
+        metrics().transactions_active.inc();
         match body(txn) {
             Ok(value) => {
-                self.inner.storage.commit(txn)?;
-                Ok(value)
+                let committed = self.inner.storage.commit(txn);
+                metrics().transactions_active.dec();
+                match committed {
+                    Ok(()) => {
+                        metrics().transactions_committed_total.inc();
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        metrics().transactions_aborted_total.inc();
+                        Err(err)
+                    }
+                }
             }
             Err(err) => {
                 let _ = self.inner.storage.abort(txn);
+                metrics().transactions_active.dec();
+                metrics().transactions_aborted_total.inc();
                 Err(err)
             }
         }
@@ -224,6 +268,7 @@ impl SessionHandle {
         let mut state = self.lock()?;
         if state.txn.is_none() {
             state.txn = Some(self.inner.storage.begin()?);
+            metrics().transactions_active.inc();
         }
         Ok(QueryResult::command(CommandTag::Begin)
             .with_transaction(TransactionStatus::InTransaction))
@@ -233,7 +278,15 @@ impl SessionHandle {
         let mut state = self.lock()?;
         if let Some(txn) = state.txn.take() {
             state.ddl = false;
-            self.inner.storage.commit(txn)?;
+            let committed = self.inner.storage.commit(txn);
+            metrics().transactions_active.dec();
+            match committed {
+                Ok(()) => metrics().transactions_committed_total.inc(),
+                Err(err) => {
+                    metrics().transactions_aborted_total.inc();
+                    return Err(err);
+                }
+            }
         }
         Ok(QueryResult::command(CommandTag::Commit).with_transaction(TransactionStatus::Idle))
     }
@@ -242,6 +295,8 @@ impl SessionHandle {
         let mut state = self.lock()?;
         if let Some(txn) = state.txn.take() {
             let _ = self.inner.storage.abort(txn);
+            metrics().transactions_active.dec();
+            metrics().transactions_aborted_total.inc();
             if std::mem::take(&mut state.ddl) {
                 // The catalog updated its in-memory index when the DDL ran;
                 // nothing else undoes that for an aborted transaction.
@@ -444,6 +499,8 @@ impl Drop for SessionHandle {
             if let Some(txn) = state.txn.take() {
                 debug!(txn, "connection closed with an open transaction: aborting");
                 let _ = self.inner.storage.abort(txn);
+                metrics().transactions_active.dec();
+                metrics().transactions_aborted_total.inc();
                 if state.ddl {
                     let _ = self.inner.catalog.reload();
                 }
@@ -518,6 +575,49 @@ where
     tokio::task::spawn_blocking(move || body(session.as_ref()))
         .await
         .map_err(|err| FerriteError::Exec(format!("engine task failed: {err}")))?
+}
+
+/// The `kind` label of `ferrite_queries_total`.
+fn statement_kind(statement: &sql::Statement) -> StatementKind {
+    match statement {
+        sql::Statement::Query(_) => StatementKind::Select,
+        sql::Statement::Insert(_) => StatementKind::Insert,
+        sql::Statement::Update(_) => StatementKind::Update,
+        sql::Statement::Delete(_) => StatementKind::Delete,
+        sql::Statement::CreateTable(_)
+        | sql::Statement::AlterTable(_)
+        | sql::Statement::DropTable(_)
+        | sql::Statement::CreateIndex(_)
+        | sql::Statement::DropIndex(_)
+        | sql::Statement::CreateProcedure(_)
+        | sql::Statement::DropProcedure(_)
+        | sql::Statement::CreateTrigger(_)
+        | sql::Statement::DropTrigger(_) => StatementKind::Ddl,
+        sql::Statement::Begin | sql::Statement::Commit | sql::Statement::Rollback => {
+            StatementKind::Transaction
+        }
+        sql::Statement::Call(_) => StatementKind::Call,
+    }
+}
+
+/// The `category` label of `ferrite_query_errors_total`.
+fn error_kind(err: &FerriteError) -> ErrorKind {
+    match err {
+        FerriteError::TableNotFound(_) => ErrorKind::TableNotFound,
+        FerriteError::ColumnNotFound(_) => ErrorKind::ColumnNotFound,
+        FerriteError::TypeMismatch { .. } => ErrorKind::TypeMismatch,
+        FerriteError::RowNotFound => ErrorKind::RowNotFound,
+        FerriteError::TxnNotActive(_) => ErrorKind::TxnNotActive,
+        FerriteError::PermissionDenied(_) => ErrorKind::PermissionDenied,
+        FerriteError::SerializationFailure => ErrorKind::SerializationFailure,
+        FerriteError::Storage(_) => ErrorKind::Storage,
+        FerriteError::Parse(_) => ErrorKind::Parse,
+        FerriteError::Plan(_) => ErrorKind::Plan,
+        FerriteError::Exec(_) => ErrorKind::Exec,
+        FerriteError::Protocol(_) => ErrorKind::Protocol,
+        FerriteError::ObjectAlreadyExists(_) => ErrorKind::ObjectAlreadyExists,
+        FerriteError::InvalidDefinition(_) => ErrorKind::InvalidDefinition,
+    }
 }
 
 fn fields_of(schema: &Schema) -> Vec<FieldDescription> {

@@ -8,6 +8,7 @@ description = "PostgreSQL wire protocol v3 server: framing, auth, TLS. Speaks th
 
 [dependencies]
 ferrite-common.workspace = true
+ferrite-metrics.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

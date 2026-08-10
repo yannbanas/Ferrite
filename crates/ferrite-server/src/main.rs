@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 mod banner;
 mod describe;
 mod engine;
+mod observability;
 mod settings;
 
 use engine::Engine;
@@ -56,6 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // network authentication alone confers nothing.
     let superuser = identity_for_user(&settings.user);
     let engine = build_handler(&settings, superuser)?;
+
+    if let Some(listen) = &settings.metrics_listen {
+        observability::serve(listen).await?;
+        observability::spawn_sampler(Arc::clone(&engine), settings.data_dir.clone());
+    }
 
     let tls = build_tls(&settings)?;
     let authenticator = StaticAuthenticator::new().with_account(

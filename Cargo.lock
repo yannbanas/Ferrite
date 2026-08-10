@@ -289,6 +289,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-metrics"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-planner"
 version = "0.1.0"
 dependencies = [
@@ -310,6 +319,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ferrite-common",
+ "ferrite-metrics",
  "rand 0.8.7",
  "rcgen",
  "rustls-pki-types",
@@ -332,6 +342,7 @@ dependencies = [
  "ferrite-catalog",
  "ferrite-common",
  "ferrite-exec",
+ "ferrite-metrics",
  "ferrite-planner",
  "ferrite-proc",
  "ferrite-protocol",

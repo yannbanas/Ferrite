@@ -15,12 +15,18 @@ use std::path::Path;
 
 use ferrite_common::{FerriteError, TxnId};
 
-use crate::page::{Page, PageId, PageKind, META_PAGE, NO_PAGE, PAGE_SIZE};
+use crate::page::{Page, PageId, PageKind, HEADER_SIZE, META_PAGE, NO_PAGE, PAGE_SIZE};
 use crate::wal::Journal;
 
 const MAGIC: &[u8; 8] = b"FERRITE1";
 const FORMAT_VERSION: u32 = 1;
 const META_CLOG_BASE: usize = 40;
+
+/// Commit-log segments the directory in the meta page can address. Each
+/// segment covers 65 344 transactions, so this
+/// is what bounds the number of transactions a database can ever run — see
+/// [`crate::MAX_TXN_ID`].
+pub const CLOG_DIRECTORY_CAPACITY: usize = (PAGE_SIZE - HEADER_SIZE - META_CLOG_BASE) / 4;
 
 /// Default page-cache capacity, in pages: 1024 pages is 8 MiB.
 pub const DEFAULT_CACHE_PAGES: usize = 1024;
@@ -54,7 +60,7 @@ impl Meta {
     }
 
     fn encode(&self, page: &mut Page) -> Result<(), FerriteError> {
-        let capacity = (page.body().len() - META_CLOG_BASE) / 4;
+        let capacity = CLOG_DIRECTORY_CAPACITY;
         if self.clog_pages.len() > capacity {
             return Err(FerriteError::Storage(format!(
                 "commit-log directory is full ({capacity} segments); \
@@ -98,8 +104,7 @@ impl Meta {
             )));
         }
         let clog_count = u32::from_le_bytes(body[36..40].try_into().unwrap()) as usize;
-        let capacity = (body.len() - META_CLOG_BASE) / 4;
-        if clog_count > capacity {
+        if clog_count > CLOG_DIRECTORY_CAPACITY {
             return Err(FerriteError::Storage(
                 "corrupt meta page: commit-log directory length out of range".into(),
             ));
