@@ -60,8 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(listen) = &settings.metrics_listen {
         observability::serve(listen, Arc::clone(&engine)).await?;
-        observability::spawn_sampler(Arc::clone(&engine), settings.data_dir.clone());
     }
+    // Outside the block above on purpose: the sampler feeds the gauges, but
+    // it is also what notices a transaction left open and the distance to
+    // the commit-bitmap ceiling. Those warnings belong in the log whether
+    // or not anything is scraping.
+    observability::spawn_sampler(Arc::clone(&engine), settings.data_dir.clone());
 
     let tls = build_tls(&settings)?;
     let authenticator = StaticAuthenticator::new().with_account(

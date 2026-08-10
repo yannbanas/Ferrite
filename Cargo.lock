@@ -370,6 +370,7 @@ name = "ferrite-storage"
 version = "0.1.0"
 dependencies = [
  "ferrite-common",
+ "ferrite-metrics",
  "proptest",
  "thiserror",
  "tracing",

@@ -36,9 +36,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "endpoint")]
 pub mod http;
 mod registry;
 
+#[cfg(feature = "endpoint")]
 pub use http::{AlwaysHealthy, Endpoint, HealthProbe};
 pub use registry::{Counter, CounterVec, Encoder, Gauge, Histogram, Label};
 
@@ -180,6 +182,10 @@ pub struct Metrics {
     /// database is to it.
     pub txn_id: Gauge,
     pub txn_id_ceiling: Gauge,
+    /// Age of the longest-running open transaction. A number that only
+    /// grows is a client that forgot to commit, and it holds the MVCC
+    /// pruning horizon back for the whole database.
+    pub oldest_transaction_seconds: Gauge,
 
     /// Page checksum mismatches seen since start. Any value above zero is
     /// an incident, not a warning.
@@ -223,6 +229,7 @@ impl Metrics {
             journal_bytes: Gauge::new(),
             txn_id: Gauge::new(),
             txn_id_ceiling: Gauge::new(),
+            oldest_transaction_seconds: Gauge::new(),
             checksum_failures_total: Counter::new(),
             storage_write_failures_total: Counter::new(),
             health_checks_total: Counter::new(),
@@ -317,8 +324,13 @@ impl Metrics {
         );
         out.gauge(
             "ferrite_txn_id_ceiling",
-            "Transaction ids the commit bitmap can still address.",
+            "Transaction ids the commit bitmap can address in total.",
             &self.txn_id_ceiling,
+        );
+        out.gauge(
+            "ferrite_oldest_transaction_seconds",
+            "Age of the longest-running open transaction.",
+            &self.oldest_transaction_seconds,
         );
         out.counter(
             "ferrite_checksum_failures_total",

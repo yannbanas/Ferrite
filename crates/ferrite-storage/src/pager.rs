@@ -35,6 +35,25 @@ fn io_err(context: &str, e: std::io::Error) -> FerriteError {
     FerriteError::Storage(format!("{context}: {e}"))
 }
 
+/// A failed write, sync or truncate, as opposed to a failed read.
+///
+/// Worth its own path because this is the shape a full or read-only disk
+/// takes, and because a lost write is how a database loses data: the
+/// operator has to see it as it happens, not later, through a statement
+/// that fails for a reason that no longer names the cause.
+fn write_err(context: &str, e: std::io::Error) -> FerriteError {
+    ferrite_metrics::metrics()
+        .storage_write_failures_total
+        .inc();
+    tracing::error!(
+        context,
+        kind = ?e.kind(),
+        error = %e,
+        "storage write failed: the data directory may be full or read-only"
+    );
+    io_err(context, e)
+}
+
 /// Contents of page 0. Held decoded so the hot fields (allocator, txn
 /// counter) do not need re-parsing on every access.
 #[derive(Debug, Clone)]
@@ -194,7 +213,7 @@ impl Pager {
             pager
                 .file
                 .sync_data()
-                .map_err(|e| io_err("syncing new data file", e))?;
+                .map_err(|e| write_err("syncing new data file", e))?;
         } else {
             let page = pager.load_from_file(META_PAGE)?;
             pager.meta = Meta::decode(&page)?;
@@ -228,7 +247,7 @@ impl Pager {
         let offset = page_id as u64 * PAGE_SIZE as u64;
         self.file
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| io_err("seeking data file", e))?;
+            .map_err(|e| write_err("seeking data file", e))?;
         let mut bytes = [0u8; PAGE_SIZE];
         let mut filled = 0;
         while filled < PAGE_SIZE {
@@ -250,10 +269,10 @@ impl Pager {
         let offset = page_id as u64 * PAGE_SIZE as u64;
         self.file
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| io_err("seeking data file", e))?;
+            .map_err(|e| write_err("seeking data file", e))?;
         self.file
             .write_all(&page.to_bytes())
-            .map_err(|e| io_err("writing data file", e))
+            .map_err(|e| write_err("writing data file", e))
     }
 
     fn tick(&mut self) -> u64 {
@@ -467,10 +486,10 @@ impl Pager {
         self.meta_dirty_vs_journal = false;
         self.file
             .flush()
-            .map_err(|e| io_err("flushing data file", e))?;
+            .map_err(|e| write_err("flushing data file", e))?;
         self.file
             .sync_data()
-            .map_err(|e| io_err("syncing data file", e))?;
+            .map_err(|e| write_err("syncing data file", e))?;
         self.journal.log_checkpoint()?;
         self.journal.sync()?;
         self.journal.truncate()
@@ -503,9 +522,9 @@ fn recover(file: &mut File, journal_path: &Path) -> Result<Recovery, FerriteErro
             } => {
                 let offset = page_id as u64 * PAGE_SIZE as u64;
                 file.seek(SeekFrom::Start(offset))
-                    .map_err(|e| io_err("seeking during recovery", e))?;
+                    .map_err(|e| write_err("seeking during recovery", e))?;
                 file.write_all(bytes.as_slice())
-                    .map_err(|e| io_err("writing during recovery", e))?;
+                    .map_err(|e| write_err("writing during recovery", e))?;
                 stats.pages += 1;
                 stats.max_lsn = stats.max_lsn.max(lsn);
             }
@@ -523,7 +542,7 @@ fn recover(file: &mut File, journal_path: &Path) -> Result<Recovery, FerriteErro
     })?;
     if stats.pages > 0 {
         file.sync_data()
-            .map_err(|e| io_err("syncing after recovery", e))?;
+            .map_err(|e| write_err("syncing after recovery", e))?;
     }
     Ok(stats)
 }

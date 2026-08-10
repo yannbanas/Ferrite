@@ -22,7 +22,9 @@ repository = "https://github.com/mairie-creusot/Ferrite"
 
 [workspace.dependencies]
 ferrite-common = { path = "crates/ferrite-common" }
-ferrite-metrics = { path = "crates/ferrite-metrics" }
+# Registry only by default; `ferrite-server` opts into the HTTP endpoint
+# so that the crates below it need no async runtime to record a counter.
+ferrite-metrics = { path = "crates/ferrite-metrics", default-features = false }
 ferrite-storage = { path = "crates/ferrite-storage" }
 ferrite-catalog = { path = "crates/ferrite-catalog" }
 ferrite-sql = { path = "crates/ferrite-sql" }

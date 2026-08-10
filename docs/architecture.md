@@ -49,8 +49,9 @@ Rôles : `ferrite_common::Role` — un nom + une liste plate de `Permission` (Co
 - Tests par propriétés (`proptest`) sur les invariants MVCC (`ferrite-storage`) — les violations de sérialisabilité sont le genre de bug qu'un test unitaire classique ne voit pas.
 - JSON natif, UUID v7 par défaut.
 - Tout en async (`tokio`).
-- Métriques exposées façon Prometheus (à ajouter, pas encore scaffoldé — voir « Reste à faire » plus bas).
+- Métriques exposées façon Prometheus — *fait* : `ferrite-metrics`, servi en HTTP sur un port séparé du 5432 (défaut `9187`), avec `/health` à côté (voir `README.md`, §Production).
 - Journalisation structurée (`tracing`) sur tout événement sensible (échec d'auth, refus de permission, changement de schéma).
+- Limitation des tentatives d'authentification par IP source et par nom d'utilisateur (`ferrite-protocol::throttle`) — la comparaison en temps constant ne sert à rien face à un nombre illimité d'essais.
 
 ## Structure du workspace
 
@@ -251,7 +252,7 @@ crée un doublon que SQLite refuserait deux fois.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 
-- Endpoint de métriques Prometheus — pas encore de crate/emplacement défini.
+- ~~Endpoint de métriques Prometheus~~ — *fait*, crate `ferrite-metrics`, registre écrit à la main (le format d'exposition tient en quelques dizaines de lignes, la dépendance aurait pesé plus lourd que le code) et petit serveur HTTP/1.1 sur son propre port.
 - `cargo-fuzz` : cibles à écrire une fois `ferrite-sql`/`ferrite-protocol` non-triviaux.
 - Format exact du journal de récupération de `ferrite-storage` (WAL complet vs plus simple) — laissé au jugement de l'Agent 1 avec justification.
 - Sous-ensemble exact de la grammaire SQL v1 (JOIN, CTE, quelles fonctions d'agrégat, quelles fenêtres) — laissé au jugement de l'Agent 2 avec justification, dans les limites du présent document.

@@ -117,6 +117,18 @@ impl Page {
         let stored = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let actual = crc32c(&bytes[4..]);
         if stored != actual {
+            // Logged here, not only returned: a mismatch means the bytes on
+            // disk changed under the database — failing storage, a torn
+            // write, something else editing the file. An operator has to
+            // learn about it even when the statement that hit it was retried
+            // and the error never reached a person.
+            ferrite_metrics::metrics().checksum_failures_total.inc();
+            tracing::error!(
+                page = page_id,
+                stored = format!("{stored:#010x}"),
+                computed = format!("{actual:#010x}"),
+                "page checksum mismatch: the data file is corrupt"
+            );
             return Err(FerriteError::Storage(format!(
                 "page {page_id} checksum mismatch: stored {stored:#010x}, computed {actual:#010x}"
             )));
@@ -325,11 +337,16 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_page() {
+        let before = ferrite_metrics::metrics().checksum_failures_total.get();
         let page = Page::new(PageKind::Leaf);
         let mut bytes = page.to_bytes();
         bytes[100] ^= 0xff;
         let err = Page::from_bytes(bytes, 9).unwrap_err();
         assert!(matches!(err, FerriteError::Storage(_)));
+        // Corruption is not only reported to the caller: it is counted, so
+        // an operator sees it even when the statement that hit it was
+        // retried and the error never reached anyone.
+        assert!(ferrite_metrics::metrics().checksum_failures_total.get() > before);
     }
 
     #[test]

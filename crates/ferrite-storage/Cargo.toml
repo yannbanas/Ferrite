@@ -8,6 +8,7 @@ description = "Page-based storage engine: B-tree, MVCC row versions, crash-recov
 
 [dependencies]
 ferrite-common.workspace = true
+ferrite-metrics.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

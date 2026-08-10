@@ -14,7 +14,7 @@ path = "src/main.rs"
 ferrite-common.workspace = true
 ferrite-catalog.workspace = true
 ferrite-exec.workspace = true
-ferrite-metrics.workspace = true
+ferrite-metrics = { workspace = true, features = ["endpoint"] }
 ferrite-planner.workspace = true
 ferrite-proc.workspace = true
 ferrite-protocol.workspace = true

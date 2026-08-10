@@ -60,6 +60,25 @@ fn io_err(context: &str, e: std::io::Error) -> FerriteError {
     FerriteError::Storage(format!("{context}: {e}"))
 }
 
+/// A failed write, sync or truncate, as opposed to a failed read.
+///
+/// Worth its own path because this is the shape a full or read-only disk
+/// takes, and because a lost write is how a database loses data: the
+/// operator has to see it as it happens, not later, through a statement
+/// that fails for a reason that no longer names the cause.
+fn write_err(context: &str, e: std::io::Error) -> FerriteError {
+    ferrite_metrics::metrics()
+        .storage_write_failures_total
+        .inc();
+    tracing::error!(
+        context,
+        kind = ?e.kind(),
+        error = %e,
+        "storage write failed: the data directory may be full or read-only"
+    );
+    io_err(context, e)
+}
+
 /// A decoded journal record.
 pub enum Record {
     PageImage {
@@ -115,7 +134,7 @@ impl Journal {
         framed.extend_from_slice(payload);
         self.file
             .write_all(&framed)
-            .map_err(|e| io_err("appending to journal", e))
+            .map_err(|e| write_err("appending to journal", e))
     }
 
     pub fn log_page_image(
@@ -158,11 +177,11 @@ impl Journal {
     pub fn sync(&mut self) -> Result<(), FerriteError> {
         self.file
             .flush()
-            .map_err(|e| io_err("flushing journal", e))?;
+            .map_err(|e| write_err("flushing journal", e))?;
         if self.sync_on_commit {
             self.file
                 .sync_data()
-                .map_err(|e| io_err("syncing journal", e))?;
+                .map_err(|e| write_err("syncing journal", e))?;
         }
         Ok(())
     }
@@ -172,13 +191,13 @@ impl Journal {
     pub fn truncate(&mut self) -> Result<(), FerriteError> {
         self.file
             .set_len(0)
-            .map_err(|e| io_err("truncating journal", e))?;
+            .map_err(|e| write_err("truncating journal", e))?;
         self.file
             .seek(SeekFrom::Start(0))
-            .map_err(|e| io_err("rewinding journal", e))?;
+            .map_err(|e| write_err("rewinding journal", e))?;
         self.file
             .sync_data()
-            .map_err(|e| io_err("syncing truncated journal", e))?;
+            .map_err(|e| write_err("syncing truncated journal", e))?;
         Ok(())
     }
 

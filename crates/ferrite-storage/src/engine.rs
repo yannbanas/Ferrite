@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use ferrite_common::{FerriteError, Row, RowId, ScanIter, Snapshot, StorageEngine, TableId, TxnId};
 
@@ -48,6 +49,9 @@ pub struct StorageStats {
     pub active_txns: usize,
     /// Pages the data file uses, meta page included.
     pub page_count: u32,
+    /// The longest-running open transaction, and how long it has been
+    /// open. `None` when nothing is open.
+    pub oldest_txn: Option<(TxnId, Duration)>,
 }
 
 /// Tunables for [`FerriteStorage::open_with`].
@@ -83,6 +87,10 @@ struct TxnState {
     /// Header pages of tables this transaction dropped, so their space can
     /// be considered for reclamation at commit.
     dropped: Vec<PageId>,
+    /// When it opened. A transaction left open holds the pruning horizon
+    /// back for every other one, so its age is something an operator has to
+    /// be able to see.
+    started: Instant,
 }
 
 struct Inner {
@@ -135,10 +143,17 @@ impl FerriteStorage {
     /// it off the async runtime like any other storage call.
     pub fn stats(&self) -> Result<StorageStats, FerriteError> {
         let inner = self.lock()?;
+        let now = Instant::now();
+        let oldest = inner
+            .active
+            .iter()
+            .max_by_key(|(_, state)| now.saturating_duration_since(state.started))
+            .map(|(txn, state)| (*txn, now.saturating_duration_since(state.started)));
         Ok(StorageStats {
             next_txn_id: inner.pager.meta().next_txn_id,
             active_txns: inner.active.len(),
             page_count: inner.pager.meta().page_count,
+            oldest_txn: oldest,
         })
     }
 
@@ -417,6 +432,7 @@ impl StorageEngine for FerriteStorage {
             TxnState {
                 snapshot,
                 dropped: Vec::new(),
+                started: Instant::now(),
             },
         );
         tracing::debug!(txn, "transaction begun");

@@ -254,10 +254,13 @@ only appropriate for data you are willing to lose.
 - **No DDL locking.** Postgres takes an `ACCESS EXCLUSIVE` lock for
   `DROP TABLE`; Ferrite v1 has nowhere to put one. Concurrent readers see
   the drop through the normal snapshot rules rather than being blocked.
-- **Commit-bitmap ceiling.** The directory in the meta page holds about 2000
-  segments of 65 344 transactions, so roughly 1.3 x 10^8 transactions per
-  database. Lifting it means moving the directory out of the meta page or
-  naming clog segments as files.
+- **Commit-bitmap ceiling.** The directory in the meta page holds 2032
+  segments of 65 344 transactions, so 1.32 x 10^8 transactions per database
+  (`ferrite_storage::MAX_TXN_ID`). Lifting it means moving the directory out
+  of the meta page or naming clog segments as files. It is a wall rather
+  than a slope — commits stop dead — so `ferrite-server` samples the
+  distance to it and warns from 70 % of the way, then on every sample past
+  90 %; `ferrite_txn_id` / `ferrite_txn_id_ceiling` carry the same number.
 - **Write amplification at commit.** Every dirty page is journalled in full;
   see the journal section.
 - **Scans are `O(log n)` per row.** The cursor re-descends the tree for each
@@ -265,6 +268,23 @@ only appropriate for data you are willing to lose.
   would make it amortised constant.
 - **No savepoints** and no transaction-id wraparound handling, both
   deliberately out of scope for v1 per `docs/architecture.md`.
+
+## Ce qui est journalise pour l'operateur
+
+Trois evenements sortent en `tracing::error!`/`warn!` avec un compteur en
+face. Ils doivent etre vus avant de devenir un incident, et aucun ne
+remonte forcement jusqu'a un humain par le chemin d'erreur — une requete
+qui echoue est souvent retentee et l'erreur disparait.
+
+| Evenement | Ou | Compteur |
+| --- | --- | --- |
+| Somme de controle de page invalide | `page.rs`, a la lecture | `ferrite_checksum_failures_total` |
+| Ecriture / `fsync` / troncature en echec (disque plein, monte en lecture seule) | `pager.rs`, `wal.rs` | `ferrite_storage_write_failures_total` |
+| Transaction ouverte anormalement longtemps | echantillonne par `ferrite-server` | `ferrite_oldest_transaction_seconds` |
+
+Le dernier n'est pas cosmetique : une transaction laissee ouverte retient
+l'horizon d'elagage MVCC pour toute la base, donc les versions mortes
+s'accumulent tant qu'elle vit.
 
 ## Tests
 
