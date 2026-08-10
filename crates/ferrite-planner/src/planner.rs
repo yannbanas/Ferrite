@@ -67,6 +67,7 @@ impl<'a> Planner<'a> {
             // catalog and storage operations the caller drives directly,
             // and the v1 executor has no node set for them.
             sql::Statement::CreateTable(_)
+            | sql::Statement::AlterTable(_)
             | sql::Statement::DropTable(_)
             | sql::Statement::CreateIndex(_)
             | sql::Statement::DropIndex(_) => Err(FerriteError::Plan(

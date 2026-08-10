@@ -384,6 +384,61 @@ impl SystemCatalog {
         Ok(id)
     }
 
+    /// Append a column to an existing table's stored schema, joining a
+    /// caller-owned transaction. This is the catalog half of
+    /// `ALTER TABLE … ADD COLUMN`. See [`SystemCatalog::create_table_in`]
+    /// for the abort caveat.
+    ///
+    /// One row is added to `ferrite_columns`, at the next free ordinal —
+    /// the column goes on the end and nothing already stored moves.
+    /// **Rows already written keep the arity they had**: the catalog does
+    /// not touch table data, and the reader is what reconciles the two
+    /// (`ferrite-exec` fills the missing trailing values with the column's
+    /// default). That is Postgres's behaviour too, and it is what makes
+    /// this an `O(1)` operation on a table of any size.
+    pub fn add_column_in(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        column: ColumnDef,
+    ) -> Result<(), FerriteError> {
+        if Self::is_system_table(table) {
+            return Err(FerriteError::PermissionDenied(format!(
+                "table {table} belongs to the system catalog and cannot be altered"
+            )));
+        }
+        if column.name.is_empty() {
+            return Err(catalog_error("column names must not be empty"));
+        }
+        let position = {
+            let cache = self.read_cache()?;
+            let entry = cache
+                .by_id
+                .get(&table)
+                .ok_or_else(|| FerriteError::TableNotFound(table.to_string()))?;
+            if entry.columns.column_index(&column.name).is_some() {
+                return Err(FerriteError::ObjectAlreadyExists(format!(
+                    "column `{}.{}.{}`",
+                    entry.schema, entry.name, column.name
+                )));
+            }
+            entry.columns.columns.len()
+        };
+
+        self.record_column(txn, table, position, &column)?;
+        if let Some(entry) = self.write_cache()?.by_id.get_mut(&table) {
+            entry.columns.columns.push(column);
+        }
+        Ok(())
+    }
+
+    /// [`SystemCatalog::add_column_in`] in a transaction of the catalog's
+    /// own. [`Catalog`] has no `add_column`, so this is an inherent method
+    /// the same way the `*_in` primitives are.
+    pub fn add_column(&self, table: TableId, column: ColumnDef) -> Result<(), FerriteError> {
+        self.in_own_txn(|txn| self.add_column_in(txn, table, column))
+    }
+
     /// [`Catalog::drop_table`], joining a caller-owned transaction. Drops
     /// the table's indexes with it. See [`SystemCatalog::create_table_in`]
     /// for the abort caveat.

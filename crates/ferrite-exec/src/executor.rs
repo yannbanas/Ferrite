@@ -1,8 +1,8 @@
 //! Single-threaded physical plan executor.
 
 use ferrite_common::{
-    Catalog, DataType, FerriteError, Identity, Permission, Row, RowId, Schema, StorageEngine,
-    TableId, TxnId, Value,
+    Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Row, RowId, Schema,
+    StorageEngine, TableId, TxnId, Value,
 };
 use ferrite_planner::{PhysExpr, PhysicalPlan};
 use ferrite_proc::{ProcDecision, ProcRegistry, TriggerEvent};
@@ -18,6 +18,15 @@ use crate::index::IndexProvider;
 pub struct Tuple {
     pub rid: Option<RowId>,
     pub row: Row,
+}
+
+/// The table a scan reads, paired with the schema the plan was built
+/// against. The two travel together because every row coming out of
+/// storage is reconciled with that schema — see [`fill_added_columns`].
+#[derive(Debug, Clone, Copy)]
+struct ScanTarget<'a> {
+    table: TableId,
+    schema: &'a Schema,
 }
 
 /// Outcome of one statement.
@@ -155,7 +164,14 @@ impl<'a> Session<'a> {
                 filter,
             } => {
                 self.check_schema(*table, table_name, schema)?;
-                self.seq_scan(txn, *table, filter.as_ref())
+                self.seq_scan(
+                    txn,
+                    ScanTarget {
+                        table: *table,
+                        schema,
+                    },
+                    filter.as_ref(),
+                )
             }
 
             PhysicalPlan::IndexScan {
@@ -168,7 +184,17 @@ impl<'a> Session<'a> {
                 residual,
             } => {
                 self.check_schema(*table, table_name, schema)?;
-                self.index_scan(txn, *table, index, *column, key, residual.as_ref())
+                self.index_scan(
+                    txn,
+                    ScanTarget {
+                        table: *table,
+                        schema,
+                    },
+                    index,
+                    *column,
+                    key,
+                    residual.as_ref(),
+                )
             }
 
             PhysicalPlan::Filter { input, predicate } => {
@@ -212,15 +238,16 @@ impl<'a> Session<'a> {
     fn seq_scan(
         &self,
         txn: TxnId,
-        table: TableId,
+        target: ScanTarget<'_>,
         filter: Option<&PhysExpr>,
     ) -> Result<Vec<Tuple>, FerriteError> {
         let scanned = self
             .storage
-            .scan(txn, table)?
+            .scan(txn, target.table)?
             .collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
-        for (rid, row) in scanned {
+        for (rid, mut row) in scanned {
+            fill_added_columns(target.schema, &mut row);
             let keep = match filter {
                 Some(predicate) => eval_predicate(predicate, &row)?,
                 None => true,
@@ -238,7 +265,7 @@ impl<'a> Session<'a> {
     fn index_scan(
         &self,
         txn: TxnId,
-        table: TableId,
+        target: ScanTarget<'_>,
         index: &str,
         column: usize,
         key: &PhysExpr,
@@ -249,9 +276,11 @@ impl<'a> Session<'a> {
         let candidates = match self.indexes {
             Some(provider) => {
                 let mut out = Vec::new();
-                for rid in provider.lookup(txn, table, index, &key)? {
+                for rid in provider.lookup(txn, target.table, index, &key)? {
+                    let mut row = self.storage.get(txn, target.table, rid)?;
+                    fill_added_columns(target.schema, &mut row);
                     out.push(Tuple {
-                        row: self.storage.get(txn, table, rid)?,
+                        row,
                         rid: Some(rid),
                     });
                 }
@@ -260,7 +289,7 @@ impl<'a> Session<'a> {
             None => {
                 tracing::warn!(
                     index,
-                    table,
+                    table = target.table,
                     "no index provider wired: falling back to a sequential scan"
                 );
                 let equality = PhysExpr::binary(
@@ -268,7 +297,7 @@ impl<'a> Session<'a> {
                     ferrite_planner::BinaryOp::Eq,
                     PhysExpr::Literal(key),
                 );
-                self.seq_scan(txn, table, Some(&equality))?
+                self.seq_scan(txn, target, Some(&equality))?
             }
         };
 
@@ -444,6 +473,41 @@ fn node_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Update { .. } => "Update",
         PhysicalPlan::Delete { .. } => "Delete",
         PhysicalPlan::CallProcedure { .. } => "CallProcedure",
+    }
+}
+
+/// Reconcile a stored row with a schema that has grown since it was
+/// written, by appending the missing trailing values.
+///
+/// `ALTER TABLE … ADD COLUMN` records a column in the catalog and touches
+/// no table data, so every row written before it is one value short of the
+/// new schema. Nothing below this crate can fix that: `ferrite_common::Row`
+/// is positional and `ferrite-storage` is schema-blind — it stores a
+/// `Vec<Value>` and has never been told how many columns a table has. The
+/// alternative, rewriting every row at `ALTER` time, would turn an `O(1)`
+/// catalog write into a full table rewrite under one engine-wide lock, and
+/// it is not what PostgreSQL does either (`pg_attribute.attmissingval`
+/// holds the value and the heap tuples stay short).
+///
+/// The filler is the column's `DEFAULT` when that default is a constant,
+/// and `NULL` otherwise. A volatile default — `CURRENT_TIMESTAMP` — has no
+/// honest answer for a row that predates the column, and inventing one at
+/// read time would make the same row read differently twice. `ALTER TABLE`
+/// refuses to add a `NOT NULL` column to a non-empty table unless the
+/// default is a constant, which is what keeps that `NULL` from reaching a
+/// column declared not to hold one.
+///
+/// A row longer than the schema is left alone: v1 has no `DROP COLUMN`, so
+/// the only way to see one is a plan built against a stale schema, and
+/// `Session::check_schema` catches that first.
+fn fill_added_columns(schema: &Schema, row: &mut Row) {
+    for column in schema.columns.iter().skip(row.values.len()) {
+        row.values.push(
+            match column.default.as_ref().and_then(ColumnDefault::constant) {
+                Some(value) => value.clone(),
+                None => Value::Null,
+            },
+        );
     }
 }
 

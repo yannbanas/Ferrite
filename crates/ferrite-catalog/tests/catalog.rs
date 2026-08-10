@@ -633,6 +633,93 @@ fn a_failed_create_leaves_the_index_consistent() {
     assert_eq!(catalog.table_id("public", "users").unwrap(), Some(table));
 }
 
+/// `ADD COLUMN` appends to the stored schema, refuses a duplicate and a
+/// system table, and survives the round trip through the catalog tables —
+/// including the `DEFAULT`, which is what an omitted `INSERT` column reads.
+#[test]
+fn add_column_appends_to_the_stored_schema() {
+    let (storage, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let before = storage.rows(COLUMNS_TABLE_ID).unwrap().len();
+
+    catalog
+        .add_column(table, ColumnDef::new("bio", DataType::Text, true))
+        .unwrap();
+    catalog
+        .add_column(
+            table,
+            ColumnDef::new("totp_enabled", DataType::Int8, false)
+                .with_default(ColumnDefault::Constant(Value::Int8(0))),
+        )
+        .unwrap();
+    catalog
+        .add_column(
+            table,
+            ColumnDef::new("created_at", DataType::Timestamp, false)
+                .with_default(ColumnDefault::CurrentTimestamp),
+        )
+        .unwrap();
+
+    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), before + 3);
+
+    let expected = |schema: &Schema| {
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "id",
+                "email",
+                "age",
+                "profile",
+                "bio",
+                "totp_enabled",
+                "created_at"
+            ],
+            "new columns go on the end and nothing already stored moves"
+        );
+        assert_eq!(schema.columns[4].default, None);
+        assert_eq!(
+            schema.columns[5].default,
+            Some(ColumnDefault::Constant(Value::Int8(0)))
+        );
+        assert_eq!(
+            schema.columns[6].default,
+            Some(ColumnDefault::CurrentTimestamp)
+        );
+    };
+    expected(&catalog.table_schema(table).unwrap());
+
+    // Read back from the catalog tables rather than the in-memory index.
+    let reopened = SystemCatalog::open(storage.clone() as Arc<dyn StorageEngine>).unwrap();
+    expected(&reopened.table_schema(table).unwrap());
+
+    assert!(
+        matches!(
+            catalog.add_column(table, ColumnDef::new("bio", DataType::Text, true)),
+            Err(FerriteError::ObjectAlreadyExists(_))
+        ),
+        "a column that is already there is not added twice"
+    );
+    assert!(
+        matches!(
+            catalog.add_column(TABLES_TABLE_ID, ColumnDef::new("x", DataType::Text, true)),
+            Err(FerriteError::PermissionDenied(_))
+        ),
+        "the system catalog is not the application's to alter"
+    );
+    assert!(catalog
+        .add_column(9999, ColumnDef::new("x", DataType::Text, true))
+        .is_err());
+    assert_eq!(
+        storage.rows(COLUMNS_TABLE_ID).unwrap().len(),
+        before + 3,
+        "no refused ADD COLUMN left a row behind"
+    );
+}
+
 /// Every `DEFAULT` shape has to come back out of `ferrite_columns` as
 /// exactly what went in: it is stored as one tagged string, and the
 /// constant's own type is recovered from the column's declared type.

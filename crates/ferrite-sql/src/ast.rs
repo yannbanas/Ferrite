@@ -32,6 +32,7 @@ impl ObjectName {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTable),
+    AlterTable(AlterTable),
     DropTable(DropTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
@@ -87,6 +88,31 @@ impl CreateTable {
                 .collect::<Result<_, _>>()?,
         })
     }
+}
+
+/// `ALTER TABLE [IF EXISTS] name <action>`. Ferrite v1 has one action —
+/// see [`AlterTableAction`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub if_exists: bool,
+    pub name: ObjectName,
+    pub action: AlterTableAction,
+}
+
+/// The `ALTER TABLE` actions Ferrite v1 covers.
+///
+/// `ADD COLUMN` only. `DROP COLUMN`, `RENAME`, `ALTER COLUMN TYPE`,
+/// `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL` and constraint actions are
+/// **not** covered and are a parse error naming the action, never a
+/// silently accepted no-op. `ADD COLUMN` is what an application's
+/// migration mechanism actually runs; the rest can follow once the storage
+/// layer has a story for rewriting existing rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    AddColumn {
+        if_not_exists: bool,
+        column: ColumnSpec,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

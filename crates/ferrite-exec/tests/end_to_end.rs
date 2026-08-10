@@ -4,8 +4,8 @@
 mod support;
 
 use ferrite_common::{
-    Catalog, DataType, FerriteError, Identity, Permission, Role, Row, Schema, StorageEngine,
-    TableId, Value,
+    Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Role, Row, Schema,
+    StorageEngine, TableId, Value,
 };
 use ferrite_exec::{QueryResult, Session};
 use ferrite_planner::{PhysicalPlan, Planner};
@@ -469,6 +469,69 @@ fn a_not_null_violation_is_rejected() {
     )
     .is_err());
     assert!(storage.dump(table).is_empty());
+}
+
+/// `ALTER TABLE … ADD COLUMN` writes a catalog row and leaves table data
+/// alone, so every row written before it is short. The read path is what
+/// reconciles the two: a column with a constant `DEFAULT` reads back as
+/// that constant, one without reads back as `NULL`, on the sequential and
+/// the indexed path alike.
+#[test]
+fn rows_written_before_a_column_existed_read_back_at_the_new_arity() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    assert!(storage.dump(table).iter().all(|row| row.values.len() == 3));
+
+    let mut altered = users_schema();
+    altered.columns.push(column("bio", DataType::Text, true));
+    altered.columns.push(
+        column("totp_enabled", DataType::Int8, false)
+            .with_default(ColumnDefault::Constant(Value::Int8(0))),
+    );
+    catalog.replace_schema(table, altered);
+
+    // Storage still holds the short rows: nothing rewrote them.
+    assert!(storage.dump(table).iter().all(|row| row.values.len() == 3));
+
+    for sql in [
+        "SELECT id, bio, totp_enabled FROM users",
+        // The indexed path reads one row at a time and has to fill it too.
+        "SELECT id, bio, totp_enabled FROM users WHERE id = 1",
+    ] {
+        let rows = rows_of(run(&storage, &catalog, &procs, OWNER, sql).unwrap());
+        assert!(!rows.is_empty(), "{sql}");
+        for row in rows {
+            assert_eq!(row.values[1], Value::Null, "{sql}");
+            assert_eq!(row.values[2], Value::Int8(0), "{sql}");
+        }
+    }
+
+    // A short row can still be updated, and lands back at the full arity.
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "UPDATE users SET bio = 'hi' WHERE id = 2",
+    )
+    .unwrap();
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT bio, totp_enabled FROM users WHERE id = 2",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows[0].values[0], Value::Text("hi".into()));
+    assert_eq!(rows[0].values[1], Value::Int8(0));
+    assert!(storage
+        .dump(table)
+        .iter()
+        .any(|row| row.values.len() == 5 && row.values[3] == Value::Text("hi".into())));
 }
 
 #[test]

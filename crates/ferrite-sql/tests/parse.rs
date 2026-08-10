@@ -187,6 +187,52 @@ fn column_defaults_reach_the_schema() {
 }
 
 #[test]
+fn alter_table_add_column() {
+    let altered = match stmt("ALTER TABLE IF EXISTS public.users ADD COLUMN IF NOT EXISTS bio TEXT")
+    {
+        Statement::AlterTable(a) => a,
+        other => panic!("{other:?}"),
+    };
+    assert!(altered.if_exists);
+    assert_eq!(altered.name.split("public"), ("public", "users"));
+    let AlterTableAction::AddColumn {
+        if_not_exists,
+        column,
+    } = &altered.action;
+    assert!(if_not_exists);
+    assert_eq!(column.name, "bio");
+    assert_eq!(column.data_type, DataType::Text);
+
+    // `COLUMN` is optional, as it is in PostgreSQL.
+    let altered = match stmt("ALTER TABLE t ADD flag BIGINT NOT NULL DEFAULT 0") {
+        Statement::AlterTable(a) => a,
+        other => panic!("{other:?}"),
+    };
+    assert!(!altered.if_exists);
+    let AlterTableAction::AddColumn {
+        if_not_exists,
+        column,
+    } = &altered.action;
+    assert!(!if_not_exists);
+    let def = column.to_column_def(false).unwrap();
+    assert!(!def.nullable);
+    assert_eq!(def.default, Some(ColumnDefault::Constant(Value::Int4(0))));
+
+    // Every other action is named in the error, never accepted as a no-op.
+    for sql in [
+        "ALTER TABLE t DROP COLUMN a",
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE t ALTER COLUMN a TYPE TEXT",
+        "ALTER TABLE t ADD",
+        "ALTER TABLE t ADD COLUMN a",
+        "ALTER TABLE ADD COLUMN a TEXT",
+        "ALTER INDEX i RENAME TO j",
+    ] {
+        rejects(sql);
+    }
+}
+
+#[test]
 fn drop_table() {
     let dropped = match stmt("DROP TABLE IF EXISTS a, public.b CASCADE") {
         Statement::DropTable(d) => d,
