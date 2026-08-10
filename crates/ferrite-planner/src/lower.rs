@@ -1,7 +1,7 @@
 //! `ferrite-sql` AST → the planner's IR.
 //!
-//! `ferrite-sql` parses a good deal more than `ferrite-exec` can run: joins,
-//! aggregates, subqueries, set operations, `ORDER BY`. Everything this
+//! `ferrite-sql` parses more than `ferrite-exec` can run: subqueries, set
+//! operations, `CASE`, `CAST`, common table expressions. Everything this
 //! module cannot project onto [`crate::expr`] becomes a
 //! [`FerriteError::Plan`], never a panic and never a silently wrong plan.
 //! The rejections are all in one place so the gap between "parses" and
@@ -10,10 +10,18 @@
 use ferrite_common::{DataType, FerriteError, Value};
 use ferrite_sql::ast as sql;
 
-use crate::expr::{BinaryOp, Expr};
+use crate::expr::{BinaryOp, ColumnRef, Expr};
 
-fn unsupported(what: &str) -> FerriteError {
+pub(crate) fn unsupported(what: &str) -> FerriteError {
     FerriteError::Plan(format!("{what} is not supported by the v1 planner"))
+}
+
+/// Where an aggregate call lands in the row an `Aggregate` node produces:
+/// the group keys come first, then `calls` in order.
+#[derive(Clone, Copy)]
+pub(crate) struct AggregateSlots<'a> {
+    pub(crate) calls: &'a [sql::FunctionCall],
+    pub(crate) offset: usize,
 }
 
 /// Lowers expressions, resolving `$n` placeholders against the bound
@@ -21,9 +29,13 @@ fn unsupported(what: &str) -> FerriteError {
 /// relation actually in scope.
 pub(crate) struct Lowerer<'a> {
     params: &'a [Value],
-    /// Table name and alias of the single relation in scope, empty where
-    /// column references are illegal (`INSERT ... VALUES`, `CALL` args).
+    /// Every table name and alias in scope, empty where column references
+    /// are illegal (`INSERT ... VALUES`, `CALL` args).
     qualifiers: Vec<String>,
+    /// Set while lowering the expressions that sit above an `Aggregate`
+    /// node, where an aggregate call is a reference to an already-computed
+    /// column rather than something to evaluate per row.
+    aggregates: Option<AggregateSlots<'a>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -31,11 +43,17 @@ impl<'a> Lowerer<'a> {
         Self {
             params,
             qualifiers: Vec::new(),
+            aggregates: None,
         }
     }
 
     pub(crate) fn with_qualifiers(mut self, qualifiers: Vec<String>) -> Self {
         self.qualifiers = qualifiers;
+        self
+    }
+
+    pub(crate) fn with_aggregates(mut self, slots: AggregateSlots<'a>) -> Self {
+        self.aggregates = Some(slots);
         self
     }
 
@@ -50,12 +68,16 @@ impl<'a> Lowerer<'a> {
                 sql::UnaryOp::Plus => self.expr(expr),
                 sql::UnaryOp::Minus => match self.expr(expr)? {
                     Expr::Literal(value) => Ok(Expr::Literal(negate(value)?)),
-                    _ => Err(unsupported("unary minus on a non-literal")),
+                    other => Ok(Expr::binary(
+                        Expr::Literal(Value::Int4(0)),
+                        BinaryOp::Minus,
+                        other,
+                    )),
                 },
             },
 
             sql::Expr::BinaryOp { left, op, right } => {
-                let op = binary_op(*op)?;
+                let op = binary_op(*op);
                 Ok(Expr::binary(self.expr(left)?, op, self.expr(right)?))
             }
 
@@ -114,31 +136,63 @@ impl<'a> Lowerer<'a> {
                 })
             }
 
+            sql::Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Expr::Like {
+                expr: Box::new(self.expr(expr)?),
+                pattern: Box::new(self.expr(pattern)?),
+                negated: *negated,
+            }),
+
+            sql::Expr::Function(call) => self.function(call),
+
             sql::Expr::Cast { .. } => Err(unsupported("CAST")),
-            sql::Expr::Like { .. } => Err(unsupported("LIKE")),
             sql::Expr::Case { .. } => Err(unsupported("CASE")),
-            sql::Expr::Function(call) => Err(unsupported(&format!("the function {}", call.name))),
             sql::Expr::Subquery(_) | sql::Expr::InSubquery { .. } | sql::Expr::Exists { .. } => {
                 Err(unsupported("subqueries"))
             }
         }
     }
 
-    fn column(&self, name: &sql::ObjectName) -> Result<Expr, FerriteError> {
-        if let Some(qualifier) = name.qualifier() {
-            if self.qualifiers.is_empty() {
-                return Err(FerriteError::Plan(format!(
-                    "column reference {qualifier}.{} has no relation in scope",
-                    name.base()
-                )));
-            }
-            if !self.qualifiers.iter().any(|q| q == qualifier) {
-                return Err(FerriteError::Plan(format!(
-                    "no relation named {qualifier} in this statement"
-                )));
-            }
+    /// An aggregate call is a reference to a column the `Aggregate` node
+    /// below has already computed; anything else is a function the v1
+    /// executor has no implementation for.
+    fn function(&self, call: &sql::FunctionCall) -> Result<Expr, FerriteError> {
+        if !sql::is_aggregate(&call.name) {
+            return Err(unsupported(&format!("the function {}", call.name)));
         }
-        Ok(Expr::Column(name.base().to_string()))
+        let Some(slots) = self.aggregates else {
+            return Err(FerriteError::Plan(format!(
+                "{}() is only allowed in a select list, HAVING or ORDER BY",
+                call.name
+            )));
+        };
+        let position = slots
+            .calls
+            .iter()
+            .position(|c| c == call)
+            .expect("every aggregate in the statement was collected first");
+        Ok(Expr::Slot(slots.offset + position))
+    }
+
+    fn column(&self, name: &sql::ObjectName) -> Result<Expr, FerriteError> {
+        let Some(qualifier) = name.qualifier() else {
+            return Ok(Expr::Column(ColumnRef::new(name.base())));
+        };
+        if self.qualifiers.is_empty() {
+            return Err(FerriteError::Plan(format!(
+                "column reference {qualifier}.{} has no relation in scope",
+                name.base()
+            )));
+        }
+        if !self.qualifiers.iter().any(|q| q == qualifier) {
+            return Err(FerriteError::Plan(format!(
+                "no relation named {qualifier} in this statement"
+            )));
+        }
+        Ok(Expr::Column(ColumnRef::qualified(qualifier, name.base())))
     }
 
     /// `$n` is 1-based on the wire, as PostgreSQL numbers placeholders.
@@ -151,6 +205,150 @@ impl<'a> Lowerer<'a> {
             .get(index)
             .cloned()
             .ok_or_else(|| FerriteError::Plan(format!("${n} has no bound value")))
+    }
+}
+
+/// Every aggregate call in `expr`, appended to `out` without duplicates so
+/// `count(*)` written twice is computed once.
+///
+/// An aggregate inside another aggregate has no meaning — there is no inner
+/// grouping for it to run over — and is refused here rather than producing
+/// a slot that refers to itself.
+pub(crate) fn collect_aggregates(
+    expr: &sql::Expr,
+    out: &mut Vec<sql::FunctionCall>,
+) -> Result<(), FerriteError> {
+    walk(expr, &mut |e| {
+        if let sql::Expr::Function(call) = e {
+            if sql::is_aggregate(&call.name) {
+                if let sql::FunctionArgs::List(args) = &call.args {
+                    for arg in args {
+                        if contains_aggregate(arg) {
+                            return Err(unsupported("an aggregate inside another aggregate"));
+                        }
+                    }
+                }
+                if !out.contains(call) {
+                    out.push(call.clone());
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn contains_aggregate(expr: &sql::Expr) -> bool {
+    let mut found = false;
+    let _ = walk(expr, &mut |e| {
+        if let sql::Expr::Function(call) = e {
+            found |= sql::is_aggregate(&call.name);
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Pre-order walk over the sub-expressions this planner understands.
+/// Subqueries are not descended into: they are rejected on their own, and
+/// an aggregate inside one belongs to that query, not to this one.
+fn walk(
+    expr: &sql::Expr,
+    visit: &mut impl FnMut(&sql::Expr) -> Result<(), FerriteError>,
+) -> Result<(), FerriteError> {
+    visit(expr)?;
+    match expr {
+        sql::Expr::Literal(_)
+        | sql::Expr::Column(_)
+        | sql::Expr::Parameter(_)
+        | sql::Expr::Subquery(_)
+        | sql::Expr::Exists { .. } => {}
+        sql::Expr::UnaryOp { expr, .. }
+        | sql::Expr::IsNull { expr, .. }
+        | sql::Expr::Cast { expr, .. }
+        | sql::Expr::InSubquery { expr, .. } => walk(expr, visit)?,
+        sql::Expr::BinaryOp { left, right, .. } => {
+            walk(left, visit)?;
+            walk(right, visit)?;
+        }
+        sql::Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk(expr, visit)?;
+            walk(low, visit)?;
+            walk(high, visit)?;
+        }
+        sql::Expr::InList { expr, list, .. } => {
+            walk(expr, visit)?;
+            for item in list {
+                walk(item, visit)?;
+            }
+        }
+        sql::Expr::Like { expr, pattern, .. } => {
+            walk(expr, visit)?;
+            walk(pattern, visit)?;
+        }
+        sql::Expr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            for e in operand.iter().chain(else_result.iter()) {
+                walk(e, visit)?;
+            }
+            for (when, then) in branches {
+                walk(when, visit)?;
+                walk(then, visit)?;
+            }
+        }
+        sql::Expr::Function(call) => {
+            if let sql::FunctionArgs::List(args) = &call.args {
+                for arg in args {
+                    walk(arg, visit)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace every subtree equal to one of `keys` with the slot it occupies
+/// in the aggregate's output row. This is what makes `SELECT dept,
+/// count(*) ... GROUP BY dept` legal: `dept` above the aggregate means the
+/// group key, not the column it was computed from.
+pub(crate) fn substitute_group_keys(expr: Expr, keys: &[Expr]) -> Expr {
+    if let Some(position) = keys.iter().position(|key| *key == expr) {
+        return Expr::Slot(position);
+    }
+    match expr {
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(substitute_group_keys(*left, keys)),
+            op,
+            right: Box::new(substitute_group_keys(*right, keys)),
+        },
+        Expr::Not(inner) => Expr::Not(Box::new(substitute_group_keys(*inner, keys))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_group_keys(*inner, keys))),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(substitute_group_keys(*expr, keys)),
+            pattern: Box::new(substitute_group_keys(*pattern, keys)),
+            negated,
+        },
+        other => other,
+    }
+}
+
+/// A column reference that survived [`substitute_group_keys`] is a column
+/// read outside any aggregate and outside the grouping — one row of the
+/// group would have to be picked arbitrarily, which SQL does not allow.
+pub(crate) fn reject_ungrouped(expr: &Expr) -> Result<(), FerriteError> {
+    match expr.referenced_columns().first() {
+        None => Ok(()),
+        Some(reference) => Err(FerriteError::Plan(format!(
+            "{reference} must appear in the GROUP BY clause or be used in an aggregate function"
+        ))),
     }
 }
 
@@ -179,8 +377,8 @@ fn negate(value: Value) -> Result<Value, FerriteError> {
     }
 }
 
-fn binary_op(op: sql::BinaryOp) -> Result<BinaryOp, FerriteError> {
-    Ok(match op {
+fn binary_op(op: sql::BinaryOp) -> BinaryOp {
+    match op {
         sql::BinaryOp::Or => BinaryOp::Or,
         sql::BinaryOp::And => BinaryOp::And,
         sql::BinaryOp::Eq => BinaryOp::Eq,
@@ -189,91 +387,68 @@ fn binary_op(op: sql::BinaryOp) -> Result<BinaryOp, FerriteError> {
         sql::BinaryOp::LtEq => BinaryOp::LtEq,
         sql::BinaryOp::Gt => BinaryOp::Gt,
         sql::BinaryOp::GtEq => BinaryOp::GtEq,
-        sql::BinaryOp::Plus
-        | sql::BinaryOp::Minus
-        | sql::BinaryOp::Multiply
-        | sql::BinaryOp::Divide
-        | sql::BinaryOp::Modulo
-        | sql::BinaryOp::Concat => {
-            return Err(unsupported(
-                "arithmetic and string operators in expressions",
-            ))
-        }
-    })
-}
-
-/// The single relation a statement reads, plus the names it may be
-/// qualified by. Multi-table `FROM` clauses, joins and derived tables are
-/// all rejected here: `ferrite-exec` has no join node to run them with.
-pub(crate) fn single_relation(
-    from: &[sql::TableWithJoins],
-) -> Result<(&sql::ObjectName, Vec<String>), FerriteError> {
-    let [only] = from else {
-        return Err(unsupported("more than one relation in FROM"));
-    };
-    if !only.joins.is_empty() {
-        return Err(unsupported("JOIN"));
-    }
-    match &only.relation {
-        sql::TableFactor::Table { name, alias } => {
-            let mut qualifiers = vec![name.base().to_string()];
-            if let Some(alias) = alias {
-                qualifiers.push(alias.clone());
-            }
-            Ok((name, qualifiers))
-        }
-        sql::TableFactor::Derived { .. } => Err(unsupported("a subquery in FROM")),
+        sql::BinaryOp::Plus => BinaryOp::Plus,
+        sql::BinaryOp::Minus => BinaryOp::Minus,
+        sql::BinaryOp::Multiply => BinaryOp::Multiply,
+        sql::BinaryOp::Divide => BinaryOp::Divide,
+        sql::BinaryOp::Modulo => BinaryOp::Modulo,
+        sql::BinaryOp::Concat => BinaryOp::Concat,
     }
 }
 
 /// Unwrap a [`sql::Query`] down to the one `SELECT` the executor can run,
-/// returning it with the `LIMIT` that applies to it.
-pub(crate) fn single_select(
-    query: &sql::Query,
-) -> Result<(&sql::Select, Option<u64>), FerriteError> {
+/// carrying the `ORDER BY`/`LIMIT`/`OFFSET` that apply to it.
+pub(crate) struct QueryTail<'a> {
+    pub(crate) select: &'a sql::Select,
+    pub(crate) order_by: &'a [sql::OrderByItem],
+    pub(crate) limit: Option<&'a sql::Expr>,
+    pub(crate) offset: Option<&'a sql::Expr>,
+}
+
+pub(crate) fn single_select(query: &sql::Query) -> Result<QueryTail<'_>, FerriteError> {
     if !query.with.is_empty() {
         return Err(unsupported("WITH (common table expressions)"));
-    }
-    if !query.order_by.is_empty() {
-        return Err(unsupported("ORDER BY"));
-    }
-    if query.offset.is_some() {
-        return Err(unsupported("OFFSET"));
     }
     let select = match &query.body {
         sql::SetExpr::Select(select) => select.as_ref(),
         // A parenthesised query keeps its own `SELECT`, but the outer
-        // `LIMIT` is the one that applies.
-        sql::SetExpr::Query(inner) => {
-            let (select, _) = single_select(inner)?;
-            return Ok((select, limit(query)?));
-        }
+        // clauses are the ones that apply.
+        sql::SetExpr::Query(inner) => single_select(inner)?.select,
         sql::SetExpr::SetOp { .. } => {
             return Err(unsupported("UNION/INTERSECT/EXCEPT"));
         }
     };
-    if select.distinct {
-        return Err(unsupported("SELECT DISTINCT"));
-    }
-    if !select.group_by.is_empty() {
-        return Err(unsupported("GROUP BY"));
-    }
-    if select.having.is_some() {
-        return Err(unsupported("HAVING"));
-    }
-    Ok((select, limit(query)?))
+    Ok(QueryTail {
+        select,
+        order_by: &query.order_by,
+        limit: query.limit.as_ref(),
+        offset: query.offset.as_ref(),
+    })
 }
 
-fn limit(query: &sql::Query) -> Result<Option<u64>, FerriteError> {
-    let Some(expr) = &query.limit else {
+/// `LIMIT`/`OFFSET` must be a constant, but not necessarily a literal: a
+/// bound `$n` is substituted before this runs, which is how a paginated
+/// application query arrives.
+pub(crate) fn row_count(
+    expr: Option<&sql::Expr>,
+    lowerer: &Lowerer<'_>,
+    clause: &str,
+) -> Result<Option<u64>, FerriteError> {
+    let Some(expr) = expr else {
         return Ok(None);
     };
-    match expr {
-        sql::Expr::Literal(sql::Literal::Int(n)) if *n >= 0 => Ok(Some(*n as u64)),
-        _ => Err(FerriteError::Plan(
-            "LIMIT must be a non-negative integer literal".into(),
-        )),
-    }
+    let bad = || FerriteError::Plan(format!("{clause} must be a non-negative integer constant"));
+    let Expr::Literal(value) = lowerer.expr(expr)? else {
+        return Err(bad());
+    };
+    let n = match value {
+        Value::Int4(n) => i64::from(n),
+        Value::Int8(n) => n,
+        // `LIMIT NULL` means "no limit" in PostgreSQL.
+        Value::Null => return Ok(None),
+        _ => return Err(bad()),
+    };
+    u64::try_from(n).map(Some).map_err(|_| bad())
 }
 
 /// Coerce a literal to the type of the column it is being written into.
@@ -430,5 +605,42 @@ mod tests {
             coerce(Expr::Literal(Value::Text("x".into())), DataType::Text).unwrap(),
             Expr::Literal(Value::Text("x".into()))
         );
+    }
+
+    #[test]
+    fn the_same_aggregate_written_twice_is_collected_once() {
+        let query = ferrite_sql::parse_statement(
+            "SELECT count(*), count(*), max(age) FROM users GROUP BY dept",
+        )
+        .unwrap();
+        let sql::Statement::Query(query) = query else {
+            panic!("expected a query");
+        };
+        let sql::SetExpr::Select(select) = &query.body else {
+            panic!("expected a select");
+        };
+
+        let mut collected = Vec::new();
+        for item in &select.projection {
+            if let sql::SelectItem::Expr { expr, .. } = item {
+                collect_aggregates(expr, &mut collected).unwrap();
+            }
+        }
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn a_group_key_is_replaced_wherever_it_appears() {
+        let key = Expr::column("dept");
+        let rewritten = substitute_group_keys(
+            Expr::eq(key.clone(), Expr::Literal(Value::Int4(1))),
+            std::slice::from_ref(&key),
+        );
+        assert_eq!(
+            rewritten,
+            Expr::eq(Expr::Slot(0), Expr::Literal(Value::Int4(1)))
+        );
+        assert!(reject_ungrouped(&rewritten).is_ok());
+        assert!(reject_ungrouped(&Expr::column("other")).is_err());
     }
 }

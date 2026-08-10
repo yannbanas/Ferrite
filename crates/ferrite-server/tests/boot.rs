@@ -292,8 +292,10 @@ async fn a_write_conflict_is_reported_as_serialization_failure() {
     );
 }
 
-/// Everything `ferrite-sql` parses but `ferrite-exec` cannot run has to come
-/// back as a clean error on a connection that stays usable.
+/// Two things at once, through the real wire: the query shapes an
+/// application actually writes run end to end, and everything `ferrite-sql`
+/// parses but `ferrite-exec` still cannot run comes back as a clean error on
+/// a connection that stays usable.
 #[tokio::test]
 async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
     let data = scratch("unsupported");
@@ -310,13 +312,35 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         .execute("INSERT INTO t VALUES (1, 'x')", &[])
         .await
         .expect("INSERT");
+    client
+        .batch_execute("CREATE TABLE u (a BIGINT NOT NULL, tag TEXT)")
+        .await
+        .expect("CREATE TABLE u");
+    client
+        .execute("INSERT INTO u VALUES (1, 'tag')", &[])
+        .await
+        .expect("INSERT u");
 
     for sql in [
         "SELECT count(*) FROM t",
-        "SELECT * FROM t ORDER BY a",
+        "SELECT * FROM t ORDER BY a DESC",
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 0",
+        "SELECT t.a, u.tag FROM t JOIN u ON u.a = t.a",
+        "SELECT t.a, u.tag FROM t LEFT JOIN u ON u.a = t.a",
+        "SELECT DISTINCT b FROM t WHERE b LIKE 'x%'",
+        "SELECT b FROM t LIMIT 1 OFFSET 0",
+    ] {
+        client
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|err| panic!("{sql:?} should run now: {err}"));
+    }
+
+    for sql in [
+        // `*` has no meaning once the rows have been collapsed into groups.
         "SELECT * FROM t GROUP BY a",
-        "SELECT * FROM t JOIN t t2 ON t2.a = t.a",
-        "SELECT * FROM t WHERE b LIKE 'x%'",
+        "SELECT (SELECT a FROM t) FROM t",
+        "SELECT CAST(a AS TEXT) FROM t",
         "ALTER TABLE t ADD COLUMN c INT",
         "SELECT * FROM nope",
         "this is not sql",
