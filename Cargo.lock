@@ -136,12 +136,9 @@ dependencies = [
 name = "ferrite-exec"
 version = "0.1.0"
 dependencies = [
- "ferrite-catalog",
  "ferrite-common",
  "ferrite-planner",
  "ferrite-proc",
- "ferrite-storage",
- "thiserror",
  "tracing",
 ]
 
@@ -150,8 +147,6 @@ name = "ferrite-planner"
 version = "0.1.0"
 dependencies = [
  "ferrite-common",
- "ferrite-sql",
- "thiserror",
 ]
 
 [[package]]
@@ -159,8 +154,7 @@ name = "ferrite-proc"
 version = "0.1.0"
 dependencies = [
  "ferrite-common",
- "ferrite-storage",
- "thiserror",
+ "tracing",
 ]
 
 [[package]]
