@@ -223,6 +223,15 @@ CRC check — the normal signature of a write interrupted by a power cut.
 Records before the tear are unaffected because each is checksummed
 independently.
 
+That covers a tear in the *journal*. A tear in the **data file** — a power
+cut halfway through an 8 KiB page write, leaving some sectors new and the
+rest old — is covered by the same images: recovery overwrites the page
+wholesale rather than patching it, so a half-written page becomes a whole
+one. `tests/recovery.rs` tears a page for real (second half overwritten,
+first half intact) and asserts both halves of the guarantee: repaired when
+the journal still holds its image, and reported as a checksum failure
+rather than served when a checkpoint has already emptied the journal.
+
 **Why full images rather than physiological logging.** Logging operations
 instead of pages writes far less, but it needs per-page LSN comparison during
 replay, an idempotent redo path for every structural B-tree operation, and a
@@ -262,6 +271,22 @@ with other transactions still open for the same reason uncommitted work may
 reach the data file at all: the commit bitmap is what makes it invisible. The journal is also
 truncated at the end of recovery, once its records have been applied and the
 data file fsynced.
+
+## The data directory belongs to one process
+
+`FerriteStorage::open` takes an exclusive lock on the directory before it
+touches a single file, and holds it for the life of the engine. Two
+processes on one `FERRITE_DATA` would each replay the journal at startup,
+each cache pages, and each write back a version of a page the other never
+saw; nothing in the page format, the checksums or the journal defends
+against that, because all three assume a single writer.
+
+The lock lives on an open file handle (`share_mode(0)` on Windows,
+`flock(LOCK_EX | LOCK_NB)` on Unix), not on the existence of a file. That
+is the whole point: a lock file created on start and deleted on exit does
+not survive a crash, and the stale one a killed process leaves behind would
+block the very restart recovery exists for. A handle-based lock is released
+by the kernel however the process dies.
 
 The engine does no work in `Drop`. Dropping a `FerriteStorage` therefore
 leaves the files exactly as a power cut would, which is what most of the

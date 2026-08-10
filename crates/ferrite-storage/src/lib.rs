@@ -33,6 +33,7 @@ mod clog;
 mod codec;
 mod crc;
 mod engine;
+mod lockfile;
 mod page;
 mod pager;
 mod unique;
@@ -45,5 +46,6 @@ mod testutil;
 pub use engine::{
     FerriteStorage, StorageConfig, DATA_FILE, DEFAULT_CHECKPOINT_JOURNAL_BYTES, JOURNAL_FILE,
 };
+pub use lockfile::LOCK_FILE;
 pub use page::PAGE_SIZE;
 pub use pager::DEFAULT_CACHE_PAGES;

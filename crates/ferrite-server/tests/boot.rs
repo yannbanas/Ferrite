@@ -964,3 +964,96 @@ async fn the_configured_limits_are_enforced_end_to_end() {
         "the expired transaction was rolled back, so its write is not there"
     );
 }
+
+/// Two servers on one data directory is the classic self-inflicted
+/// corruption: both replay the journal at startup, both cache pages, and
+/// each writes back a version of a page the other never saw. Nothing in
+/// the page format, the checksums or the journal defends against it — they
+/// all assume a single writer — so the defence is refusing to start.
+#[tokio::test]
+async fn a_second_server_on_the_same_data_directory_refuses_to_start() {
+    let data = scratch("dirlock");
+    let first_port = free_port();
+    let second_port = free_port();
+
+    let _first = spawn(first_port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(first_port).await;
+    let client = connect(first_port).await;
+    client
+        .batch_execute("CREATE TABLE held (id BIGINT NOT NULL)")
+        .await
+        .expect("the first server owns the directory");
+
+    // The second one must die rather than listen. `scratch` would wipe the
+    // directory, so the path is reused directly.
+    let mut second = Command::new(env!("CARGO_BIN_EXE_ferrite-server"))
+        .env("FERRITE_LISTEN", format!("127.0.0.1:{second_port}"))
+        .env("FERRITE_USER", "ferrite")
+        .env("FERRITE_PASSWORD", "hunter2")
+        .env("FERRITE_DATA", &data)
+        .env("FERRITE_TLS_DISABLE", "1")
+        .env("FERRITE_LOG", "warn")
+        .spawn()
+        .expect("spawn the second server");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second server is still running; it should have refused the locked directory"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        !status.success(),
+        "the second server exited cleanly instead of refusing"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", second_port))
+            .await
+            .is_err(),
+        "the second server must not be listening"
+    );
+
+    // And the first one never noticed.
+    client
+        .execute("INSERT INTO held (id) VALUES (1)", &[])
+        .await
+        .expect("the holder is unaffected");
+}
+
+/// A lock the operating system holds on a handle, not a file that must be
+/// deleted: a killed server has to be restartable on the same directory,
+/// which is the whole promise of "restart and everything works".
+#[tokio::test]
+async fn a_killed_server_leaves_the_directory_lockable_again() {
+    let data = scratch("dirlock-restart");
+    let port = free_port();
+    {
+        let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+        wait_for_port(port).await;
+        let client = connect(port).await;
+        client
+            .batch_execute("CREATE TABLE kept (id BIGINT NOT NULL)")
+            .await
+            .expect("CREATE TABLE");
+        client
+            .execute("INSERT INTO kept (id) VALUES (7)", &[])
+            .await
+            .expect("INSERT");
+        // Dropped here: the child is killed, not asked to stop.
+    }
+
+    let port = free_port();
+    let _restarted = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+    let client = connect(port).await;
+    let row = client
+        .query_one("SELECT id FROM kept WHERE id = 7", &[])
+        .await
+        .expect("a killed holder must not block the restart");
+    assert_eq!(row.get::<_, i64>(0), 7);
+}

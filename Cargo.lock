@@ -360,6 +360,7 @@ name = "ferrite-storage"
 version = "0.1.0"
 dependencies = [
  "ferrite-common",
+ "libc",
  "proptest",
  "thiserror",
  "tracing",

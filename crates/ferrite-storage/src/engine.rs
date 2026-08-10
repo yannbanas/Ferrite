@@ -22,6 +22,7 @@ use ferrite_common::{
 use crate::btree;
 use crate::clog;
 use crate::codec::{decode_row, encode_row};
+use crate::lockfile::DirectoryLock;
 use crate::page::{PageId, PageKind, NO_PAGE};
 use crate::pager::{Pager, DEFAULT_CACHE_PAGES};
 use crate::unique::{hash_key, KeyFilters, DEFAULT_FILTER_CAPACITY};
@@ -100,6 +101,10 @@ pub struct FerriteStorage {
     inner: Mutex<Inner>,
     dir: PathBuf,
     checkpoint_journal_bytes: u64,
+    /// Held for the life of the engine. Two processes writing one data
+    /// directory is corruption nothing else in this crate defends
+    /// against — see `src/lockfile.rs`.
+    _lock: DirectoryLock,
 }
 
 impl FerriteStorage {
@@ -113,6 +118,10 @@ impl FerriteStorage {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)
             .map_err(|e| FerriteError::Storage(format!("creating {}: {e}", dir.display())))?;
+        // Before the files are touched, not after: recovery replays the
+        // journal on open, and two processes replaying it at once is
+        // exactly the case this refuses.
+        let lock = DirectoryLock::acquire(&dir)?;
         let mut pager = Pager::open(
             &dir.join(DATA_FILE),
             &dir.join(JOURNAL_FILE),
@@ -131,6 +140,7 @@ impl FerriteStorage {
             }),
             dir,
             checkpoint_journal_bytes: config.checkpoint_journal_bytes,
+            _lock: lock,
         })
     }
 
