@@ -1,0 +1,36 @@
+[package]
+name = "ferrite-sql-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the root workspace on purpose: libfuzzer-sys needs a
+# nightly toolchain and `-Z` flags, which must not leak into the normal
+# `cargo build`/`cargo test` of the workspace.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ferrite-sql]
+path = ".."
+
+[[bin]]
+name = "parse_sql"
+path = "fuzz_targets/parse_sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lex_sql"
+path = "fuzz_targets/lex_sql.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

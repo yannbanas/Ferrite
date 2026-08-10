@@ -6,7 +6,14 @@ license.workspace = true
 authors.workspace = true
 description = "System catalog: implements ferrite_common::Catalog on top of a StorageEngine. Owned by Agent 2, alongside ferrite-sql."
 
+[features]
+# Exposes `ferrite_catalog::memory::MemoryStorage`, a minimal in-memory
+# StorageEngine used by this crate's own tests. Off by default so it never
+# ships in the server binary.
+test-util = []
+
 [dependencies]
 ferrite-common.workspace = true
-ferrite-storage.workspace = true
-thiserror.workspace = true
+
+[dev-dependencies]
+ferrite-catalog = { workspace = true, features = ["test-util"] }
