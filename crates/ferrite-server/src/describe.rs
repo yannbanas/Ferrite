@@ -346,16 +346,8 @@ mod tests {
         fn table_schema(&self, _table: TableId) -> Result<Schema, FerriteError> {
             Ok(Schema {
                 columns: vec![
-                    ColumnDef {
-                        name: "id".into(),
-                        data_type: DataType::Int8,
-                        nullable: false,
-                    },
-                    ColumnDef {
-                        name: "name".into(),
-                        data_type: DataType::Text,
-                        nullable: true,
-                    },
+                    ColumnDef::new("id", DataType::Int8, false),
+                    ColumnDef::new("name", DataType::Text, true),
                 ],
             })
         }

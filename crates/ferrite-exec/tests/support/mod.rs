@@ -367,9 +367,5 @@ impl IndexProvider for MemIndexes<'_> {
 }
 
 pub fn column(name: &str, data_type: ferrite_common::DataType, nullable: bool) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable,
-    }
+    ColumnDef::new(name, data_type, nullable)
 }

@@ -21,11 +21,7 @@
 //!         "public",
 //!         "users",
 //!         Schema {
-//!             columns: vec![ColumnDef {
-//!                 name: "id".into(),
-//!                 data_type: DataType::Uuid,
-//!                 nullable: false,
-//!             }],
+//!             columns: vec![ColumnDef::new("id", DataType::Uuid, false)],
 //!         },
 //!     )
 //!     .unwrap();

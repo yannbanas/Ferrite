@@ -269,7 +269,9 @@ impl SessionHandle {
                         "{namespace}.{name}"
                     )));
                 }
-                catalog.create_table_in(txn, namespace, name, create.to_schema())?;
+                let mut schema = create.to_schema()?;
+                ferrite_planner::typecheck_defaults(&mut schema)?;
+                catalog.create_table_in(txn, namespace, name, schema)?;
                 "CREATE TABLE"
             }
 

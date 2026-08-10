@@ -7,13 +7,65 @@
 //! The rejections are all in one place so the gap between "parses" and
 //! "executes" stays legible.
 
-use ferrite_common::{DataType, FerriteError, Value};
+use ferrite_common::{ColumnDefault, DataType, FerriteError, Schema, Value};
 use ferrite_sql::ast as sql;
 
 use crate::expr::{BinaryOp, Expr};
 
 fn unsupported(what: &str) -> FerriteError {
     FerriteError::Plan(format!("{what} is not supported by the v1 planner"))
+}
+
+/// Resolve every `DEFAULT` in a freshly parsed schema against the type of
+/// the column carrying it, and refuse the ones that cannot hold.
+///
+/// `ferrite-sql` produces the default untyped, because a quoted literal
+/// has the same syntax whatever column it lands in: `DEFAULT '1970-01-01'`
+/// parses as `Text` even on a `TIMESTAMP` column. This is the same
+/// coercion [`coerce`] does for a `VALUES` literal, applied once at DDL
+/// time so that a default which could never be written is rejected when
+/// the table is defined rather than on the first `INSERT` that omits the
+/// column.
+///
+/// Refused here: a default whose type cannot be coerced to the column's,
+/// `DEFAULT NULL` on a `NOT NULL` column, and `CURRENT_TIMESTAMP` anywhere
+/// but a `TIMESTAMP` column.
+pub fn typecheck_defaults(schema: &mut Schema) -> Result<(), FerriteError> {
+    for column in &mut schema.columns {
+        let Some(default) = column.default.take() else {
+            continue;
+        };
+        let bad = |what: &str| {
+            FerriteError::InvalidDefinition(format!(
+                "the DEFAULT of column `{}` {what}",
+                column.name
+            ))
+        };
+        let resolved = match default {
+            ColumnDefault::CurrentTimestamp if column.data_type != DataType::Timestamp => {
+                return Err(bad("is CURRENT_TIMESTAMP, which needs a TIMESTAMP column"))
+            }
+            ColumnDefault::CurrentTimestamp => ColumnDefault::CurrentTimestamp,
+            ColumnDefault::Constant(Value::Null) if !column.nullable => {
+                return Err(bad("is NULL, but the column is NOT NULL"))
+            }
+            ColumnDefault::Constant(Value::Null) => ColumnDefault::Constant(Value::Null),
+            ColumnDefault::Constant(value) => {
+                let Expr::Literal(coerced) = coerce(Expr::Literal(value), column.data_type)? else {
+                    unreachable!("coerce maps a literal to a literal");
+                };
+                if coerced.data_type() != Some(column.data_type) {
+                    return Err(bad(&format!(
+                        "is {coerced:?}, which does not fit a {:?} column",
+                        column.data_type
+                    )));
+                }
+                ColumnDefault::Constant(coerced)
+            }
+        };
+        column.default = Some(resolved);
+    }
+    Ok(())
 }
 
 /// Lowers expressions, resolving `$n` placeholders against the bound

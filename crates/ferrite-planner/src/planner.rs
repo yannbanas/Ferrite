@@ -1,7 +1,8 @@
 //! Rule-based planner: `ferrite-sql` AST -> logical plan -> physical plan.
 
 use ferrite_common::{
-    Catalog, ColumnDef, DataType, FerriteError, IndexCatalog, IndexDef, Schema, Value,
+    Catalog, ColumnDef, ColumnDefault, DataType, FerriteError, IndexCatalog, IndexDef, Schema,
+    Value,
 };
 use ferrite_sql::ast as sql;
 
@@ -156,6 +157,17 @@ impl<'a> Planner<'a> {
                 .collect::<Result<_, _>>()?
         };
 
+        // Every column the statement does not name starts at its
+        // `DEFAULT`, which is `NULL` when there is none. Evaluated once
+        // for the whole statement, so every row of a multi-row `INSERT`
+        // gets the same `CURRENT_TIMESTAMP`, as PostgreSQL does.
+        let defaults: Vec<Expr> = source
+            .schema
+            .columns
+            .iter()
+            .map(|column| default_expr(column.default.as_ref()))
+            .collect();
+
         let mut rows = Vec::with_capacity(values.len());
         for exprs in values {
             if exprs.len() != targets.len() {
@@ -166,7 +178,8 @@ impl<'a> Planner<'a> {
                     exprs.len()
                 )));
             }
-            let mut row = vec![Expr::Literal(Value::Null); width];
+            let mut row = defaults.clone();
+            debug_assert_eq!(row.len(), width);
             for (position, expr) in targets.iter().zip(exprs) {
                 row[*position] = coerce(
                     lowerer.expr(expr)?,
@@ -435,6 +448,30 @@ impl<'a> Planner<'a> {
     }
 }
 
+/// The value a column takes when a write does not supply one.
+///
+/// `CURRENT_TIMESTAMP` is resolved here, at planning time, rather than
+/// carried into the physical plan as a node the executor evaluates per
+/// row: PostgreSQL's `now()` is fixed for the whole statement too, and
+/// folding it into a literal keeps `PhysExpr` free of a volatile variant
+/// whose value would depend on when the executor happened to reach it.
+fn default_expr(default: Option<&ColumnDefault>) -> Expr {
+    Expr::Literal(match default {
+        None => Value::Null,
+        Some(ColumnDefault::Constant(value)) => value.clone(),
+        Some(ColumnDefault::CurrentTimestamp) => Value::Timestamp(now_micros()),
+    })
+}
+
+/// Microseconds since the Unix epoch, saturating at the epoch itself for a
+/// clock set before 1970 — a `DEFAULT` must not be able to panic.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// A projection item before its output name has been decided; `None` there
 /// means "name it after the column it reads".
 struct RawItem {
@@ -514,14 +551,15 @@ fn output_column(item: &ProjectionItem, input: &Schema) -> Result<ColumnDef, Fer
                 .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))?;
             Ok(ColumnDef {
                 name: item.output_name.clone(),
+                default: None,
                 ..input.columns[position].clone()
             })
         }
-        Expr::Literal(value) => Ok(ColumnDef {
-            name: item.output_name.clone(),
-            data_type: value.data_type().unwrap_or(DataType::Text),
-            nullable: true,
-        }),
+        Expr::Literal(value) => Ok(ColumnDef::new(
+            item.output_name.clone(),
+            value.data_type().unwrap_or(DataType::Text),
+            true,
+        )),
         other => Err(FerriteError::Plan(format!(
             "computed select expressions are not supported in v1: {other:?}"
         ))),
@@ -589,21 +627,9 @@ mod tests {
         fn users() -> Self {
             let schema = Schema {
                 columns: vec![
-                    ColumnDef {
-                        name: "id".into(),
-                        data_type: DataType::Int8,
-                        nullable: false,
-                    },
-                    ColumnDef {
-                        name: "name".into(),
-                        data_type: DataType::Text,
-                        nullable: true,
-                    },
-                    ColumnDef {
-                        name: "age".into(),
-                        data_type: DataType::Int4,
-                        nullable: true,
-                    },
+                    ColumnDef::new("id", DataType::Int8, false),
+                    ColumnDef::new("name", DataType::Text, true),
+                    ColumnDef::new("age", DataType::Int4, true),
                 ],
             };
             let mut tables = HashMap::new();
@@ -829,6 +855,89 @@ mod tests {
         );
     }
 
+    /// A column an `INSERT` leaves out takes its `DEFAULT`, not `NULL` —
+    /// the case that used to write a silently wrong value into a nullable
+    /// column and a hard failure into a `NOT NULL` one.
+    #[test]
+    fn insert_fills_omitted_columns_with_their_default() {
+        let mut schema = Schema {
+            columns: vec![
+                ColumnDef::new("id", DataType::Int8, false),
+                ColumnDef::new("name", DataType::Text, true),
+                ColumnDef::new("totp_enabled", DataType::Int8, false)
+                    .with_default(ColumnDefault::Constant(Value::Int4(0))),
+                ColumnDef::new("visibility", DataType::Text, false)
+                    .with_default(ColumnDefault::Constant(Value::Text("everyone".into()))),
+                ColumnDef::new("created_at", DataType::Timestamp, false)
+                    .with_default(ColumnDefault::CurrentTimestamp),
+            ],
+        };
+        // The constant leaves `ferrite-sql` untyped; this is the step that
+        // pins it to the column's declared type.
+        crate::typecheck_defaults(&mut schema).unwrap();
+        assert_eq!(
+            schema.columns[2].default,
+            Some(ColumnDefault::Constant(Value::Int8(0))),
+            "the literal widens to the column's type at DDL time"
+        );
+
+        let mut tables = HashMap::new();
+        tables.insert("public.users".to_string(), (1, schema));
+        let catalog = TestCatalog { tables };
+        let indexes = TestIndexes::default();
+        let stmt = ferrite_sql::parse_statement("INSERT INTO users (id) VALUES (7)").unwrap();
+        let PhysicalPlan::Insert { rows, .. } =
+            Planner::new(&catalog, &indexes).plan(&stmt).unwrap()
+        else {
+            panic!("expected an Insert");
+        };
+        assert_eq!(rows[0][0], PhysExpr::Literal(Value::Int8(7)));
+        assert_eq!(rows[0][1], PhysExpr::Literal(Value::Null));
+        assert_eq!(rows[0][2], PhysExpr::Literal(Value::Int8(0)));
+        assert_eq!(
+            rows[0][3],
+            PhysExpr::Literal(Value::Text("everyone".into()))
+        );
+        assert!(
+            matches!(rows[0][4], PhysExpr::Literal(Value::Timestamp(t)) if t > 0),
+            "CURRENT_TIMESTAMP is folded to one literal for the whole statement"
+        );
+    }
+
+    #[test]
+    fn a_default_that_cannot_hold_is_refused_at_ddl_time() {
+        let checked = |column: ColumnDef| {
+            crate::typecheck_defaults(&mut Schema {
+                columns: vec![column],
+            })
+        };
+        assert!(checked(
+            ColumnDef::new("a", DataType::Int8, false)
+                .with_default(ColumnDefault::Constant(Value::Null))
+        )
+        .is_err());
+        assert!(checked(
+            ColumnDef::new("a", DataType::Int8, true)
+                .with_default(ColumnDefault::Constant(Value::Text("x".into())))
+        )
+        .is_err());
+        assert!(checked(
+            ColumnDef::new("a", DataType::Text, true).with_default(ColumnDefault::CurrentTimestamp)
+        )
+        .is_err());
+        assert!(checked(
+            ColumnDef::new("a", DataType::Int8, true)
+                .with_default(ColumnDefault::Constant(Value::Null))
+        )
+        .is_ok());
+        assert!(checked(
+            ColumnDef::new("a", DataType::Timestamp, false).with_default(ColumnDefault::Constant(
+                Value::Text("2026-08-10T12:00:00Z".into())
+            ))
+        )
+        .is_ok());
+    }
+
     #[test]
     fn an_unknown_table_is_a_planning_error() {
         assert!(matches!(
@@ -927,16 +1036,8 @@ mod tests {
             fn table_schema(&self, _table: TableId) -> Result<Schema, FerriteError> {
                 Ok(Schema {
                     columns: vec![
-                        ColumnDef {
-                            name: "id".into(),
-                            data_type: DataType::Uuid,
-                            nullable: false,
-                        },
-                        ColumnDef {
-                            name: "at".into(),
-                            data_type: DataType::Timestamp,
-                            nullable: false,
-                        },
+                        ColumnDef::new("id", DataType::Uuid, false),
+                        ColumnDef::new("at", DataType::Timestamp, false),
                     ],
                 })
             }
