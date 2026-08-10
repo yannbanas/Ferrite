@@ -4,7 +4,8 @@
 use ferrite_common::{ColumnDef, DataType, FerriteError, Schema, TableId, Value};
 
 use crate::expr::{AggregateFunc, BinaryOp, Expr};
-use crate::logical::JoinType;
+use crate::logical::{JoinType, LogicalPlan};
+use crate::scalar::ScalarFunc;
 use crate::scope::Scope;
 
 /// Expression with every column reference resolved to its position in the
@@ -23,6 +24,30 @@ pub enum PhysExpr {
     Like {
         expr: Box<PhysExpr>,
         pattern: Box<PhysExpr>,
+        negated: bool,
+        case_insensitive: bool,
+    },
+    Case {
+        operand: Option<Box<PhysExpr>>,
+        branches: Vec<(PhysExpr, PhysExpr)>,
+        else_result: Option<Box<PhysExpr>>,
+    },
+    Cast {
+        expr: Box<PhysExpr>,
+        data_type: DataType,
+    },
+    Function {
+        func: ScalarFunc,
+        args: Vec<PhysExpr>,
+    },
+    /// `expr IN (SELECT …)`, still holding its subplan. The executor runs
+    /// the subplan once and rewrites this node into the equivalent value
+    /// test before evaluating any row — see
+    /// `ferrite_exec::Session::execute`. Reaching [`crate::PhysExpr`]
+    /// evaluation with this variant still in place is a bug, and says so.
+    InSubquery {
+        expr: Box<PhysExpr>,
+        subquery: Box<PhysicalPlan>,
         negated: bool,
     },
 }
@@ -45,6 +70,24 @@ pub struct PhysAggregate {
     pub distinct: bool,
 }
 
+/// [`crate::logical::OnConflict`] with its expressions bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysOnConflict {
+    pub target: Vec<usize>,
+    pub action: PhysConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhysConflictAction {
+    Nothing,
+    /// Bound against the existing row followed by the excluded row, so a
+    /// position past the table's width reads the excluded half.
+    Update {
+        assignments: Vec<(usize, PhysExpr)>,
+        selection: Option<PhysExpr>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysSortKey {
     pub expr: PhysExpr,
@@ -62,6 +105,25 @@ pub struct PhysSortKey {
 /// a `BIGINT` column has to carry an `Int8`, not the `Int4` the literal
 /// parsed as — otherwise the probe silently matches nothing.
 pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
+    bind_with(expr, scope, &|_| {
+        Err(FerriteError::Plan(
+            "a subquery is not allowed here".to_string(),
+        ))
+    })
+}
+
+/// How a subquery's logical plan becomes a physical one. Only the planner
+/// can do it — choosing an access path needs the index catalog — so it is
+/// handed in rather than reached for.
+pub type SubPlanLowerer<'a> = &'a dyn Fn(&LogicalPlan) -> Result<PhysicalPlan, FerriteError>;
+
+/// [`bind`], plus the ability to lower a subquery's plan.
+pub fn bind_with(
+    expr: &Expr,
+    scope: &Scope,
+    lower: SubPlanLowerer,
+) -> Result<PhysExpr, FerriteError> {
+    let bind = |expr: &Expr, scope: &Scope| bind_with(expr, scope, lower);
     Ok(match expr {
         Expr::Column(reference) => PhysExpr::Column(scope.resolve(reference)?),
         Expr::Slot(position) => {
@@ -70,7 +132,7 @@ pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
         }
         Expr::Literal(v) => PhysExpr::Literal(v.clone()),
         Expr::Binary { left, op, right } if op.is_comparison() => {
-            let (left, right) = align_comparison(left, right, scope)?;
+            let (left, right) = align_comparison(left, right, scope, lower)?;
             PhysExpr::binary(left, *op, right)
         }
         Expr::Binary { left, op, right } => {
@@ -82,11 +144,63 @@ pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => PhysExpr::Like {
             expr: Box::new(bind(expr, scope)?),
             pattern: Box::new(bind(pattern, scope)?),
             negated: *negated,
+            case_insensitive: *case_insensitive,
         },
+        Expr::Case {
+            operand,
+            branches,
+            else_result,
+        } => PhysExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| bind(o, scope).map(Box::new))
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|(when, then)| Ok((bind(when, scope)?, bind(then, scope)?)))
+                .collect::<Result<_, FerriteError>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|e| bind(e, scope).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Cast { expr, data_type } => PhysExpr::Cast {
+            expr: Box::new(bind(expr, scope)?),
+            data_type: *data_type,
+        },
+        Expr::Function { func, args } => {
+            let args = args
+                .iter()
+                .map(|arg| bind(arg, scope))
+                .collect::<Result<Vec<_>, FerriteError>>()?;
+            PhysExpr::Function { func: *func, args }
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let subquery = lower(subquery)?;
+            // `x IN (SELECT ...)` compares one value against one column;
+            // a wider subquery is a row constructor, which v1 has no
+            // comparison for.
+            let width = subquery.output_schema().map_or(0, |s| s.columns.len());
+            if width != 1 {
+                return Err(FerriteError::Plan(format!(
+                    "the subquery of IN must select exactly one column, not {width}"
+                )));
+            }
+            PhysExpr::InSubquery {
+                expr: Box::new(bind(expr, scope)?),
+                subquery: Box::new(subquery),
+                negated: *negated,
+            }
+        }
     })
 }
 
@@ -94,7 +208,9 @@ fn align_comparison(
     left: &Expr,
     right: &Expr,
     scope: &Scope,
+    lower: SubPlanLowerer,
 ) -> Result<(PhysExpr, PhysExpr), FerriteError> {
+    let bind = |expr: &Expr, scope: &Scope| bind_with(expr, scope, lower);
     let target = match (left, right) {
         (Expr::Column(_), Expr::Literal(_)) => Some(infer(left, scope)?.0),
         (Expr::Literal(_), Expr::Column(_)) => Some(infer(right, scope)?.0),
@@ -139,7 +255,51 @@ pub fn infer(expr: &Expr, scope: &Scope) -> Result<(DataType, bool), FerriteErro
         // An untyped `NULL` has to be given some type for the wire; `Text`
         // is what PostgreSQL falls back to as well.
         Expr::Literal(value) => (value.data_type().unwrap_or(DataType::Text), value.is_null()),
-        Expr::Not(_) | Expr::IsNull(_) | Expr::Like { .. } => (DataType::Boolean, true),
+        Expr::Not(_) | Expr::IsNull(_) | Expr::Like { .. } | Expr::InSubquery { .. } => {
+            (DataType::Boolean, true)
+        }
+        Expr::Cast { data_type, .. } => (*data_type, true),
+        // `coalesce` and `nocase` take the type of their first argument;
+        // for the rest the argument's type is irrelevant, so inferring it
+        // is only ever a way to reject an unresolvable column reference.
+        Expr::Function { func, args } => {
+            let inferred = args
+                .iter()
+                .map(|arg| infer(arg, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first = inferred.first().map_or(DataType::Text, |(t, _)| *t);
+            // `coalesce` is null only when every argument is; every other
+            // function propagates a null argument to its result.
+            let nullable = match func.is_null_preserving() {
+                true => inferred.iter().any(|(_, n)| *n),
+                false => inferred.iter().all(|(_, n)| *n),
+            };
+            (func.result_type(first), nullable)
+        }
+        // The branch results decide the type; a `CASE` with no `ELSE`
+        // yields null when nothing matches, so it is always nullable.
+        Expr::Case {
+            branches,
+            else_result,
+            ..
+        } => {
+            let data_type = match branches.first() {
+                Some((_, then)) => infer(then, scope)?.0,
+                None => DataType::Text,
+            };
+            let exhaustive = else_result
+                .as_ref()
+                .map(|e| infer(e, scope).map(|(_, n)| !n))
+                .transpose()?
+                .unwrap_or(false);
+            let any_branch_nullable = branches
+                .iter()
+                .map(|(_, then)| infer(then, scope).map(|(_, n)| n))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|n| n);
+            (data_type, !exhaustive || any_branch_nullable)
+        }
         Expr::Binary { left, op, right } if op.is_arithmetic() => {
             let (left, left_null) = infer(left, scope)?;
             let (right, right_null) = infer(right, scope)?;
@@ -289,6 +449,7 @@ pub enum PhysicalPlan {
         schema: Schema,
         /// One `PhysExpr` per table column, in schema order.
         rows: Vec<Vec<PhysExpr>>,
+        on_conflict: Option<PhysOnConflict>,
     },
     Update {
         table: TableId,

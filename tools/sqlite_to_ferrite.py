@@ -17,7 +17,10 @@ everything that had to be dropped; `crates/ferrite-server/tests/replay.rs`
 replays the result and reports what got in and what answered.
 
 Note when migrating off SQLite: `LIKE` is case-insensitive there and
-case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ.
+case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ — on this
+database, `name LIKE '%a%'` finds 144 rows in SQLite and 136 in Ferrite, and
+`ILIKE` is what reproduces the 144. `docs/pawchat-sql-audit.md` lists the
+three call sites that have to be rewritten.
 
 Type mapping, and why:
 
@@ -36,9 +39,12 @@ Type mapping, and why:
   dropped, unless it is empty in this database, in which case it becomes
   `TEXT`.
 
-Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `UNIQUE`,
-`COLLATE`, `AUTOINCREMENT` and `CHECK`. `PRIMARY KEY`, `NOT NULL` and
-`DEFAULT` are kept. Every identifier is quoted: Ferrite reserves nearly every
+Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `AUTOINCREMENT`
+and `CHECK`. `PRIMARY KEY`, `NOT NULL` and `DEFAULT` are kept. A table-level
+`UNIQUE (a, b)` is re-emitted as a `CREATE UNIQUE INDEX` in `_after.sql`,
+because that is what an `INSERT OR IGNORE` with no explicit target conflicts
+on — note that Ferrite records such a key but does not yet enforce it, so a
+duplicate write still succeeds (see the audit document). Every identifier is quoted: Ferrite reserves nearly every
 keyword, and application schemas are full of columns called `type`,
 `position` and `content`.
 
@@ -48,7 +54,10 @@ a `DEFAULT` it cannot evaluate rather than accepting one it would ignore.
 SQLite's `datetime('now')` and `CURRENT_TIMESTAMP` both map to
 `CURRENT_TIMESTAMP`.
 
-`_after.sql` holds what only makes sense once every table exists, and is
+`_after.sql` also carries one statement per SQL construct the audit found
+PawChat emitting (`ILIKE`, `COLLATE NOCASE`, `datetime`/`date`, `CASE`,
+`CAST`, `coalesce`, `IN (SELECT ...)`, the upsert idioms), plus a dozen
+queries copied verbatim from the PawChat sources. It is
 where the two features an application actually depends on get exercised
 against real data: one `ALTER TABLE ... ADD COLUMN` of each shape per table
 (nullable, and `NOT NULL DEFAULT`, which is what PawChat's migrations look
@@ -201,6 +210,29 @@ def index_ddl(cur, notes):
             f'ON {quote(table)} ({", ".join(quote(c) for c in columns)})'
         )
 
+    # A table-level `UNIQUE (a, b)` has no `CREATE INDEX` of its own in
+    # sqlite_master — it is an implicit index. Ferrite needs it recorded,
+    # because that is what an `INSERT OR IGNORE` with no explicit target
+    # conflicts on; without it the insert has no target and is refused.
+    for note in notes:
+        table = note["table"]
+        for row in cur.execute(f'PRAGMA index_list("{table}")').fetchall():
+            name = row[1].decode() if isinstance(row[1], bytes) else row[1]
+            unique = bool(row[2])
+            origin = row[3].decode() if isinstance(row[3], bytes) else row[3]
+            if not unique or origin != "u":
+                continue
+            columns = [
+                (c[2].decode() if isinstance(c[2], bytes) else c[2])
+                for c in cur.execute(f'PRAGMA index_info("{name}")').fetchall()
+            ]
+            if not columns or any(c not in note["types"] for c in columns):
+                continue
+            out.append(
+                f'CREATE UNIQUE INDEX {quote("u_" + table + "_" + "_".join(columns))} '
+                f'ON {quote(table)} ({", ".join(quote(c) for c in columns)})'
+            )
+
     return out
 
 
@@ -292,6 +324,268 @@ def query_shapes(notes):
             )
             joins += 1
 
+    return out
+
+
+def dialect_shapes(notes):
+    """One query per SQL construct the audit found PawChat emitting, built
+    from this schema rather than hand-written.
+
+    `docs/pawchat-sql-audit.md` counts what the application actually runs;
+    this turns that list into statements the replay can execute, so the
+    report says which constructs a real schema supports rather than which
+    ones parse in isolation.
+    """
+    by_name = {n["table"]: n for n in notes}
+    out = []
+
+    def columns_of(note, *types):
+        return [c for c, ty in note["types"].items() if ty in types]
+
+    populated = sorted(
+        (n for n in notes if n["rows"] - n["skipped_rows"] > 0),
+        key=lambda n: -(n["rows"] - n["skipped_rows"]),
+    )
+    if not populated:
+        return out
+
+    text_table = next((n for n in populated if columns_of(n, "TEXT")), None)
+    stamp_table = next((n for n in populated if columns_of(n, "TIMESTAMP")), None)
+    int_table = next((n for n in populated if columns_of(n, "BIGINT")), None)
+
+    if text_table:
+        t, c = quote(text_table["table"]), quote(columns_of(text_table, "TEXT")[0])
+        # ILIKE is the migration target for every LIKE PawChat relies on:
+        # SQLite folds case there by default and Ferrite does not.
+        out.append(f"SELECT count(*) FROM {t} WHERE {c} ILIKE '%A%'")
+        out.append(f"SELECT count(*) FROM {t} WHERE {c} NOT ILIKE '%A%'")
+        # COLLATE NOCASE, in the two places PawChat writes it.
+        out.append(f"SELECT count(*) FROM {t} WHERE {c} = 'A' COLLATE NOCASE")
+        out.append(f"SELECT {c} FROM {t} ORDER BY {c} COLLATE NOCASE ASC LIMIT 20")
+        out.append(f"SELECT lower({c}), upper({c}), substr({c}, 1, 3) FROM {t} LIMIT 20")
+        out.append(f"SELECT coalesce({c}, 'none') FROM {t} LIMIT 20")
+        out.append(f"SELECT {c} || '!' FROM {t} LIMIT 20")
+        out.append(f"SELECT lower(hex(randomblob(4))) FROM {t} LIMIT 1")
+        out.append(
+            f"SELECT CASE WHEN {c} IS NULL THEN 'empty' ELSE 'set' END FROM {t} LIMIT 20"
+        )
+        out.append(f"SELECT CAST({c} AS TEXT) FROM {t} LIMIT 20")
+
+    if stamp_table:
+        t = quote(stamp_table["table"])
+        c = quote(columns_of(stamp_table, "TIMESTAMP")[0])
+        out.append(f"SELECT count(*) FROM {t} WHERE {c} >= datetime('now', '-30 days')")
+        out.append(f"SELECT count(*) FROM {t} WHERE {c} >= datetime('now', '-1 hour')")
+        out.append(
+            f"SELECT date({c}) AS day, count(*) FROM {t} GROUP BY day ORDER BY day ASC"
+        )
+        out.append(f"SELECT datetime({c}) FROM {t} LIMIT 20")
+
+    if int_table:
+        t = quote(int_table["table"])
+        c = quote(columns_of(int_table, "BIGINT")[0])
+        out.append(f"SELECT CAST({c} AS TEXT) FROM {t} LIMIT 20")
+        out.append(
+            f"SELECT coalesce(sum(CASE WHEN {c} > 0 THEN {c} END), 0), "
+            f"count(DISTINCT {c}) FROM {t}"
+        )
+
+    # An uncorrelated `IN (SELECT ...)` between two tables that share a
+    # column type, which is the shape of every one PawChat runs.
+    for note in populated:
+        done = False
+        for column in note["types"]:
+            if not column.endswith("_id"):
+                continue
+            stem = column[:-3]
+            target = next(
+                (
+                    by_name[c]
+                    for c in (stem, stem + "s", stem + "es")
+                    if c in by_name
+                    and by_name[c]["pk"]
+                    and by_name[c]["types"].get(by_name[c]["pk"])
+                    == note["types"][column]
+                ),
+                None,
+            )
+            if target is None or target["table"] == note["table"]:
+                continue
+            outer = quote(target["table"])
+            key = quote(target["pk"])
+            inner = quote(note["table"])
+            out.append(
+                f"SELECT count(*) FROM {outer} WHERE {key} IN "
+                f"(SELECT {quote(column)} FROM {inner})"
+            )
+            out.append(
+                f"SELECT count(*) FROM {outer} WHERE {key} NOT IN "
+                f"(SELECT {quote(column)} FROM {inner})"
+            )
+            done = True
+            break
+        if done:
+            break
+
+    return out
+
+
+def upsert_shapes(cur, notes):
+    """`INSERT OR IGNORE` / `INSERT OR REPLACE` / `ON CONFLICT DO UPDATE`
+    against a table that really has a unique key, re-inserting a row that is
+    already there.
+
+    Running these after the rows are loaded is the whole point: the conflict
+    has to be real for `DO NOTHING` and `DO UPDATE` to be told apart, and for
+    the row count afterwards to mean anything.
+    """
+    out = []
+    tried = 0
+    for note in notes:
+        if not note["pk"] or note["rows"] - note["skipped_rows"] == 0 or tried >= 3:
+            continue
+        table = note["table"]
+        rows = cur.execute('SELECT * FROM "%s" LIMIT 1' % table).fetchall()
+        if not rows:
+            continue
+        info = cur.execute('PRAGMA table_info("%s")' % table).fetchall()
+        names = [c[1].decode() if isinstance(c[1], bytes) else c[1] for c in info]
+        pairs = []
+        for name, value in zip(names, rows[0]):
+            if name not in note["types"]:
+                continue
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-8")
+                except UnicodeDecodeError:
+                    pairs = []
+                    break
+            lit = literal(value)
+            if lit is None:
+                pairs = []
+                break
+            pairs.append((name, lit))
+        if not pairs:
+            continue
+        cols = ", ".join(quote(n) for n, _ in pairs)
+        vals = ", ".join(v for _, v in pairs)
+        pk = quote(note["pk"])
+        other = next((n for n, _ in pairs if n != note["pk"]), None)
+        out.append("SELECT count(*) FROM %s" % quote(table))
+        out.append(
+            "INSERT OR IGNORE INTO %s (%s) VALUES (%s)" % (quote(table), cols, vals)
+        )
+        out.append(
+            "INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (quote(table), cols, vals)
+        )
+        if other:
+            out.append(
+                "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET %s = excluded.%s"
+                % (quote(table), cols, vals, pk, quote(other), quote(other))
+            )
+            out.append(
+                "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO NOTHING"
+                % (quote(table), cols, vals, pk)
+            )
+        # The count must be unchanged: every statement above collided.
+        out.append("SELECT count(*) FROM %s" % quote(table))
+        tried += 1
+    return out
+
+
+def real_queries(notes):
+    """Queries copied from the PawChat sources, translated rather than
+    paraphrased: identifiers quoted, `?` replaced by a constant, and the
+    three `LIKE`s the audit flagged rewritten as `ILIKE`.
+
+    A shape derived from the schema proves a construct parses. These prove
+    the statements the application really sends do. Each carries the file
+    and line it came from.
+    """
+    have = {n["table"]: n for n in notes}
+    out = []
+
+    def add(needs, sql):
+        if all(t in have for t in needs):
+            out.append(sql)
+
+    # src/app/api/admin/users/route.ts:18 - LIKE -> ILIKE, see the audit.
+    add(
+        ["users"],
+        'SELECT "id", "username", "display_name" FROM "users" '
+        "WHERE \"id\" != 'bot-0' AND (\"username\" ILIKE '%a%' "
+        "OR \"display_name\" ILIKE '%a%') LIMIT 50",
+    )
+    # src/lib/userStore.ts:30
+    add(
+        ["users"],
+        'SELECT "id" FROM "users" WHERE "username" = \'Demo\' COLLATE NOCASE',
+    )
+    # src/app/api/admin/analytics/route.ts:11
+    add(
+        ["users"],
+        'SELECT date("created_at") AS day, COUNT(*) AS n FROM "users" '
+        "WHERE \"created_at\" >= datetime('now', '-30 days') "
+        "GROUP BY day ORDER BY day ASC",
+    )
+    # src/app/api/channels/[channelId]/messages/route.ts:123
+    add(
+        ["users", "memberships"],
+        'SELECT "id" FROM "users" WHERE "is_bot" = 1 AND "id" IN '
+        '(SELECT "user_id" FROM "memberships" WHERE "server_id" = 1)',
+    )
+    # src/lib/channelStore.ts:233
+    add(
+        ["servers", "memberships"],
+        'SELECT "id" FROM "servers" WHERE "is_public" = 1 AND "id" NOT IN '
+        '(SELECT "server_id" FROM "memberships" WHERE "user_id" = \'demo\') '
+        'ORDER BY "id" DESC',
+    )
+    # src/app/api/servers/route.ts:86
+    add(
+        ["memberships"],
+        'INSERT OR IGNORE INTO "memberships" ("server_id", "user_id") '
+        "VALUES (1, 'demo')",
+    )
+    # src/app/api/admin/config/route.ts:34
+    add(
+        ["platform_config"],
+        'INSERT INTO "platform_config" ("key", "value", "updated_at") '
+        "VALUES ('ferrite_probe', 'on', datetime('now')) "
+        'ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value", '
+        '"updated_at" = excluded."updated_at"',
+    )
+    # src/app/api/admin/store/route.ts:18
+    add(
+        ["store_items"],
+        'SELECT COUNT(DISTINCT "id") AS total_items, '
+        "COUNT(DISTINCT CASE WHEN \"status\" = 'live' THEN \"id\" END) AS live_items "
+        'FROM "store_items"',
+    )
+    # src/app/api/admin/support-tickets/route.ts:47
+    add(
+        ["support_tickets"],
+        'UPDATE "support_tickets" SET "status" = \'resolved\', '
+        "\"updated_at\" = datetime('now'), "
+        "\"closed_at\" = CASE WHEN 'resolved' IN ('resolved','closed') "
+        "THEN datetime('now') ELSE \"closed_at\" END WHERE \"id\" = -1",
+    )
+    # src/app/api/servers/[serverId]/invite/regenerate/route.ts:18
+    out.append("SELECT lower(hex(randomblob(4))) AS code")
+    # src/lib/botFlows.ts:84
+    add(
+        ["bot_flows"],
+        'SELECT DISTINCT "group_name" FROM "bot_flows" '
+        'WHERE "group_name" IS NOT NULL ORDER BY "group_name" COLLATE NOCASE ASC',
+    )
+    # src/app/api/admin/protection/route.ts:33
+    add(
+        ["users", "channel_messages"],
+        'SELECT "users"."id", MAX("channel_messages"."created_at") AS last_msg '
+        'FROM "users" JOIN "channel_messages" '
+        'ON "channel_messages"."user_id" = "users"."id" '
+        'GROUP BY "users"."id" HAVING count(*) > 1',
+    )
     return out
 
 
@@ -450,8 +744,14 @@ def main():
             }
         )
 
-    reads = query_shapes(notes)
-    after = index_ddl(cur, notes) + reads + migrations(notes) + reads
+    reads = query_shapes(notes) + dialect_shapes(notes) + real_queries(notes)
+    after = (
+        index_ddl(cur, notes)
+        + reads
+        + upsert_shapes(cur, notes)
+        + migrations(notes)
+        + reads
+    )
     with open(os.path.join(OUT, "_after.sql"), "w", encoding="utf-8") as f:
         f.write(("\n" + SENTINEL + "\n").join(after))
 

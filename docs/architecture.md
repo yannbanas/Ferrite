@@ -118,7 +118,13 @@ ce test fait ressortir :
    travers des jointures.
 4. ~~**Agrégats (`count`/`sum`/…) et `ORDER BY`**~~ — *faits*, avec
    `GROUP BY`/`HAVING`, `DISTINCT` et `LIKE`.
-5. **Sous-requêtes, `CASE`, `CAST`, index partiels** — ensuite.
+5. ~~**`CASE`, `CAST`, fonctions scalaires, `ILIKE`, `COLLATE NOCASE`,
+   idiomes d'upsert, `IN (SELECT ...)` non corrélé**~~ — *faits*, sur la
+   base d'un audit de tout le SQL réellement émis par PawChat
+   (1287 littéraux, 181 fichiers) : voir `docs/pawchat-sql-audit.md`.
+6. **Sous-requête scalaire corrélée, `EXISTS`, `UNION`, `SELECT` sans
+   `FROM`, index partiels** — ensuite. Ce sont les 13 derniers littéraux
+   PawChat que Ferrite refuse, chacun en le nommant.
 
 Les contraintes que la traduction doit encore jeter faute d'équivalent :
 4 `FOREIGN KEY`, 13 `UNIQUE`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun `CHECK`,
@@ -231,9 +237,17 @@ d'origine.
 Une différence de sémantique à connaître avant de migrer : `LIKE` est
 **sensible à la casse** dans Ferrite, comme dans PostgreSQL, alors qu'il est
 insensible dans SQLite. Sur la même donnée, `WHERE name LIKE '%a%'` rend 136
-lignes ici et 144 dans SQLite — l'écart est exactement ce que SQLite rend
-avec `GLOB '*a*'`. Toute recherche `LIKE` de PawChat changera de résultat ;
-il n'y a pas encore de `ILIKE`.
+lignes ici et 144 dans SQLite. `ILIKE` existe désormais et rend bien 144 :
+c'est la cible de réécriture des trois recherches `LIKE` de PawChat, listées
+dans `docs/pawchat-sql-audit.md`. `LIKE` n'a **pas** été rendu insensible,
+la casse étant le bon comportement partout ailleurs.
+
+Le risque le plus sérieux avant une mise en production n'est pas dialectal :
+`ferrite-storage` n'ayant pas encore d'index secondaire, **aucune contrainte
+`PRIMARY KEY` ou `UNIQUE` n'est appliquée**. Le catalogue les enregistre —
+c'est ce qui donne sa cible à `INSERT OR IGNORE` — mais une écriture qui les
+viole passe. Le replay le montre : réinsérer la ligne `users` de PawChat
+crée un doublon que SQLite refuserait deux fois.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 

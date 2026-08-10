@@ -548,3 +548,432 @@ fn a_plan_built_against_an_older_schema_is_rejected() {
     let result = Session::new(&storage, &catalog, &procs, OWNER).execute(1, &plan);
     assert!(matches!(result, Err(FerriteError::Plan(_))));
 }
+
+#[test]
+fn insert_or_ignore_leaves_the_existing_row_alone() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let again = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR IGNORE INTO users VALUES (1, 'imposter', 99)",
+    )
+    .unwrap();
+    assert_eq!(again, QueryResult::Affected(0));
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].values[1], Value::Text("ada".into()));
+}
+
+#[test]
+fn insert_or_ignore_still_inserts_a_row_that_does_not_collide() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let fresh = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR IGNORE INTO users VALUES (3, 'alan', 41)",
+    )
+    .unwrap();
+    assert_eq!(fresh, QueryResult::Affected(1));
+    assert_eq!(storage.dump(table).len(), 3);
+}
+
+#[test]
+fn on_conflict_do_update_reads_the_excluded_row() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let upsert = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'ada lovelace', 37) \
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = excluded.age",
+    )
+    .unwrap();
+    assert_eq!(upsert, QueryResult::Affected(1));
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].values[1], Value::Text("ada lovelace".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(37));
+}
+
+#[test]
+fn do_update_keeps_the_columns_the_statement_does_not_assign() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'ada k', 99) ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+    )
+    .unwrap();
+
+    let stored = storage.dump(table);
+    assert_eq!(stored[0].values[1], Value::Text("ada k".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(36), "age was not assigned");
+}
+
+#[test]
+fn insert_or_replace_writes_every_named_column() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT OR REPLACE INTO users (id, name, age) VALUES (1, 'ada b', 38)",
+    )
+    .unwrap();
+
+    let stored = storage.dump(table);
+    assert_eq!(stored.len(), 2, "replaced in place, not duplicated");
+    assert_eq!(stored[0].values[1], Value::Text("ada b".into()));
+    assert_eq!(stored[0].values[2], Value::Int4(38));
+}
+
+#[test]
+fn do_update_where_can_decline_the_update() {
+    let (storage, catalog, table) = setup();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let declined = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO users VALUES (1, 'nope', 1) \
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE excluded.age > users.age",
+    )
+    .unwrap();
+    assert_eq!(declined, QueryResult::Affected(0));
+    assert_eq!(storage.dump(table)[0].values[1], Value::Text("ada".into()));
+}
+
+#[test]
+fn an_upsert_needs_update_permission_as_well_as_insert() {
+    let (storage, catalog, _) = setup();
+    let mut procs = full_access();
+    procs.grant_role(
+        GUEST,
+        Role {
+            name: "writer".into(),
+            permissions: vec![Permission::Select, Permission::Insert],
+        },
+    );
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let denied = run(
+        &storage,
+        &catalog,
+        &procs,
+        GUEST,
+        "INSERT INTO users VALUES (1, 'x', 1) ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+    );
+    assert!(matches!(denied, Err(FerriteError::PermissionDenied(_))));
+}
+
+#[test]
+fn on_conflict_without_a_target_needs_a_unique_key_to_be_known() {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table("public", "users", users_schema())
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+
+    let error = plan_of(&catalog, "INSERT OR IGNORE INTO users VALUES (1, 'a', 2)").unwrap_err();
+    assert!(error.to_string().contains("no unique key"), "{error}");
+}
+
+/// A second table, so a subquery has somewhere to read from.
+fn setup_with_posts() -> (MemStorage, MemCatalog, TableId) {
+    let (storage, catalog, users) = setup();
+    let posts = catalog
+        .create_table(
+            "public",
+            "posts",
+            Schema {
+                columns: vec![
+                    column("id", DataType::Int8, false),
+                    column("author", DataType::Int8, true),
+                ],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, posts).unwrap();
+    (storage, catalog, users)
+}
+
+#[test]
+fn in_a_subquery_keeps_only_the_rows_the_subquery_names() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 2)",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Text("grace".into()));
+}
+
+#[test]
+fn not_in_a_subquery_is_the_complement() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 2)",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id NOT IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Text("ada".into()));
+}
+
+#[test]
+fn an_empty_subquery_makes_in_match_nothing_and_not_in_match_everything() {
+    let (storage, catalog, _) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+
+    let empty = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert!(empty.is_empty());
+
+    let all = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT name FROM users WHERE id NOT IN (SELECT author FROM posts)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn delete_where_in_a_subquery_removes_exactly_those_rows() {
+    let (storage, catalog, users) = setup_with_posts();
+    let procs = full_access();
+    run(&storage, &catalog, &procs, OWNER, TWO_PEOPLE).unwrap();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO posts VALUES (10, 1)",
+    )
+    .unwrap();
+
+    let deleted = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "DELETE FROM users WHERE id IN (SELECT author FROM posts)",
+    )
+    .unwrap();
+    assert_eq!(deleted, QueryResult::Affected(1));
+    assert_eq!(storage.dump(users).len(), 1);
+}
+
+#[test]
+fn a_subquery_selecting_more_than_one_column_is_refused() {
+    let (_, catalog, _) = setup_with_posts();
+    let error = plan_of(
+        &catalog,
+        "SELECT name FROM users WHERE id IN (SELECT id, author FROM posts)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("exactly one column"), "{error}");
+}
+
+#[test]
+fn a_scalar_subquery_and_exists_are_still_refused_by_name() {
+    let (_, catalog, _) = setup_with_posts();
+    for (sql, wanted) in [
+        (
+            "SELECT (SELECT id FROM posts) FROM users",
+            "a scalar subquery",
+        ),
+        (
+            "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM posts)",
+            "EXISTS",
+        ),
+    ] {
+        let error = plan_of(&catalog, sql).unwrap_err();
+        assert!(error.to_string().contains(wanted), "{sql}: {error}");
+    }
+}
+
+/// A table whose timestamp column is a real `TIMESTAMP`, which is what the
+/// SQLite translator produces for a text column holding ISO dates.
+fn setup_events() -> (MemStorage, MemCatalog, TableId) {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table(
+            "public",
+            "events",
+            Schema {
+                columns: vec![
+                    column("id", DataType::Int8, false),
+                    column("at", DataType::Timestamp, true),
+                ],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+    (storage, catalog, table)
+}
+
+#[test]
+fn datetime_now_compares_against_a_timestamp_column() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2000-01-01 00:00:00'), (2, '2999-01-01 00:00:00')",
+    )
+    .unwrap();
+
+    // The regression: `datetime()` renders SQLite's text shape, so folding
+    // it late left a Text on one side of a Timestamp comparison and the
+    // whole query was refused.
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT id FROM events WHERE at >= datetime('now', '-30 days')",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Int8(2));
+}
+
+#[test]
+fn group_by_can_name_a_select_list_alias() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2026-08-10 01:00:00'), \
+         (2, '2026-08-10 20:00:00'), (3, '2026-08-11 05:00:00')",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT date(at) AS day, count(*) AS n FROM events \
+             GROUP BY day ORDER BY day ASC",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Text("2026-08-10".into()));
+    assert_eq!(rows[0].values[1], Value::Int8(2));
+    assert_eq!(rows[1].values[1], Value::Int8(1));
+}
+
+#[test]
+fn a_real_input_column_wins_over_a_select_list_alias_of_the_same_name() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2026-08-10 01:00:00'), (2, '2026-08-10 20:00:00')",
+    )
+    .unwrap();
+
+    // `id` names both a column and the alias of `date(at)`. PostgreSQL
+    // resolves a `GROUP BY` name to the input column, and choosing it
+    // leaves `at` ungrouped — so this error is the proof that the alias did
+    // not win. Had the alias won, the query would have succeeded.
+    let error = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "SELECT date(at) AS id, count(*) FROM events GROUP BY id",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("at must appear"), "{error}");
+}

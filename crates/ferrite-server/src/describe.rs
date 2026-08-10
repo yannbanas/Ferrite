@@ -280,6 +280,7 @@ fn walk_expr(expr: &sql::Expr, visit: &mut impl FnMut(&sql::Expr)) {
         sql::Expr::Literal(_) | sql::Expr::Column(_) | sql::Expr::Parameter(_) => {}
         sql::Expr::UnaryOp { expr, .. }
         | sql::Expr::IsNull { expr, .. }
+        | sql::Expr::Collate { expr, .. }
         | sql::Expr::Cast { expr, .. } => walk_expr(expr, visit),
         sql::Expr::BinaryOp { left, right, .. } => {
             walk_expr(left, visit);

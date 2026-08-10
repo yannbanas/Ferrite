@@ -683,6 +683,12 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         "SELECT b FROM t LIMIT 1 OFFSET 0",
         "SELECT * FROM t JOIN u ON u.a = t.a",
         "SELECT * FROM t WHERE b LIKE 'x%'",
+        "SELECT * FROM t WHERE b ILIKE 'X%'",
+        "SELECT * FROM t WHERE b = 'X' COLLATE NOCASE",
+        "SELECT CAST(a AS TEXT) FROM t",
+        "SELECT CASE WHEN a > 1 THEN 'big' ELSE 'small' END FROM t",
+        "SELECT coalesce(b, 'none') FROM t",
+        "SELECT datetime('now') FROM t",
     ] {
         client
             .query(sql, &[])
@@ -697,7 +703,7 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         // self-join leaves `t.a` naming two columns.
         "SELECT * FROM t JOIN t t2 ON t2.a = t.a",
         "SELECT (SELECT a FROM t) FROM t",
-        "SELECT CAST(a AS TEXT) FROM t",
+        "SELECT strftime('%Y', b) FROM t",
         "ALTER TABLE t DROP COLUMN b",
         "ALTER TABLE t RENAME TO u",
         "SELECT * FROM nope",

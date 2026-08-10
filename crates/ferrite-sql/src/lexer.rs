@@ -28,12 +28,15 @@ pub enum Keyword {
     Cast,
     Column,
     Commit,
+    Conflict,
     Create,
+    Collate,
     Cross,
     Default,
     Delete,
     Desc,
     Distinct,
+    Do,
     Double,
     Drop,
     Each,
@@ -53,6 +56,7 @@ pub enum Keyword {
     Group,
     Having,
     If,
+    Ilike,
     In,
     Index,
     Inner,
@@ -73,6 +77,7 @@ pub enum Keyword {
     Like,
     Limit,
     Not,
+    Nothing,
     Null,
     Nulls,
     Offset,
@@ -129,6 +134,8 @@ impl Keyword {
                 | Keyword::Boolean
                 | Keyword::Cascade
                 | Keyword::Column
+                | Keyword::Conflict
+                | Keyword::Do
                 | Keyword::Double
                 | Keyword::Each
                 | Keyword::First
@@ -144,6 +151,7 @@ impl Keyword {
                 | Keyword::Key
                 | Keyword::Last
                 | Keyword::Nulls
+                | Keyword::Nothing
                 | Keyword::Precision
                 | Keyword::Procedure
                 | Keyword::Replace
@@ -183,14 +191,17 @@ impl Keyword {
             Keyword::Cascade => "cascade",
             Keyword::Case => "case",
             Keyword::Cast => "cast",
+            Keyword::Collate => "collate",
             Keyword::Column => "column",
             Keyword::Commit => "commit",
+            Keyword::Conflict => "conflict",
             Keyword::Create => "create",
             Keyword::Cross => "cross",
             Keyword::Default => "default",
             Keyword::Delete => "delete",
             Keyword::Desc => "desc",
             Keyword::Distinct => "distinct",
+            Keyword::Do => "do",
             Keyword::Double => "double",
             Keyword::Drop => "drop",
             Keyword::Each => "each",
@@ -210,6 +221,7 @@ impl Keyword {
             Keyword::Group => "group",
             Keyword::Having => "having",
             Keyword::If => "if",
+            Keyword::Ilike => "ilike",
             Keyword::In => "in",
             Keyword::Index => "index",
             Keyword::Inner => "inner",
@@ -230,6 +242,7 @@ impl Keyword {
             Keyword::Like => "like",
             Keyword::Limit => "limit",
             Keyword::Not => "not",
+            Keyword::Nothing => "nothing",
             Keyword::Null => "null",
             Keyword::Nulls => "nulls",
             Keyword::Offset => "offset",
@@ -295,14 +308,17 @@ fn keyword_from_str(word: &str) -> Option<Keyword> {
         "cascade" => Keyword::Cascade,
         "case" => Keyword::Case,
         "cast" => Keyword::Cast,
+        "collate" => Keyword::Collate,
         "column" => Keyword::Column,
         "commit" => Keyword::Commit,
+        "conflict" => Keyword::Conflict,
         "create" => Keyword::Create,
         "cross" => Keyword::Cross,
         "default" => Keyword::Default,
         "delete" => Keyword::Delete,
         "desc" => Keyword::Desc,
         "distinct" => Keyword::Distinct,
+        "do" => Keyword::Do,
         "double" => Keyword::Double,
         "drop" => Keyword::Drop,
         "each" => Keyword::Each,
@@ -322,6 +338,7 @@ fn keyword_from_str(word: &str) -> Option<Keyword> {
         "group" => Keyword::Group,
         "having" => Keyword::Having,
         "if" => Keyword::If,
+        "ilike" => Keyword::Ilike,
         "in" => Keyword::In,
         "index" => Keyword::Index,
         "inner" => Keyword::Inner,
@@ -342,6 +359,7 @@ fn keyword_from_str(word: &str) -> Option<Keyword> {
         "like" => Keyword::Like,
         "limit" => Keyword::Limit,
         "not" => Keyword::Not,
+        "nothing" => Keyword::Nothing,
         "null" => Keyword::Null,
         "nulls" => Keyword::Nulls,
         "offset" => Keyword::Offset,

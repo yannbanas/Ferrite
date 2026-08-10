@@ -272,7 +272,18 @@ impl SessionHandle {
                 }
                 let mut schema = create.to_schema()?;
                 ferrite_planner::typecheck_defaults(&mut schema)?;
-                catalog.create_table_in(txn, namespace, name, schema)?;
+                let id = catalog.create_table_in(txn, namespace, name, schema)?;
+                // `PRIMARY KEY` and `UNIQUE` become unique indexes in the
+                // catalog. Storage does not enforce them yet (see
+                // `docs/architecture.md`), but recording them is what lets
+                // `INSERT OR IGNORE` find a conflict target without the
+                // statement naming one.
+                for (n, columns) in create.unique_keys().into_iter().enumerate() {
+                    let index = format!("{name}_key{n}");
+                    if catalog.index_by_name(namespace, &index)?.is_none() {
+                        catalog.create_index_in(txn, &index, id, &columns, true)?;
+                    }
+                }
                 "CREATE TABLE"
             }
 

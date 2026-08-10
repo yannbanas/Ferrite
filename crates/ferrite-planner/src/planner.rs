@@ -5,16 +5,18 @@ use ferrite_common::{
 };
 use ferrite_sql::ast as sql;
 
-use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, Expr};
+use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, ColumnRef, Expr};
 use crate::logical::{
-    split_conjunction, JoinType, LogicalPlan, ProjectionItem, SortKey, TableSource,
+    split_conjunction, ConflictAction, JoinType, LogicalPlan, OnConflict, ProjectionItem, SortKey,
+    TableSource,
 };
 use crate::lower::{
     coerce, collect_aggregates, contains_aggregate, reject_ungrouped, row_count, single_select,
     substitute_group_keys, unsupported, AggregateSlots, Lowerer,
 };
 use crate::physical::{
-    aggregate_schema, bind, infer, PhysAggregate, PhysExpr, PhysSortKey, PhysicalPlan,
+    aggregate_schema, bind, bind_with, infer, PhysAggregate, PhysConflictAction, PhysExpr,
+    PhysOnConflict, PhysSortKey, PhysicalPlan,
 };
 use crate::rules::optimize;
 use crate::scope::Scope;
@@ -109,7 +111,10 @@ impl<'a> Planner<'a> {
         let from_scope = plan
             .scope()
             .expect("a FROM tree is made of scans and joins, which both have a scope");
-        let lowerer = Lowerer::new(self.params).with_qualifiers(qualifiers.clone());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(qualifiers.clone())
+            .with_subqueries(&subplanner);
 
         if let Some(predicate) = &select.selection {
             if contains_aggregate(predicate) {
@@ -140,7 +145,7 @@ impl<'a> Planner<'a> {
         let mut group_keys = Vec::new();
         let scope = if grouped {
             for key in &select.group_by {
-                group_keys.push(lowerer.expr(key)?);
+                group_keys.push(group_key(key, &select.projection, &from_scope, &lowerer)?);
             }
             let aggregates = calls
                 .iter()
@@ -163,7 +168,8 @@ impl<'a> Planner<'a> {
         };
         let upper = Lowerer::new(self.params)
             .with_qualifiers(qualifiers)
-            .with_aggregates(slots);
+            .with_aggregates(slots)
+            .with_subqueries(&subplanner);
         let rewrite = |expr: &sql::Expr| -> Result<Expr, FerriteError> {
             let lowered = substitute_group_keys(upper.expr(expr)?, &group_keys);
             if grouped {
@@ -357,7 +363,102 @@ impl<'a> Planner<'a> {
             rows.push(row);
         }
 
-        Ok(LogicalPlan::Insert { source, rows })
+        let on_conflict = stmt
+            .on_conflict
+            .as_ref()
+            .map(|clause| self.build_on_conflict(&source, clause))
+            .transpose()?;
+        Ok(LogicalPlan::Insert {
+            source,
+            rows,
+            on_conflict,
+        })
+    }
+
+    /// Resolve an `ON CONFLICT` clause against the target table.
+    ///
+    /// With no explicit target — which is how `INSERT OR IGNORE` and
+    /// `INSERT OR REPLACE` arrive — the conflict columns come from the
+    /// table's first unique key as the catalog records it. A table with no
+    /// unique key recorded is a plan error naming it, rather than an
+    /// insert that can never conflict and so silently duplicates rows.
+    fn build_on_conflict(
+        &self,
+        source: &TableSource,
+        clause: &sql::OnConflict,
+    ) -> Result<OnConflict, FerriteError> {
+        let names = match clause.target.is_empty() {
+            false => clause.target.clone(),
+            true => self
+                .indexes
+                .indexes_for(source.id)?
+                .into_iter()
+                .find(|index| index.unique)
+                .map(|index| index.columns)
+                .ok_or_else(|| {
+                    FerriteError::Plan(format!(
+                        "no unique key is recorded on {}, so ON CONFLICT has no target; \
+                         write ON CONFLICT (columns) explicitly",
+                        source.name
+                    ))
+                })?,
+        };
+        let target = names
+            .iter()
+            .map(|name| {
+                source
+                    .schema
+                    .column_index(name)
+                    .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let action = match &clause.action {
+            sql::InsertConflictAction::Nothing => ConflictAction::Nothing,
+            sql::InsertConflictAction::Update {
+                assignments,
+                selection,
+            } => {
+                // The row an assignment reads is the existing row followed
+                // by the one the insert would have written, so `excluded`
+                // is simply the second relation in scope.
+                let scope = Scope::concat(
+                    Scope::for_relation(&source.schema, std::slice::from_ref(&source.name)),
+                    Scope::for_relation(&source.schema, &["excluded".to_string()]),
+                );
+                let lowerer = Lowerer::new(self.params)
+                    .with_qualifiers(vec![source.name.clone(), "excluded".to_string()]);
+                let assignments =
+                    assignments
+                        .iter()
+                        .map(|assignment| {
+                            let position =
+                                source.schema.column_index(&assignment.column).ok_or_else(
+                                    || FerriteError::ColumnNotFound(assignment.column.clone()),
+                                )?;
+                            let value = coerce(
+                                lowerer.expr(&assignment.value)?,
+                                source.schema.columns[position].data_type,
+                            )?;
+                            Ok((position, value))
+                        })
+                        .collect::<Result<Vec<_>, FerriteError>>()?;
+                let selection = selection
+                    .as_ref()
+                    .map(|expr| lowerer.expr(expr))
+                    .transpose()?;
+                // Bind eagerly so an unresolvable `excluded.col` is a plan
+                // error here rather than a surprise at execution time.
+                for (_, value) in &assignments {
+                    bind(value, &scope)?;
+                }
+                ConflictAction::Update {
+                    assignments,
+                    selection,
+                }
+            }
+        };
+        Ok(OnConflict { target, action })
     }
 
     fn build_update(&self, stmt: &sql::Update) -> Result<LogicalPlan, FerriteError> {
@@ -367,7 +468,10 @@ impl<'a> Planner<'a> {
             ));
         }
         let source = self.resolve(&stmt.table, stmt.alias.clone())?;
-        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(source.qualifiers())
+            .with_subqueries(&subplanner);
 
         let mut assignments = Vec::with_capacity(stmt.assignments.len());
         for sql::Assignment { column, value } in &stmt.assignments {
@@ -397,7 +501,10 @@ impl<'a> Planner<'a> {
             ));
         }
         let source = self.resolve(&stmt.table, stmt.alias.clone())?;
-        let lowerer = Lowerer::new(self.params).with_qualifiers(source.qualifiers());
+        let subplanner = |query: &sql::Query| self.build_select(query);
+        let lowerer = Lowerer::new(self.params)
+            .with_qualifiers(source.qualifiers())
+            .with_subqueries(&subplanner);
 
         let input = self.filtered_scan(&source, stmt.selection.as_ref(), &lowerer)?;
         Ok(LogicalPlan::Delete {
@@ -437,6 +544,12 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// Bind an expression that may contain an uncorrelated `IN (SELECT
+    /// ...)`, lowering the subquery's plan through the same pipeline.
+    fn bind_expr(&self, expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
+        bind_with(expr, scope, &|plan| self.to_physical(plan.clone()))
+    }
+
     /// Lower an optimized logical plan, choosing an access path for every
     /// scan on the way down.
     pub fn to_physical(&self, plan: LogicalPlan) -> Result<PhysicalPlan, FerriteError> {
@@ -469,7 +582,7 @@ impl<'a> Planner<'a> {
                     right_scope = right_scope.nullable();
                 }
                 let scope = Scope::concat(left_scope, right_scope);
-                let predicate = on.map(|e| bind(&e, &scope)).transpose()?;
+                let predicate = on.map(|e| self.bind_expr(&e, &scope)).transpose()?;
                 let output = scope.schema();
                 Ok((
                     PhysicalPlan::NestedLoopJoin {
@@ -487,7 +600,7 @@ impl<'a> Planner<'a> {
                 let (input, scope) = self.lower_plan(*input)?;
                 Ok((
                     PhysicalPlan::Filter {
-                        predicate: bind(&predicate, &scope)?,
+                        predicate: self.bind_expr(&predicate, &scope)?,
                         input: Box::new(input),
                     },
                     scope,
@@ -503,7 +616,7 @@ impl<'a> Planner<'a> {
                 let output = aggregate_schema(&group_by, &aggregates, &input_scope)?;
                 let group_by = group_by
                     .iter()
-                    .map(|e| bind(e, &input_scope))
+                    .map(|e| self.bind_expr(e, &input_scope))
                     .collect::<Result<Vec<_>, _>>()?;
                 let aggregates = aggregates
                     .iter()
@@ -513,7 +626,7 @@ impl<'a> Planner<'a> {
                             arg: call
                                 .arg
                                 .as_ref()
-                                .map(|e| bind(e, &input_scope))
+                                .map(|e| self.bind_expr(e, &input_scope))
                                 .transpose()?,
                             distinct: call.distinct,
                         })
@@ -536,7 +649,7 @@ impl<'a> Planner<'a> {
                 let mut exprs = Vec::with_capacity(items.len());
                 let mut columns = Vec::with_capacity(items.len());
                 for item in &items {
-                    exprs.push(bind(&item.expr, &input_scope)?);
+                    exprs.push(self.bind_expr(&item.expr, &input_scope)?);
                     let (data_type, nullable) = infer(&item.expr, &input_scope)?;
                     columns.push(ColumnDef::new(
                         item.output_name.clone(),
@@ -562,7 +675,7 @@ impl<'a> Planner<'a> {
                     .iter()
                     .map(|key| {
                         Ok(PhysSortKey {
-                            expr: bind(&key.expr, &scope)?,
+                            expr: self.bind_expr(&key.expr, &scope)?,
                             asc: key.asc,
                             nulls_first: key.nulls_first,
                         })
@@ -603,18 +716,32 @@ impl<'a> Planner<'a> {
                 ))
             }
 
-            LogicalPlan::Insert { source, rows } => {
+            LogicalPlan::Insert {
+                source,
+                rows,
+                on_conflict,
+            } => {
                 let empty = Scope::empty();
                 let rows = rows
                     .iter()
                     .map(|row| row.iter().map(|e| bind(e, &empty)).collect())
                     .collect::<Result<Vec<Vec<_>>, _>>()?;
+                // `excluded.col` resolves against the second half of a row
+                // made of the existing row followed by the excluded one.
+                let conflict_scope = Scope::concat(
+                    Scope::for_relation(&source.schema, std::slice::from_ref(&source.name)),
+                    Scope::for_relation(&source.schema, &["excluded".to_string()]),
+                );
+                let on_conflict = on_conflict
+                    .map(|clause| bind_on_conflict(clause, &conflict_scope))
+                    .transpose()?;
                 Ok((
                     PhysicalPlan::Insert {
                         table: source.id,
                         table_name: source.name,
                         schema: source.schema,
                         rows,
+                        on_conflict,
                     },
                     Scope::empty(),
                 ))
@@ -705,7 +832,7 @@ impl<'a> Planner<'a> {
             Some((position, index, column, key)) => {
                 conjuncts.remove(position);
                 let residual = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, scope))
+                    .map(|e| self.bind_expr(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::IndexScan {
                     table: source.id,
@@ -719,7 +846,7 @@ impl<'a> Planner<'a> {
             }
             None => {
                 let filter = crate::logical::combine_conjunction(conjuncts)
-                    .map(|e| bind(&e, scope))
+                    .map(|e| self.bind_expr(&e, scope))
                     .transpose()?;
                 Ok(PhysicalPlan::SeqScan {
                     table: source.id,
@@ -933,6 +1060,35 @@ fn sort_keys(
     Ok(keys)
 }
 
+/// Lower one `GROUP BY` key, letting it name a select-list alias.
+///
+/// `SELECT date(created_at) AS day ... GROUP BY day` is how PawChat writes
+/// its analytics queries, and PostgreSQL accepts it. An input column of the
+/// same name wins over the alias, which is the disambiguation rule
+/// PostgreSQL documents — hence the scope check: the alias is only used
+/// for a name the `FROM` clause does not already provide.
+fn group_key(
+    key: &sql::Expr,
+    projection: &[sql::SelectItem],
+    from_scope: &Scope,
+    lowerer: &Lowerer<'_>,
+) -> Result<Expr, FerriteError> {
+    let sql::Expr::Column(name) = key else {
+        return lowerer.expr(key);
+    };
+    if name.qualifier().is_some() || from_scope.can_resolve(&ColumnRef::new(name.base())) {
+        return lowerer.expr(key);
+    }
+    let aliased = projection.iter().find_map(|item| match item {
+        sql::SelectItem::Expr {
+            expr,
+            alias: Some(alias),
+        } if alias == name.base() => Some(expr),
+        _ => None,
+    });
+    lowerer.expr(aliased.unwrap_or(key))
+}
+
 fn select_list_reference(
     expr: &sql::Expr,
     items: Option<&[ProjectionItem]>,
@@ -1002,6 +1158,25 @@ fn pick_index<'i>(indexes: &'i [IndexDef], column: &str) -> Option<&'i IndexDef>
         .iter()
         .filter(|i| i.columns.len() == 1 && i.columns[0] == column)
         .max_by_key(|i| i.unique)
+}
+
+fn bind_on_conflict(clause: OnConflict, scope: &Scope) -> Result<PhysOnConflict, FerriteError> {
+    Ok(PhysOnConflict {
+        target: clause.target,
+        action: match clause.action {
+            ConflictAction::Nothing => PhysConflictAction::Nothing,
+            ConflictAction::Update {
+                assignments,
+                selection,
+            } => PhysConflictAction::Update {
+                assignments: assignments
+                    .iter()
+                    .map(|(position, value)| Ok((*position, bind(value, scope)?)))
+                    .collect::<Result<_, FerriteError>>()?,
+                selection: selection.as_ref().map(|e| bind(e, scope)).transpose()?,
+            },
+        },
+    })
 }
 
 #[cfg(test)]

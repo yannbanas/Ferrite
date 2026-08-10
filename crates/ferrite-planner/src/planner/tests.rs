@@ -519,8 +519,73 @@ fn like_binds_both_operands() {
             expr: Box::new(PhysExpr::Column(1)),
             pattern: Box::new(PhysExpr::Literal(Value::Text("a%".into()))),
             negated: true,
+            case_insensitive: false,
         })
     );
+}
+
+#[test]
+fn ilike_binds_the_same_way_but_folds_case() {
+    let PhysicalPlan::SeqScan { filter, .. } =
+        plan("SELECT * FROM users WHERE name ILIKE 'a%'").unwrap()
+    else {
+        panic!("expected a SeqScan");
+    };
+    assert_eq!(
+        filter,
+        Some(PhysExpr::Like {
+            expr: Box::new(PhysExpr::Column(1)),
+            pattern: Box::new(PhysExpr::Literal(Value::Text("a%".into()))),
+            negated: false,
+            case_insensitive: true,
+        })
+    );
+}
+
+#[test]
+fn collate_nocase_on_one_operand_folds_both_sides_of_the_comparison() {
+    let PhysicalPlan::SeqScan { filter, .. } =
+        plan("SELECT * FROM users WHERE name = 'Ada' COLLATE NOCASE").unwrap()
+    else {
+        panic!("expected a SeqScan");
+    };
+    let fold = |inner| PhysExpr::Function {
+        func: crate::ScalarFunc::Nocase,
+        args: vec![inner],
+    };
+    assert_eq!(
+        filter,
+        Some(PhysExpr::binary(
+            fold(PhysExpr::Column(1)),
+            BinaryOp::Eq,
+            fold(PhysExpr::Literal(Value::Text("Ada".into()))),
+        ))
+    );
+}
+
+#[test]
+fn datetime_now_is_folded_to_one_literal_for_the_whole_statement() {
+    let PhysicalPlan::SeqScan { filter, .. } =
+        plan("SELECT * FROM users WHERE name > datetime('now', '-30 days')").unwrap()
+    else {
+        panic!("expected a SeqScan");
+    };
+    let Some(PhysExpr::Binary { right, .. }) = filter else {
+        panic!("expected a comparison");
+    };
+    assert!(matches!(*right, PhysExpr::Literal(Value::Text(_))));
+}
+
+#[test]
+fn an_unknown_function_is_refused_by_name() {
+    let error = plan("SELECT strftime('%Y', name) FROM users").unwrap_err();
+    assert!(error.to_string().contains("strftime"), "{error}");
+}
+
+#[test]
+fn an_unknown_collation_is_refused_rather_than_ignored() {
+    let error = plan("SELECT * FROM users WHERE name = 'a' COLLATE rtrim").unwrap_err();
+    assert!(error.to_string().contains("rtrim"), "{error}");
 }
 
 #[test]
@@ -537,11 +602,9 @@ fn everything_outside_the_executable_subset_is_a_plan_error() {
         "SELECT * FROM users UNION SELECT * FROM users",
         "WITH x (id) AS (SELECT id FROM users) SELECT * FROM x",
         "SELECT * FROM (SELECT id FROM users) s",
-        "SELECT * FROM users WHERE id IN (SELECT id FROM users)",
         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM users)",
-        "SELECT CAST(age AS BIGINT) FROM users",
-        "SELECT CASE WHEN age > 1 THEN 1 ELSE 2 END FROM users",
-        "SELECT lower(name) FROM users",
+        "SELECT strftime('%Y', name) FROM users",
+        "SELECT lower(name, name) FROM users",
         "INSERT INTO users (name) VALUES ('a') RETURNING id",
         "INSERT INTO users SELECT id, name, age FROM users",
         "UPDATE users SET name = 'a' RETURNING id",
@@ -690,4 +753,23 @@ fn a_default_that_cannot_hold_is_refused_at_ddl_time() {
         ))
     )
     .is_ok());
+}
+
+#[test]
+fn an_uncorrelated_in_subquery_becomes_a_subplan_the_executor_runs() {
+    let PhysicalPlan::SeqScan { filter, .. } =
+        plan("SELECT * FROM users WHERE id IN (SELECT author FROM posts)").unwrap()
+    else {
+        panic!("expected a SeqScan");
+    };
+    assert!(matches!(filter, Some(PhysExpr::InSubquery { .. })));
+}
+
+#[test]
+fn a_correlated_in_subquery_is_refused_by_the_column_it_cannot_see() {
+    let error = plan(
+        "SELECT * FROM users WHERE id IN (SELECT author FROM posts WHERE posts.author = users.id)",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("users"), "{error}");
 }

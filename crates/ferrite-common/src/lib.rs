@@ -6,8 +6,13 @@
 //! against. Treat the traits here as a v0 contract: crates implementing
 //! them may propose changes, but changes must be coordinated here first
 //! since every other crate depends on this one compiling stably.
+//!
+//! The one exception is [`datetime`], which carries the calendar
+//! arithmetic the wire codec and the executor's date functions both need
+//! and neither should own.
 
 mod catalog;
+pub mod datetime;
 mod error;
 mod identity;
 mod schema;

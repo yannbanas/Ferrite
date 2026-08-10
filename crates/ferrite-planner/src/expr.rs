@@ -10,7 +10,9 @@
 
 use std::fmt;
 
-use ferrite_common::Value;
+use ferrite_common::{DataType, Value};
+
+use crate::scalar::ScalarFunc;
 
 /// A column reference, optionally qualified by a relation name or alias.
 /// The qualifier only starts to matter once a statement has more than one
@@ -67,6 +69,33 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+        /// Set by `ILIKE`, and by a `LIKE` whose operands carry an
+        /// explicit `COLLATE NOCASE`.
+        case_insensitive: bool,
+    },
+    /// `CASE [operand] WHEN … THEN … [ELSE …] END`. With an `operand` the
+    /// branch conditions are compared against it; without, they are
+    /// predicates in their own right.
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+    Cast {
+        expr: Box<Expr>,
+        data_type: DataType,
+    },
+    Function {
+        func: ScalarFunc,
+        args: Vec<Expr>,
+    },
+    /// `expr IN (SELECT …)` over a subquery that does not mention the
+    /// outer row. The subquery is a plan of its own, run once before the
+    /// enclosing node — see [`crate::logical::LogicalPlan`].
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<crate::logical::LogicalPlan>,
+        negated: bool,
     },
 }
 
@@ -110,11 +139,34 @@ impl Expr {
                 left.collect_columns(out);
                 right.collect_columns(out);
             }
-            Expr::Not(inner) | Expr::IsNull(inner) => inner.collect_columns(out),
+            Expr::Not(inner) | Expr::IsNull(inner) | Expr::Cast { expr: inner, .. } => {
+                inner.collect_columns(out)
+            }
             Expr::Like { expr, pattern, .. } => {
                 expr.collect_columns(out);
                 pattern.collect_columns(out);
             }
+            Expr::Case {
+                operand,
+                branches,
+                else_result,
+            } => {
+                for inner in operand.iter().chain(else_result.iter()) {
+                    inner.collect_columns(out);
+                }
+                for (when, then) in branches {
+                    when.collect_columns(out);
+                    then.collect_columns(out);
+                }
+            }
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    arg.collect_columns(out);
+                }
+            }
+            // The subquery's own column references belong to its own
+            // scope, so only the tested expression contributes here.
+            Expr::InSubquery { expr, .. } => expr.collect_columns(out),
         }
     }
 }
