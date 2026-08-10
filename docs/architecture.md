@@ -107,23 +107,54 @@ rejoué contre un vrai serveur (`crates/ferrite-server/tests/replay.rs`) :
 données passent. Ce qui bloque est ailleurs, et voici l'ordre de priorité que
 ce test fait ressortir :
 
-1. **`ALTER TABLE`** — PawChat porte 195 `ALTER TABLE ... ADD COLUMN` sur 22
-   tables ; c'est sa mécanique de migration. Sans ça, une application ne peut
-   pas évoluer sur Ferrite, seulement démarrer.
-2. **`DEFAULT` appliqué à l'insertion** — la grammaire le parse et le
-   planificateur l'ignore. Une colonne omise reçoit `NULL`, ce qui échoue sur
-   `NOT NULL` (visible) mais passe silencieusement sur une colonne nullable
-   (invisible). Le plus dangereux des manques actuels.
+1. ~~**`ALTER TABLE`**~~ — *fait.* PawChat porte 195 `ALTER TABLE ... ADD
+   COLUMN` sur 22 tables ; c'est sa mécanique de migration. Sans ça, une
+   application ne peut pas évoluer sur Ferrite, seulement démarrer.
+2. ~~**`DEFAULT` appliqué à l'insertion**~~ — *fait.* La grammaire le parsait
+   et le planificateur l'ignorait. Une colonne omise recevait `NULL`, ce qui
+   échouait sur `NOT NULL` (visible) mais passait silencieusement sur une
+   colonne nullable (invisible). C'était le plus dangereux des manques.
 3. **`JOIN`** — un schéma relationnel normalisé n'est lisible qu'à travers
    des jointures ; c'est le manque le plus visible côté requêtes.
 4. **Agrégats (`count`/`sum`/…) et `ORDER BY`** — présents dans presque
    toutes les pages de liste d'une application.
 5. **`LIKE`, sous-requêtes, index partiels** — ensuite.
 
-Les contraintes que la traduction a dû jeter faute d'équivalent : 4 `FOREIGN
-KEY`, 13 `UNIQUE`, 239 `DEFAULT`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun
-`CHECK`, aucun trigger, aucune vue dans ce schéma. 6 des 7 index se créent ;
-le septième est partiel (`WHERE status = 'paid'`).
+Les contraintes que la traduction doit encore jeter faute d'équivalent :
+4 `FOREIGN KEY`, 13 `UNIQUE`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun `CHECK`,
+aucun trigger, aucune vue dans ce schéma. 6 des 7 index se créent ; le
+septième est partiel (`WHERE status = 'paid'`).
+
+### Après `ALTER TABLE` + `DEFAULT` (même mesure, même base)
+
+Le traducteur émet maintenant les `DEFAULT` qu'il jetait (200 des 239 ; les
+39 restants sont des `datetime('now')` sur des colonnes que les valeurs ne
+permettent pas de typer `TIMESTAMP`, et sont refusés plutôt qu'ignorés). Le
+fichier `_after.sql` rejoue en plus, sur les 72 tables déjà remplies, les
+deux formes de migration qu'une application utilise vraiment — une colonne
+nullable et une colonne `NOT NULL DEFAULT` —, la ré-exécution de la même
+migration (`IF NOT EXISTS`, ce que fait un `try/catch` côté PawChat), une
+relecture des lignes écrites avant ces colonnes, et un `INSERT` ne nommant
+que les colonnes que l'application n'a pas le choix de fournir :
+
+```
+avant : 72/72 tables, 938/938 lignes,   0/313 énoncés `_after` acceptés
+après : 72/72 tables, 938/938 lignes, 313/313 énoncés `_after` acceptés
+```
+
+Les 313 refus d'avant : 216 `parse error: found identifier alter`, 72
+`column not found: ferrite_added`, et 25 `INSERT` tombant sur un
+`... is not nullable` — dont exactement celui du démarrage de PawChat,
+`INSERT INTO users (id, username, password)` refusé sur
+`users.created_at is not nullable`.
+
+Une ligne écrite avant une colonne n'est pas réécrite : `ADD COLUMN` reste
+une écriture `O(1)` dans le catalogue, et c'est la lecture qui réconcilie
+l'arité en complétant la ligne avec le `DEFAULT` constant de la colonne (ou
+`NULL`). C'est le choix de PostgreSQL (`pg_attribute.attmissingval`), et la
+raison pour laquelle `ADD COLUMN NOT NULL` sans défaut constant est refusé
+sur une table non vide plutôt que de publier un `NULL` dans une colonne
+déclarée sans.
 
 ## Extensions syntaxiques envisagées (après la priorité PawChat, pas avant)
 

@@ -18,7 +18,7 @@ mod value;
 pub use catalog::{Catalog, IndexCatalog, IndexDef, IndexId};
 pub use error::FerriteError;
 pub use identity::{Identity, Permission, Role};
-pub use schema::{ColumnDef, Schema, TableId};
+pub use schema::{ColumnDef, ColumnDefault, Schema, TableId};
 pub use storage::{RowId, ScanIter, StorageEngine};
 pub use txn::{Snapshot, TxnId};
 pub use value::{DataType, Row, Value};

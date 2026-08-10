@@ -204,6 +204,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek() {
             Token::Keyword(Keyword::Create) => self.parse_create(),
+            Token::Keyword(Keyword::Alter) => self.parse_alter(),
             Token::Keyword(Keyword::Drop) => self.parse_drop(),
             Token::Keyword(Keyword::Select) | Token::Keyword(Keyword::With) | Token::LParen => {
                 Ok(Statement::Query(Box::new(self.parse_query()?)))
@@ -297,6 +298,37 @@ impl Parser {
             name,
             columns,
             constraints,
+        }))
+    }
+
+    /// `ALTER TABLE [IF EXISTS] name ADD [COLUMN] [IF NOT EXISTS] col type …`
+    ///
+    /// Only `ADD COLUMN` is covered. Every other action is named in the
+    /// error rather than skipped, so a migration that Ferrite cannot run
+    /// stops instead of appearing to have run.
+    fn parse_alter(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
+        let if_exists = self.eat_keywords(&[Keyword::If, Keyword::Exists]);
+        let name = self.parse_object_name()?;
+
+        if !self.eat_keyword(Keyword::Add) {
+            return self.err(
+                "the only ALTER TABLE action Ferrite v1 supports is ADD COLUMN \
+                 (no DROP COLUMN, RENAME, ALTER COLUMN or constraint actions)",
+            );
+        }
+        let _ = self.eat_keyword(Keyword::Column);
+        let if_not_exists = self.eat_keywords(&[Keyword::If, Keyword::Not, Keyword::Exists]);
+        let column = self.parse_column_spec()?;
+
+        Ok(Statement::AlterTable(AlterTable {
+            if_exists,
+            name,
+            action: AlterTableAction::AddColumn {
+                if_not_exists,
+                column,
+            },
         }))
     }
 

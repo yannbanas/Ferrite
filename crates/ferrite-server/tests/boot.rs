@@ -233,6 +233,231 @@ async fn the_engine_serves_ddl_dml_and_survives_a_restart() {
         .expect("DROP INDEX after restart");
 }
 
+/// `ALTER TABLE … ADD COLUMN` on a table that already holds rows, and
+/// `DEFAULT` actually applied to a column an `INSERT` leaves out.
+///
+/// This is the shape a real application migration has: the table is
+/// created, filled, then grown one column at a time, and the rows written
+/// before each migration have to keep reading back — the storage layer
+/// never rewrites them, so the read path is what reconciles the arity.
+/// The last section replays PawChat's own `users` case, which is where the
+/// missing `DEFAULT` was found.
+#[tokio::test]
+async fn alter_table_adds_columns_and_defaults_are_applied() {
+    let data = scratch("alter");
+    let port = free_port();
+
+    {
+        let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+        wait_for_port(port).await;
+        let client = connect(port).await;
+
+        client
+            .batch_execute("CREATE TABLE members (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .expect("CREATE TABLE");
+        client
+            .execute("INSERT INTO members VALUES (1, 'Rex'), (2, 'Ada')", &[])
+            .await
+            .expect("INSERT");
+
+        // A nullable column: rows written before it read back as NULL.
+        client
+            .batch_execute("ALTER TABLE members ADD COLUMN bio TEXT")
+            .await
+            .expect("ADD COLUMN bio");
+        let row = client
+            .query_one("SELECT id, name, bio FROM members WHERE id = 1", &[])
+            .await
+            .expect("read a row that predates the column");
+        assert_eq!(row.get::<_, Option<String>>("bio"), None);
+
+        // A NOT NULL column with a constant default: rows written before it
+        // read back as that default, not as NULL.
+        client
+            .batch_execute("ALTER TABLE members ADD COLUMN banned BIGINT NOT NULL DEFAULT 0")
+            .await
+            .expect("ADD COLUMN banned");
+        let rows = client
+            .query("SELECT id, banned FROM members", &[])
+            .await
+            .expect("read the backfilled column");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.get::<_, i64>("banned") == 0));
+
+        // …and the same default lands on a row inserted without it.
+        client
+            .execute("INSERT INTO members (id, name) VALUES (3, 'Grace')", &[])
+            .await
+            .expect("INSERT omitting the defaulted column");
+        let row = client
+            .query_one("SELECT banned, bio FROM members WHERE id = 3", &[])
+            .await
+            .expect("read the new row");
+        assert_eq!(row.get::<_, i64>("banned"), 0);
+        assert_eq!(
+            row.get::<_, Option<String>>("bio"),
+            None,
+            "a column with no DEFAULT still falls back to NULL"
+        );
+
+        // An explicit value still wins over the default.
+        client
+            .execute(
+                "INSERT INTO members (id, name, banned) VALUES (4, 'Moebius', 1)",
+                &[],
+            )
+            .await
+            .expect("INSERT supplying the defaulted column");
+        let row = client
+            .query_one("SELECT banned FROM members WHERE id = 4", &[])
+            .await
+            .expect("read the explicit value");
+        assert_eq!(row.get::<_, i64>("banned"), 1);
+
+        // A short row still updates, and comes back full width afterwards.
+        let updated = client
+            .execute("UPDATE members SET bio = 'hello' WHERE id = 2", &[])
+            .await
+            .expect("UPDATE a row that predates two columns");
+        assert_eq!(updated, 1);
+        let row = client
+            .query_one("SELECT bio, banned FROM members WHERE id = 2", &[])
+            .await
+            .expect("read the updated row");
+        assert_eq!(
+            row.get::<_, Option<String>>("bio").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(row.get::<_, i64>("banned"), 0);
+
+        // `IF NOT EXISTS` makes the migration re-runnable, which is how an
+        // application replays its whole list of migrations at every boot.
+        client
+            .batch_execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS bio TEXT")
+            .await
+            .expect("ADD COLUMN IF NOT EXISTS on an existing column is a no-op");
+        client
+            .batch_execute("ALTER TABLE IF EXISTS nope ADD COLUMN x TEXT")
+            .await
+            .expect("ALTER TABLE IF EXISTS on a missing table is a no-op");
+
+        for sql in [
+            // Already there, and not guarded.
+            "ALTER TABLE members ADD COLUMN bio TEXT",
+            // NOT NULL with nothing to backfill the existing rows with.
+            "ALTER TABLE members ADD COLUMN nickname TEXT NOT NULL",
+            // Volatile default: no honest value for a row that predates it.
+            "ALTER TABLE members ADD COLUMN seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            // Missing table, unguarded.
+            "ALTER TABLE nope ADD COLUMN x TEXT",
+            // The catalog is not the application's to alter.
+            "ALTER TABLE ferrite_tables ADD COLUMN x TEXT",
+            // A default outside the stored subset is refused, not dropped.
+            "ALTER TABLE members ADD COLUMN score BIGINT DEFAULT (1 + 1)",
+            // …and one whose type cannot hold.
+            "ALTER TABLE members ADD COLUMN flag BOOLEAN DEFAULT 'nope'",
+        ] {
+            assert!(
+                client.batch_execute(sql).await.is_err(),
+                "{sql:?} should have been refused"
+            );
+        }
+
+        // The schema survives every refusal above.
+        assert_eq!(
+            client
+                .query("SELECT id, name, bio, banned FROM members", &[])
+                .await
+                .expect("the table is intact")
+                .len(),
+            4
+        );
+
+        // PawChat's own case: a `users` table whose flags all carry a
+        // `DEFAULT`, written by an `INSERT` that names four columns.
+        client
+            .batch_execute(
+                "CREATE TABLE users (
+                     id TEXT NOT NULL PRIMARY KEY,
+                     username TEXT NOT NULL,
+                     password TEXT NOT NULL,
+                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     totp_enabled BIGINT NOT NULL DEFAULT 0,
+                     age_verified BIGINT NOT NULL DEFAULT 0,
+                     profile_visibility TEXT NOT NULL DEFAULT 'everyone',
+                     profile_theme TEXT DEFAULT 'galaxy'
+                 )",
+            )
+            .await
+            .expect("CREATE TABLE users");
+        client
+            .execute(
+                "INSERT INTO users (id, username, password, created_at) \
+                 VALUES ('u1', 'yann', 'hash', '2026-08-10T12:00:00Z')",
+                &[],
+            )
+            .await
+            .expect("the INSERT that used to fail on `totp_enabled is not nullable`");
+        let row = client
+            .query_one(
+                "SELECT totp_enabled, profile_visibility, profile_theme FROM users \
+                 WHERE id = 'u1'",
+                &[],
+            )
+            .await
+            .expect("read the defaulted row");
+        assert_eq!(row.get::<_, i64>("totp_enabled"), 0);
+        assert_eq!(row.get::<_, String>("profile_visibility"), "everyone");
+        assert_eq!(
+            row.get::<_, Option<String>>("profile_theme").as_deref(),
+            Some("galaxy")
+        );
+
+        // `CURRENT_TIMESTAMP` is evaluated per statement, not stored, so a
+        // row that omits the column gets a real time rather than NULL.
+        client
+            .execute(
+                "INSERT INTO users (id, username, password) VALUES ('u2', 'ada', 'hash')",
+                &[],
+            )
+            .await
+            .expect("INSERT omitting a CURRENT_TIMESTAMP default");
+        let row = client
+            .query_one("SELECT created_at FROM users WHERE id = 'u2'", &[])
+            .await
+            .expect("read the timestamp default");
+        assert!(
+            row.get::<_, Option<std::time::SystemTime>>("created_at")
+                .is_some_and(|t| t > std::time::UNIX_EPOCH),
+            "CURRENT_TIMESTAMP must resolve to a real time"
+        );
+    }
+
+    // Column metadata and defaults are catalog rows, so they have to come
+    // back out of the files after a hard kill.
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+    let client = connect(port).await;
+
+    let rows = client
+        .query("SELECT id, name, bio, banned FROM members", &[])
+        .await
+        .expect("SELECT after restart");
+    assert_eq!(rows.len(), 4, "the added columns survive a restart");
+
+    client
+        .execute("INSERT INTO members (id, name) VALUES (5, 'Turing')", &[])
+        .await
+        .expect("the stored DEFAULT still applies after a restart");
+    let row = client
+        .query_one("SELECT banned FROM members WHERE id = 5", &[])
+        .await
+        .expect("read it back");
+    assert_eq!(row.get::<_, i64>("banned"), 0);
+}
+
 /// Two connections writing the same row: MVCC has to answer
 /// `SerializationFailure` (SQLSTATE 40001), not corrupt anything and not
 /// take the server down.
@@ -317,7 +542,8 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         "SELECT * FROM t GROUP BY a",
         "SELECT * FROM t JOIN t t2 ON t2.a = t.a",
         "SELECT * FROM t WHERE b LIKE 'x%'",
-        "ALTER TABLE t ADD COLUMN c INT",
+        "ALTER TABLE t DROP COLUMN b",
+        "ALTER TABLE t RENAME TO u",
         "SELECT * FROM nope",
         "this is not sql",
     ] {

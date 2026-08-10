@@ -5,17 +5,15 @@ use ferrite_catalog::{
     IndexCatalog, SystemCatalog, CATALOG_SCHEMA, COLUMNS_TABLE_ID, FIRST_USER_TABLE_ID,
     INDEXES_TABLE_ID, TABLES_TABLE_ID,
 };
-use ferrite_common::{Catalog, ColumnDef, DataType, FerriteError, Schema, StorageEngine};
+use ferrite_common::{
+    Catalog, ColumnDef, ColumnDefault, DataType, FerriteError, Schema, StorageEngine, Value,
+};
 
 fn schema(columns: &[(&str, DataType, bool)]) -> Schema {
     Schema {
         columns: columns
             .iter()
-            .map(|(name, data_type, nullable)| ColumnDef {
-                name: (*name).to_string(),
-                data_type: *data_type,
-                nullable: *nullable,
-            })
+            .map(|(name, data_type, nullable)| ColumnDef::new(*name, *data_type, *nullable))
             .collect(),
     }
 }
@@ -62,12 +60,16 @@ fn bootstrap_creates_self_describing_catalog_tables() {
         vec!["table_id", "schema_name", "table_name"]
     );
     let columns = catalog.table_schema(COLUMNS_TABLE_ID).unwrap();
-    assert_eq!(columns.columns.len(), 5);
+    assert_eq!(columns.columns.len(), 6);
     assert_eq!(columns.columns[4].data_type, DataType::Boolean);
+    assert!(
+        columns.columns[5].nullable,
+        "default_expr holds NULL for a column without a DEFAULT"
+    );
 
     // Three catalog tables, and one row per column of each.
     assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), 3);
-    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), 3 + 5 + 6);
+    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), 3 + 6 + 6);
     assert!(storage.rows(INDEXES_TABLE_ID).unwrap().is_empty());
 
     assert_eq!(
@@ -629,6 +631,166 @@ fn a_failed_create_leaves_the_index_consistent() {
     );
     assert_eq!(catalog.indexes_for(table).unwrap().len(), 0);
     assert_eq!(catalog.table_id("public", "users").unwrap(), Some(table));
+}
+
+/// `ADD COLUMN` appends to the stored schema, refuses a duplicate and a
+/// system table, and survives the round trip through the catalog tables —
+/// including the `DEFAULT`, which is what an omitted `INSERT` column reads.
+#[test]
+fn add_column_appends_to_the_stored_schema() {
+    let (storage, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let before = storage.rows(COLUMNS_TABLE_ID).unwrap().len();
+
+    catalog
+        .add_column(table, ColumnDef::new("bio", DataType::Text, true))
+        .unwrap();
+    catalog
+        .add_column(
+            table,
+            ColumnDef::new("totp_enabled", DataType::Int8, false)
+                .with_default(ColumnDefault::Constant(Value::Int8(0))),
+        )
+        .unwrap();
+    catalog
+        .add_column(
+            table,
+            ColumnDef::new("created_at", DataType::Timestamp, false)
+                .with_default(ColumnDefault::CurrentTimestamp),
+        )
+        .unwrap();
+
+    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), before + 3);
+
+    let expected = |schema: &Schema| {
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "id",
+                "email",
+                "age",
+                "profile",
+                "bio",
+                "totp_enabled",
+                "created_at"
+            ],
+            "new columns go on the end and nothing already stored moves"
+        );
+        assert_eq!(schema.columns[4].default, None);
+        assert_eq!(
+            schema.columns[5].default,
+            Some(ColumnDefault::Constant(Value::Int8(0)))
+        );
+        assert_eq!(
+            schema.columns[6].default,
+            Some(ColumnDefault::CurrentTimestamp)
+        );
+    };
+    expected(&catalog.table_schema(table).unwrap());
+
+    // Read back from the catalog tables rather than the in-memory index.
+    let reopened = SystemCatalog::open(storage.clone() as Arc<dyn StorageEngine>).unwrap();
+    expected(&reopened.table_schema(table).unwrap());
+
+    assert!(
+        matches!(
+            catalog.add_column(table, ColumnDef::new("bio", DataType::Text, true)),
+            Err(FerriteError::ObjectAlreadyExists(_))
+        ),
+        "a column that is already there is not added twice"
+    );
+    assert!(
+        matches!(
+            catalog.add_column(TABLES_TABLE_ID, ColumnDef::new("x", DataType::Text, true)),
+            Err(FerriteError::PermissionDenied(_))
+        ),
+        "the system catalog is not the application's to alter"
+    );
+    assert!(catalog
+        .add_column(9999, ColumnDef::new("x", DataType::Text, true))
+        .is_err());
+    assert_eq!(
+        storage.rows(COLUMNS_TABLE_ID).unwrap().len(),
+        before + 3,
+        "no refused ADD COLUMN left a row behind"
+    );
+}
+
+/// Every `DEFAULT` shape has to come back out of `ferrite_columns` as
+/// exactly what went in: it is stored as one tagged string, and the
+/// constant's own type is recovered from the column's declared type.
+#[test]
+fn every_default_shape_survives_the_catalog_round_trip() {
+    let (storage, catalog) = fresh();
+    let cases = [
+        (
+            DataType::Boolean,
+            ColumnDefault::Constant(Value::Boolean(true)),
+        ),
+        (DataType::Int4, ColumnDefault::Constant(Value::Int4(-7))),
+        (
+            DataType::Int8,
+            ColumnDefault::Constant(Value::Int8(i64::MIN)),
+        ),
+        (
+            DataType::Float8,
+            ColumnDefault::Constant(Value::Float8(0.1 + 0.2)),
+        ),
+        (
+            DataType::Text,
+            ColumnDefault::Constant(Value::Text("v:n f:now".into())),
+        ),
+        (
+            DataType::Json,
+            ColumnDefault::Constant(Value::Json("{}".into())),
+        ),
+        (
+            DataType::Timestamp,
+            ColumnDefault::Constant(Value::Timestamp(1)),
+        ),
+        (DataType::Timestamp, ColumnDefault::CurrentTimestamp),
+        (
+            DataType::Uuid,
+            ColumnDefault::Constant(Value::Uuid(u128::MAX)),
+        ),
+        (DataType::Text, ColumnDefault::Constant(Value::Null)),
+    ];
+    let columns: Vec<ColumnDef> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (data_type, default))| {
+            ColumnDef::new(format!("c{i}"), *data_type, true).with_default(default.clone())
+        })
+        .collect();
+    let table = catalog
+        .create_table(
+            "public",
+            "defaults",
+            Schema {
+                columns: columns.clone(),
+            },
+        )
+        .unwrap();
+
+    let reopened = SystemCatalog::open(storage as Arc<dyn StorageEngine>).unwrap();
+    assert_eq!(reopened.table_schema(table).unwrap().columns, columns);
+
+    // A constant that does not fit its column is refused at store time
+    // rather than written and misread later.
+    assert!(catalog
+        .create_table(
+            "public",
+            "bad",
+            Schema {
+                columns: vec![ColumnDef::new("a", DataType::Int8, true)
+                    .with_default(ColumnDefault::Constant(Value::Text("x".into())))],
+            },
+        )
+        .is_err());
 }
 
 #[test]

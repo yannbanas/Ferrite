@@ -1,4 +1,4 @@
-use ferrite_common::{ColumnDef, DataType, Schema};
+use ferrite_common::{ColumnDef, ColumnDefault, DataType, FerriteError, Schema, Value};
 
 /// A dotted name such as `users` or `public.users`. Parts are stored in
 /// source order and are already case-folded by the lexer.
@@ -32,6 +32,7 @@ impl ObjectName {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable(CreateTable),
+    AlterTable(AlterTable),
     DropTable(DropTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
@@ -64,7 +65,13 @@ impl CreateTable {
     /// A column is nullable unless it carries `NOT NULL` or takes part in
     /// a primary key; everything else in [`ColumnConstraint`] is metadata
     /// the planner handles, not part of the stored schema.
-    pub fn to_schema(&self) -> Schema {
+    ///
+    /// Fails when a `DEFAULT` clause is outside the set Ferrite v1 stores
+    /// — see [`ColumnSpec::to_column_def`]. The constants it does keep are
+    /// still untyped at this point: a quoted string written into a
+    /// `TIMESTAMP` column is `Value::Text` until the caller coerces it
+    /// (`ferrite_planner::typecheck_defaults`).
+    pub fn to_schema(&self) -> Result<Schema, FerriteError> {
         let pk: Vec<&str> = self
             .constraints
             .iter()
@@ -73,20 +80,39 @@ impl CreateTable {
                 TableConstraint::Unique(_) => Vec::new(),
             })
             .collect();
-        Schema {
+        Ok(Schema {
             columns: self
                 .columns
                 .iter()
-                .map(|col| ColumnDef {
-                    name: col.name.clone(),
-                    data_type: col.data_type,
-                    nullable: !col.constraints.iter().any(|c| {
-                        matches!(c, ColumnConstraint::NotNull | ColumnConstraint::PrimaryKey)
-                    }) && !pk.contains(&col.name.as_str()),
-                })
-                .collect(),
-        }
+                .map(|col| col.to_column_def(pk.contains(&col.name.as_str())))
+                .collect::<Result<_, _>>()?,
+        })
     }
+}
+
+/// `ALTER TABLE [IF EXISTS] name <action>`. Ferrite v1 has one action —
+/// see [`AlterTableAction`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub if_exists: bool,
+    pub name: ObjectName,
+    pub action: AlterTableAction,
+}
+
+/// The `ALTER TABLE` actions Ferrite v1 covers.
+///
+/// `ADD COLUMN` only. `DROP COLUMN`, `RENAME`, `ALTER COLUMN TYPE`,
+/// `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL` and constraint actions are
+/// **not** covered and are a parse error naming the action, never a
+/// silently accepted no-op. `ADD COLUMN` is what an application's
+/// migration mechanism actually runs; the rest can follow once the storage
+/// layer has a story for rewriting existing rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    AddColumn {
+        if_not_exists: bool,
+        column: ColumnSpec,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +120,97 @@ pub struct ColumnSpec {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<ColumnConstraint>,
+}
+
+impl ColumnSpec {
+    /// Project one parsed column onto a [`ferrite_common::ColumnDef`].
+    /// `primary_key` says whether a table-level `PRIMARY KEY` names it,
+    /// which makes it non-nullable just as the column-level spelling does.
+    pub fn to_column_def(&self, primary_key: bool) -> Result<ColumnDef, FerriteError> {
+        let nullable = !primary_key
+            && !self
+                .constraints
+                .iter()
+                .any(|c| matches!(c, ColumnConstraint::NotNull | ColumnConstraint::PrimaryKey));
+        let default = self
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                ColumnConstraint::Default(expr) => Some(expr),
+                _ => None,
+            })
+            .map(|expr| column_default(&self.name, expr))
+            .transpose()?;
+        Ok(ColumnDef {
+            name: self.name.clone(),
+            data_type: self.data_type,
+            nullable,
+            default,
+        })
+    }
+}
+
+/// Project a parsed `DEFAULT` expression onto the small set Ferrite
+/// stores.
+///
+/// Accepted: any literal (including a signed number), and the current
+/// timestamp written either as a bare `CURRENT_TIMESTAMP` or as a
+/// zero-argument `now()` / `current_timestamp()`. Everything else —
+/// arithmetic, a call to any other function, a reference to another column
+/// — is refused here rather than dropped, because a `DEFAULT` that is
+/// quietly not applied puts a `NULL` where the application expects a
+/// value, and on a nullable column nothing ever reports it.
+fn column_default(column: &str, expr: &Expr) -> Result<ColumnDefault, FerriteError> {
+    let refused = || {
+        FerriteError::InvalidDefinition(format!(
+            "the DEFAULT of column `{column}` is not a literal or CURRENT_TIMESTAMP"
+        ))
+    };
+    match expr {
+        Expr::Literal(literal) => Ok(ColumnDefault::Constant(literal_value(literal))),
+        Expr::UnaryOp { op, expr } => match (op, expr.as_ref()) {
+            (UnaryOp::Plus, Expr::Literal(literal)) => {
+                Ok(ColumnDefault::Constant(literal_value(literal)))
+            }
+            (UnaryOp::Minus, Expr::Literal(Literal::Int(n))) => Ok(ColumnDefault::Constant(
+                literal_value(&Literal::Int(n.checked_neg().ok_or_else(refused)?)),
+            )),
+            (UnaryOp::Minus, Expr::Literal(Literal::Float(f))) => {
+                Ok(ColumnDefault::Constant(Value::Float8(-f)))
+            }
+            _ => Err(refused()),
+        },
+        Expr::Function(call) if is_current_timestamp(&call.name) => match &call.args {
+            FunctionArgs::List(args) if args.is_empty() => Ok(ColumnDefault::CurrentTimestamp),
+            _ => Err(refused()),
+        },
+        // `CURRENT_TIMESTAMP` has no parentheses in the SQL standard, so
+        // the expression parser sees a bare name and reads it as a column
+        // reference; there is no column in scope in a `DEFAULT`.
+        Expr::Column(name) if name.qualifier().is_none() && is_current_timestamp(name.base()) => {
+            Ok(ColumnDefault::CurrentTimestamp)
+        }
+        _ => Err(refused()),
+    }
+}
+
+fn is_current_timestamp(name: &str) -> bool {
+    matches!(name, "now" | "current_timestamp")
+}
+
+/// Integer literals take the narrowest type that fits, matching what the
+/// planner does with a literal in a `VALUES` list.
+fn literal_value(literal: &Literal) -> Value {
+    match literal {
+        Literal::Null => Value::Null,
+        Literal::Boolean(b) => Value::Boolean(*b),
+        Literal::Int(n) => match i32::try_from(*n) {
+            Ok(small) => Value::Int4(small),
+            Err(_) => Value::Int8(*n),
+        },
+        Literal::Float(f) => Value::Float8(*f),
+        Literal::String(s) => Value::Text(s.clone()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

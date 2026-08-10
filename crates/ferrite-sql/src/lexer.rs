@@ -8,8 +8,10 @@ use crate::ParseError;
 /// `key` or `row` usable without quoting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Keyword {
+    Add,
     After,
     All,
+    Alter,
     And,
     As,
     Asc,
@@ -24,6 +26,7 @@ pub enum Keyword {
     Cascade,
     Case,
     Cast,
+    Column,
     Commit,
     Create,
     Cross,
@@ -120,10 +123,12 @@ impl Keyword {
     pub fn is_reserved(self) -> bool {
         !matches!(
             self,
-            Keyword::Bigint
+            Keyword::Add
+                | Keyword::Bigint
                 | Keyword::Bool
                 | Keyword::Boolean
                 | Keyword::Cascade
+                | Keyword::Column
                 | Keyword::Double
                 | Keyword::Each
                 | Keyword::First
@@ -160,8 +165,10 @@ impl Keyword {
     /// messages.
     pub fn as_str(self) -> &'static str {
         match self {
+            Keyword::Add => "add",
             Keyword::After => "after",
             Keyword::All => "all",
+            Keyword::Alter => "alter",
             Keyword::And => "and",
             Keyword::As => "as",
             Keyword::Asc => "asc",
@@ -176,6 +183,7 @@ impl Keyword {
             Keyword::Cascade => "cascade",
             Keyword::Case => "case",
             Keyword::Cast => "cast",
+            Keyword::Column => "column",
             Keyword::Commit => "commit",
             Keyword::Create => "create",
             Keyword::Cross => "cross",
@@ -269,8 +277,10 @@ impl Keyword {
 
 fn keyword_from_str(word: &str) -> Option<Keyword> {
     let kw = match word {
+        "add" => Keyword::Add,
         "after" => Keyword::After,
         "all" => Keyword::All,
+        "alter" => Keyword::Alter,
         "and" => Keyword::And,
         "as" => Keyword::As,
         "asc" => Keyword::Asc,
@@ -285,6 +295,7 @@ fn keyword_from_str(word: &str) -> Option<Keyword> {
         "cascade" => Keyword::Cascade,
         "case" => Keyword::Case,
         "cast" => Keyword::Cast,
+        "column" => Keyword::Column,
         "commit" => Keyword::Commit,
         "create" => Keyword::Create,
         "cross" => Keyword::Cross,

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ferrite_common::{
-    Catalog, ColumnDef, DataType, FerriteError, IndexCatalog, IndexDef, IndexId, Row, RowId,
-    Schema, StorageEngine, TableId, TxnId, Value,
+    Catalog, ColumnDef, ColumnDefault, DataType, FerriteError, IndexCatalog, IndexDef, IndexId,
+    Row, RowId, Schema, StorageEngine, TableId, TxnId, Value,
 };
 
 /// `TableId` of the table listing every table, including itself.
@@ -45,6 +45,7 @@ fn columns_schema() -> Schema {
             column("column_name", DataType::Text),
             column("data_type", DataType::Text),
             column("nullable", DataType::Boolean),
+            ColumnDef::new("default_expr", DataType::Text, true),
         ],
     }
 }
@@ -63,11 +64,71 @@ fn indexes_schema() -> Schema {
 }
 
 fn column(name: &str, data_type: DataType) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable: false,
+    ColumnDef::new(name, data_type, false)
+}
+
+/// Encode a `DEFAULT` for the `default_expr` column of `ferrite_columns`.
+///
+/// One tagged string rather than a column per shape: the tag says how to
+/// read the rest, so a new kind of default (a sequence, say) adds a tag
+/// instead of a column, and a row written by an older Ferrite still reads
+/// back. The constant's own type is not stored — it is always the
+/// column's declared type, which sits two columns away in the same row.
+///
+/// ```text
+/// n            DEFAULT NULL
+/// f:now        CURRENT_TIMESTAMP
+/// v:<text>     a constant, spelled per the column's data type
+/// ```
+fn encode_default(default: &ColumnDefault, data_type: DataType) -> Result<String, FerriteError> {
+    Ok(match default {
+        ColumnDefault::CurrentTimestamp => "f:now".to_string(),
+        ColumnDefault::Constant(Value::Null) => "n".to_string(),
+        ColumnDefault::Constant(value) => format!("v:{}", encode_constant(value, data_type)?),
+    })
+}
+
+fn encode_constant(value: &Value, data_type: DataType) -> Result<String, FerriteError> {
+    match (value, data_type) {
+        (Value::Boolean(b), DataType::Boolean) => Ok(b.to_string()),
+        (Value::Int4(n), DataType::Int4) => Ok(n.to_string()),
+        (Value::Int8(n), DataType::Int8) => Ok(n.to_string()),
+        (Value::Float8(f), DataType::Float8) => Ok(format!("{f:?}")),
+        (Value::Text(s), DataType::Text) => Ok(s.clone()),
+        (Value::Json(s), DataType::Json) => Ok(s.clone()),
+        (Value::Timestamp(n), DataType::Timestamp) => Ok(n.to_string()),
+        (Value::Uuid(u), DataType::Uuid) => Ok(format!("{u:032x}")),
+        (value, data_type) => Err(FerriteError::InvalidDefinition(format!(
+            "a DEFAULT of {value:?} does not fit a {data_type:?} column"
+        ))),
     }
+}
+
+fn decode_default(encoded: &str, data_type: DataType) -> Result<ColumnDefault, FerriteError> {
+    match encoded {
+        "n" => Ok(ColumnDefault::Constant(Value::Null)),
+        "f:now" => Ok(ColumnDefault::CurrentTimestamp),
+        _ => match encoded.strip_prefix("v:") {
+            Some(body) => Ok(ColumnDefault::Constant(decode_constant(body, data_type)?)),
+            None => Err(catalog_error(format!(
+                "corrupt catalog row: unknown default encoding `{encoded}`"
+            ))),
+        },
+    }
+}
+
+fn decode_constant(body: &str, data_type: DataType) -> Result<Value, FerriteError> {
+    let bad = || catalog_error(format!("corrupt catalog row: bad {data_type:?} default"));
+    Ok(match data_type {
+        DataType::Boolean => Value::Boolean(body.parse().map_err(|_| bad())?),
+        DataType::Int4 => Value::Int4(body.parse().map_err(|_| bad())?),
+        DataType::Int8 => Value::Int8(body.parse().map_err(|_| bad())?),
+        DataType::Float8 => Value::Float8(body.parse().map_err(|_| bad())?),
+        DataType::Text => Value::Text(body.to_string()),
+        DataType::Json => Value::Json(body.to_string()),
+        DataType::Timestamp => Value::Timestamp(body.parse().map_err(|_| bad())?),
+        DataType::Uuid => Value::Uuid(u128::from_str_radix(body, 16).map_err(|_| bad())?),
+    })
 }
 
 fn type_name(data_type: DataType) -> &'static str {
@@ -101,6 +162,19 @@ fn text(row: &Row, index: usize) -> Result<String, FerriteError> {
     match row.values.get(index) {
         Some(Value::Text(s)) => Ok(s.clone()),
         _ => Err(catalog_error("corrupt catalog row: expected text")),
+    }
+}
+
+/// A nullable text column. A value missing from the row entirely reads as
+/// `None` too: `ferrite_columns` gained `default_expr` after the fact, so
+/// rows written by an earlier Ferrite are one value short — the same
+/// short-row reconciliation `ALTER TABLE ADD COLUMN` needs for user
+/// tables, applied to the catalog's own.
+fn optional_text(row: &Row, index: usize) -> Result<Option<String>, FerriteError> {
+    match row.values.get(index) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Text(s)) => Ok(Some(s.clone())),
+        _ => Err(catalog_error("corrupt catalog row: expected text or null")),
     }
 }
 
@@ -310,6 +384,61 @@ impl SystemCatalog {
         Ok(id)
     }
 
+    /// Append a column to an existing table's stored schema, joining a
+    /// caller-owned transaction. This is the catalog half of
+    /// `ALTER TABLE … ADD COLUMN`. See [`SystemCatalog::create_table_in`]
+    /// for the abort caveat.
+    ///
+    /// One row is added to `ferrite_columns`, at the next free ordinal —
+    /// the column goes on the end and nothing already stored moves.
+    /// **Rows already written keep the arity they had**: the catalog does
+    /// not touch table data, and the reader is what reconciles the two
+    /// (`ferrite-exec` fills the missing trailing values with the column's
+    /// default). That is Postgres's behaviour too, and it is what makes
+    /// this an `O(1)` operation on a table of any size.
+    pub fn add_column_in(
+        &self,
+        txn: TxnId,
+        table: TableId,
+        column: ColumnDef,
+    ) -> Result<(), FerriteError> {
+        if Self::is_system_table(table) {
+            return Err(FerriteError::PermissionDenied(format!(
+                "table {table} belongs to the system catalog and cannot be altered"
+            )));
+        }
+        if column.name.is_empty() {
+            return Err(catalog_error("column names must not be empty"));
+        }
+        let position = {
+            let cache = self.read_cache()?;
+            let entry = cache
+                .by_id
+                .get(&table)
+                .ok_or_else(|| FerriteError::TableNotFound(table.to_string()))?;
+            if entry.columns.column_index(&column.name).is_some() {
+                return Err(FerriteError::ObjectAlreadyExists(format!(
+                    "column `{}.{}.{}`",
+                    entry.schema, entry.name, column.name
+                )));
+            }
+            entry.columns.columns.len()
+        };
+
+        self.record_column(txn, table, position, &column)?;
+        if let Some(entry) = self.write_cache()?.by_id.get_mut(&table) {
+            entry.columns.columns.push(column);
+        }
+        Ok(())
+    }
+
+    /// [`SystemCatalog::add_column_in`] in a transaction of the catalog's
+    /// own. [`Catalog`] has no `add_column`, so this is an inherent method
+    /// the same way the `*_in` primitives are.
+    pub fn add_column(&self, table: TableId, column: ColumnDef) -> Result<(), FerriteError> {
+        self.in_own_txn(|txn| self.add_column_in(txn, table, column))
+    }
+
     /// [`Catalog::drop_table`], joining a caller-owned transaction. Drops
     /// the table's indexes with it. See [`SystemCatalog::create_table_in`]
     /// for the abort caveat.
@@ -422,18 +551,34 @@ impl SystemCatalog {
 
     fn record_columns(&self, txn: TxnId, id: TableId, schema: &Schema) -> Result<(), FerriteError> {
         for (position, col) in schema.columns.iter().enumerate() {
-            self.storage.insert(
-                txn,
-                COLUMNS_TABLE_ID,
-                Row::new(vec![
-                    Value::Int8(i64::from(id)),
-                    Value::Int4(to_ordinal(position)?),
-                    Value::Text(col.name.clone()),
-                    Value::Text(type_name(col.data_type).to_string()),
-                    Value::Boolean(col.nullable),
-                ]),
-            )?;
+            self.record_column(txn, id, position, col)?;
         }
+        Ok(())
+    }
+
+    fn record_column(
+        &self,
+        txn: TxnId,
+        id: TableId,
+        position: usize,
+        col: &ColumnDef,
+    ) -> Result<(), FerriteError> {
+        let default = match &col.default {
+            Some(default) => Value::Text(encode_default(default, col.data_type)?),
+            None => Value::Null,
+        };
+        self.storage.insert(
+            txn,
+            COLUMNS_TABLE_ID,
+            Row::new(vec![
+                Value::Int8(i64::from(id)),
+                Value::Int4(to_ordinal(position)?),
+                Value::Text(col.name.clone()),
+                Value::Text(type_name(col.data_type).to_string()),
+                Value::Boolean(col.nullable),
+                default,
+            ]),
+        )?;
         Ok(())
     }
 
@@ -444,10 +589,14 @@ impl SystemCatalog {
             let (_, row) = row?;
             let id = object_id(&row, 0)?;
             let position = ordinal(&row, 1)?;
+            let data_type = type_from_name(&text(&row, 3)?)?;
             let def = ColumnDef {
                 name: text(&row, 2)?,
-                data_type: type_from_name(&text(&row, 3)?)?,
+                data_type,
                 nullable: boolean(&row, 4)?,
+                default: optional_text(&row, 5)?
+                    .map(|encoded| decode_default(&encoded, data_type))
+                    .transpose()?,
             };
             columns.entry(id).or_default().push((position, def));
         }

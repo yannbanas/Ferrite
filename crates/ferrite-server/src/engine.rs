@@ -154,6 +154,7 @@ impl SessionHandle {
             sql::Statement::Rollback => self.rollback(),
 
             sql::Statement::CreateTable(_)
+            | sql::Statement::AlterTable(_)
             | sql::Statement::DropTable(_)
             | sql::Statement::CreateIndex(_)
             | sql::Statement::DropIndex(_) => self.in_transaction(|txn| {
@@ -269,8 +270,46 @@ impl SessionHandle {
                         "{namespace}.{name}"
                     )));
                 }
-                catalog.create_table_in(txn, namespace, name, create.to_schema())?;
+                let mut schema = create.to_schema()?;
+                ferrite_planner::typecheck_defaults(&mut schema)?;
+                catalog.create_table_in(txn, namespace, name, schema)?;
                 "CREATE TABLE"
+            }
+
+            sql::Statement::AlterTable(alter) => {
+                let (namespace, name) = alter.name.split(DEFAULT_NAMESPACE);
+                let Some(id) = catalog.table_id(namespace, name)? else {
+                    if alter.if_exists {
+                        return Ok(QueryResult::command(CommandTag::Other(
+                            "ALTER TABLE".into(),
+                        )));
+                    }
+                    return Err(FerriteError::TableNotFound(format!("{namespace}.{name}")));
+                };
+                let sql::AlterTableAction::AddColumn {
+                    if_not_exists,
+                    column,
+                } = &alter.action;
+
+                if *if_not_exists
+                    && catalog
+                        .table_schema(id)?
+                        .column_index(&column.name)
+                        .is_some()
+                {
+                    return Ok(QueryResult::command(CommandTag::Other(
+                        "ALTER TABLE".into(),
+                    )));
+                }
+
+                let mut added = Schema {
+                    columns: vec![column.to_column_def(false)?],
+                };
+                ferrite_planner::typecheck_defaults(&mut added)?;
+                let added = added.columns.remove(0);
+                self.check_addable(txn, id, namespace, name, &added)?;
+                catalog.add_column_in(txn, id, added)?;
+                "ALTER TABLE"
             }
 
             sql::Statement::DropTable(drop) => {
@@ -320,6 +359,42 @@ impl SessionHandle {
             }
         };
         Ok(QueryResult::command(CommandTag::Other(tag.into())))
+    }
+
+    /// Refuse an `ADD COLUMN` whose result would contradict itself.
+    ///
+    /// Existing rows are not rewritten (see
+    /// `SystemCatalog::add_column_in`), so the new column reads back as
+    /// its default on every row already there — and as `NULL` when that
+    /// default is `CURRENT_TIMESTAMP`, which cannot be evaluated for a row
+    /// written before the column existed. Adding a `NOT NULL` column
+    /// without a constant default to a table that has rows would therefore
+    /// publish `NULL` in a column declared not to hold one, so it is
+    /// refused, exactly as PostgreSQL refuses it.
+    fn check_addable(
+        &self,
+        txn: TxnId,
+        table: ferrite_common::TableId,
+        namespace: &str,
+        name: &str,
+        column: &ferrite_common::ColumnDef,
+    ) -> Result<(), FerriteError> {
+        if column.nullable
+            || column
+                .default
+                .as_ref()
+                .is_some_and(|d| d.constant().is_some())
+        {
+            return Ok(());
+        }
+        if self.inner.storage.scan(txn, table)?.next().is_none() {
+            return Ok(());
+        }
+        Err(FerriteError::InvalidDefinition(format!(
+            "column `{}` of {namespace}.{name} is NOT NULL and the table has rows: \
+             add it with a constant DEFAULT, or in two steps",
+            column.name
+        )))
     }
 
     fn describe_statement(&self, text: &str) -> Result<StatementDescription, FerriteError> {

@@ -40,6 +40,7 @@ pub mod rules;
 
 pub use expr::{BinaryOp, Expr};
 pub use logical::{LogicalPlan, ProjectionItem, TableSource};
+pub use lower::typecheck_defaults;
 pub use physical::{bind, PhysExpr, PhysicalPlan};
 pub use planner::{Planner, DEFAULT_NAMESPACE};
 pub use rules::optimize;

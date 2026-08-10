@@ -1,4 +1,4 @@
-use ferrite_common::DataType;
+use ferrite_common::{ColumnDefault, DataType, Value};
 use ferrite_sql::ast::*;
 use ferrite_sql::{parse, parse_statement};
 
@@ -94,7 +94,7 @@ fn create_table_all_types() {
         ]
     );
 
-    let schema = created.to_schema();
+    let schema = created.to_schema().unwrap();
     assert_eq!(schema.columns.len(), 9);
     assert!(!schema.columns[0].nullable, "primary key implies not null");
     assert!(!schema.columns[1].nullable);
@@ -119,7 +119,117 @@ fn create_table_if_not_exists_and_table_constraints() {
             TableConstraint::Unique(vec!["group_id".into()]),
         ]
     );
-    assert!(created.to_schema().columns.iter().all(|c| !c.nullable));
+    assert!(created
+        .to_schema()
+        .unwrap()
+        .columns
+        .iter()
+        .all(|c| !c.nullable));
+}
+
+#[test]
+fn column_defaults_reach_the_schema() {
+    let created = match stmt(
+        "CREATE TABLE users (id UUID PRIMARY KEY, \
+         totp_enabled BIGINT NOT NULL DEFAULT 0, \
+         visibility TEXT NOT NULL DEFAULT 'everyone', \
+         balance DOUBLE PRECISION DEFAULT -1.5, \
+         verified BOOLEAN DEFAULT false, \
+         nickname TEXT DEFAULT NULL, \
+         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+         seen_at TIMESTAMP DEFAULT now(), \
+         bio TEXT)",
+    ) {
+        Statement::CreateTable(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let schema = created.to_schema().unwrap();
+    let of = |name: &str| {
+        schema.columns[schema.column_index(name).expect(name)]
+            .default
+            .clone()
+    };
+    assert_eq!(of("id"), None);
+    assert_eq!(of("bio"), None);
+    assert_eq!(
+        of("totp_enabled"),
+        Some(ColumnDefault::Constant(Value::Int4(0)))
+    );
+    assert_eq!(
+        of("visibility"),
+        Some(ColumnDefault::Constant(Value::Text("everyone".into())))
+    );
+    assert_eq!(
+        of("balance"),
+        Some(ColumnDefault::Constant(Value::Float8(-1.5)))
+    );
+    assert_eq!(
+        of("verified"),
+        Some(ColumnDefault::Constant(Value::Boolean(false)))
+    );
+    assert_eq!(of("nickname"), Some(ColumnDefault::Constant(Value::Null)));
+    assert_eq!(of("created_at"), Some(ColumnDefault::CurrentTimestamp));
+    assert_eq!(of("seen_at"), Some(ColumnDefault::CurrentTimestamp));
+
+    // A default outside the stored subset is an error rather than a
+    // silently dropped clause.
+    for sql in [
+        "CREATE TABLE t (a BIGINT DEFAULT 1 + 1)",
+        "CREATE TABLE t (a BIGINT DEFAULT random())",
+        "CREATE TABLE t (a BIGINT DEFAULT b)",
+        "CREATE TABLE t (a TIMESTAMP DEFAULT now(1))",
+    ] {
+        let Statement::CreateTable(c) = stmt(sql) else {
+            panic!("{sql}");
+        };
+        assert!(c.to_schema().is_err(), "{sql:?} should have been refused");
+    }
+}
+
+#[test]
+fn alter_table_add_column() {
+    let altered = match stmt("ALTER TABLE IF EXISTS public.users ADD COLUMN IF NOT EXISTS bio TEXT")
+    {
+        Statement::AlterTable(a) => a,
+        other => panic!("{other:?}"),
+    };
+    assert!(altered.if_exists);
+    assert_eq!(altered.name.split("public"), ("public", "users"));
+    let AlterTableAction::AddColumn {
+        if_not_exists,
+        column,
+    } = &altered.action;
+    assert!(if_not_exists);
+    assert_eq!(column.name, "bio");
+    assert_eq!(column.data_type, DataType::Text);
+
+    // `COLUMN` is optional, as it is in PostgreSQL.
+    let altered = match stmt("ALTER TABLE t ADD flag BIGINT NOT NULL DEFAULT 0") {
+        Statement::AlterTable(a) => a,
+        other => panic!("{other:?}"),
+    };
+    assert!(!altered.if_exists);
+    let AlterTableAction::AddColumn {
+        if_not_exists,
+        column,
+    } = &altered.action;
+    assert!(!if_not_exists);
+    let def = column.to_column_def(false).unwrap();
+    assert!(!def.nullable);
+    assert_eq!(def.default, Some(ColumnDefault::Constant(Value::Int4(0))));
+
+    // Every other action is named in the error, never accepted as a no-op.
+    for sql in [
+        "ALTER TABLE t DROP COLUMN a",
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE t ALTER COLUMN a TYPE TEXT",
+        "ALTER TABLE t ADD",
+        "ALTER TABLE t ADD COLUMN a",
+        "ALTER TABLE ADD COLUMN a TEXT",
+        "ALTER INDEX i RENAME TO j",
+    ] {
+        rejects(sql);
+    }
 }
 
 #[test]
