@@ -6,19 +6,24 @@ use ferrite_common::{
     Value,
 };
 
+use crate::index::{IndexCatalog, IndexDef, IndexId};
+
 /// `TableId` of the table listing every table, including itself.
 pub const TABLES_TABLE_ID: TableId = 1;
 /// `TableId` of the table listing every column of every table.
 pub const COLUMNS_TABLE_ID: TableId = 2;
+/// `TableId` of the table listing every index.
+pub const INDEXES_TABLE_ID: TableId = 3;
 /// Schema the catalog's own tables live in.
 pub const CATALOG_SCHEMA: &str = "ferrite_catalog";
 /// Schema unqualified names resolve to.
 pub const DEFAULT_SCHEMA: &str = "public";
-/// Ids below this are reserved for catalog tables; user tables start here.
+/// Ids below this are reserved for catalog tables; user objects start here.
 pub const FIRST_USER_TABLE_ID: TableId = 16;
 
 const TABLES_TABLE_NAME: &str = "ferrite_tables";
 const COLUMNS_TABLE_NAME: &str = "ferrite_columns";
+const INDEXES_TABLE_NAME: &str = "ferrite_indexes";
 
 fn catalog_error(message: impl Into<String>) -> FerriteError {
     FerriteError::Storage(format!("catalog: {}", message.into()))
@@ -42,6 +47,19 @@ fn columns_schema() -> Schema {
             column("column_name", DataType::Text),
             column("data_type", DataType::Text),
             column("nullable", DataType::Boolean),
+        ],
+    }
+}
+
+fn indexes_schema() -> Schema {
+    Schema {
+        columns: vec![
+            column("index_id", DataType::Int8),
+            column("table_id", DataType::Int8),
+            column("index_name", DataType::Text),
+            column("ordinal", DataType::Int4),
+            column("column_name", DataType::Text),
+            column("is_unique", DataType::Boolean),
         ],
     }
 }
@@ -88,10 +106,10 @@ fn text(row: &Row, index: usize) -> Result<String, FerriteError> {
     }
 }
 
-fn table_id(row: &Row, index: usize) -> Result<TableId, FerriteError> {
+fn object_id(row: &Row, index: usize) -> Result<TableId, FerriteError> {
     match row.values.get(index) {
         Some(Value::Int8(v)) => TableId::try_from(*v)
-            .map_err(|_| catalog_error(format!("corrupt catalog row: bad table id {v}"))),
+            .map_err(|_| catalog_error(format!("corrupt catalog row: bad object id {v}"))),
         _ => Err(catalog_error("corrupt catalog row: expected int8")),
     }
 }
@@ -111,6 +129,10 @@ fn boolean(row: &Row, index: usize) -> Result<bool, FerriteError> {
     }
 }
 
+fn to_ordinal(index: usize) -> Result<i32, FerriteError> {
+    i32::try_from(index).map_err(|_| catalog_error("too many columns"))
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     id: TableId,
@@ -123,37 +145,81 @@ struct Entry {
 struct Cache {
     by_id: HashMap<TableId, Entry>,
     by_name: HashMap<(String, String), TableId>,
+    indexes: HashMap<IndexId, IndexDef>,
+    index_by_name: HashMap<(String, String), IndexId>,
     next_id: TableId,
 }
 
 impl Cache {
-    fn insert(&mut self, entry: Entry) {
+    fn empty() -> Self {
+        Self {
+            next_id: FIRST_USER_TABLE_ID,
+            ..Self::default()
+        }
+    }
+
+    fn bump(&mut self, id: TableId) {
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+    }
+
+    fn insert_table(&mut self, entry: Entry) {
         self.by_name
             .insert((entry.schema.clone(), entry.name.clone()), entry.id);
-        if entry.id >= self.next_id {
-            self.next_id = entry.id + 1;
-        }
+        self.bump(entry.id);
         self.by_id.insert(entry.id, entry);
     }
 
-    fn remove(&mut self, id: TableId) -> Option<Entry> {
+    fn remove_table(&mut self, id: TableId) -> Option<Entry> {
         let entry = self.by_id.remove(&id)?;
         self.by_name
             .remove(&(entry.schema.clone(), entry.name.clone()));
+        let doomed: Vec<IndexId> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == id)
+            .map(|index| index.id)
+            .collect();
+        for index in doomed {
+            self.remove_index(index);
+        }
         Some(entry)
+    }
+
+    fn insert_index(&mut self, def: IndexDef, schema: &str) {
+        self.index_by_name
+            .insert((schema.to_string(), def.name.clone()), def.id);
+        self.bump(def.id);
+        self.indexes.insert(def.id, def);
+    }
+
+    fn remove_index(&mut self, id: IndexId) -> Option<IndexDef> {
+        let def = self.indexes.remove(&id)?;
+        let schema = self
+            .by_id
+            .get(&def.table)
+            .map(|entry| entry.schema.clone())
+            .unwrap_or_default();
+        self.index_by_name.remove(&(schema, def.name.clone()));
+        Some(def)
     }
 }
 
-/// The system catalog: name resolution and schema lookup, stored as two
-/// ordinary tables through a [`StorageEngine`].
+/// The system catalog: name resolution, schema lookup and index metadata,
+/// stored as ordinary tables through a [`StorageEngine`].
 ///
-/// `ferrite_catalog.ferrite_tables` holds one row per table and
-/// `ferrite_catalog.ferrite_columns` one row per column; both describe
-/// themselves, so a bootstrapped database has no metadata that lives
-/// outside the normal storage path. Storage is the source of truth — an
-/// in-memory index is kept alongside it purely so name lookups on the hot
-/// path do not scan, and [`SystemCatalog::open`] rebuilds that index from
-/// storage alone.
+/// `ferrite_catalog.ferrite_tables`, `ferrite_columns` and
+/// `ferrite_indexes` hold the metadata and describe themselves, so a
+/// bootstrapped database has no metadata living outside the normal
+/// storage path. Storage is the source of truth — an in-memory
+/// index is kept alongside it purely so name lookups on the hot path do
+/// not scan, and [`SystemCatalog::open`] rebuilds that index from storage
+/// alone.
+///
+/// Every method takes `&self` and uses interior mutability, matching the
+/// [`Catalog`] contract: the executor shares one catalog behind an
+/// `Arc`/`&dyn Catalog` across statements and connections.
 pub struct SystemCatalog {
     storage: Arc<dyn StorageEngine>,
     cache: RwLock<Cache>,
@@ -166,10 +232,7 @@ impl SystemCatalog {
     pub fn bootstrap(storage: Arc<dyn StorageEngine>) -> Result<Self, FerriteError> {
         let catalog = Self {
             storage,
-            cache: RwLock::new(Cache {
-                next_id: FIRST_USER_TABLE_ID,
-                ..Cache::default()
-            }),
+            cache: RwLock::new(Cache::empty()),
         };
 
         let txn = catalog.storage.begin()?;
@@ -184,46 +247,160 @@ impl SystemCatalog {
     pub fn open(storage: Arc<dyn StorageEngine>) -> Result<Self, FerriteError> {
         let catalog = Self {
             storage,
-            cache: RwLock::new(Cache {
-                next_id: FIRST_USER_TABLE_ID,
-                ..Cache::default()
-            }),
+            cache: RwLock::new(Cache::empty()),
         };
         catalog.reload()?;
         Ok(catalog)
     }
 
     /// Discard the in-memory index and rebuild it from the catalog
-    /// tables.
+    /// tables. Also the recovery path after a transaction that ran DDL
+    /// through one of the `*_in` methods was aborted.
     pub fn reload(&self) -> Result<(), FerriteError> {
         let txn = self.storage.begin()?;
         let result = self.read_all(txn);
-        let entries = self.finish(txn, result)?;
+        let (tables, indexes) = self.finish(txn, result)?;
 
         let mut cache = self.write_cache()?;
-        *cache = Cache {
-            next_id: FIRST_USER_TABLE_ID,
-            ..Cache::default()
-        };
-        for entry in entries {
-            cache.insert(entry);
+        *cache = Cache::empty();
+        for entry in tables {
+            cache.insert_table(entry);
+        }
+        for def in indexes {
+            let schema = cache
+                .by_id
+                .get(&def.table)
+                .map(|entry| entry.schema.clone())
+                .unwrap_or_default();
+            cache.insert_index(def, &schema);
         }
         Ok(())
     }
 
-    /// The tables the catalog itself is made of, for callers that need to
-    /// treat them specially (`ferrite-exec` refusing writes, for example).
+    /// Whether an id falls in the range reserved for the catalog's own
+    /// objects, for callers that need to treat them specially
+    /// (`ferrite-exec` refusing writes, for example).
     pub fn is_system_table(table: TableId) -> bool {
         table < FIRST_USER_TABLE_ID
     }
 
+    /// [`Catalog::create_table`], but joining a transaction the caller
+    /// owns instead of opening one.
+    ///
+    /// This is the transactional form of catalog DDL: the trait method
+    /// cannot take a `TxnId` (see the crate README), so it wraps this in
+    /// its own transaction. The in-memory index is updated optimistically
+    /// — if `txn` is later aborted, call [`SystemCatalog::reload`].
+    pub fn create_table_in(
+        &self,
+        txn: TxnId,
+        schema: &str,
+        name: &str,
+        columns: Schema,
+    ) -> Result<TableId, FerriteError> {
+        Self::validate_table(schema, name, &columns)?;
+        let id = self.reserve_id(schema, name)?;
+        self.storage.create_table(txn, id)?;
+        self.record_table(txn, id, schema, name)?;
+        self.record_columns(txn, id, &columns)?;
+        self.write_cache()?.insert_table(Entry {
+            id,
+            schema: schema.to_string(),
+            name: name.to_string(),
+            columns,
+        });
+        Ok(id)
+    }
+
+    /// [`Catalog::drop_table`], joining a caller-owned transaction. Drops
+    /// the table's indexes with it. See [`SystemCatalog::create_table_in`]
+    /// for the abort caveat.
+    pub fn drop_table_in(&self, txn: TxnId, table: TableId) -> Result<(), FerriteError> {
+        self.check_droppable(table)?;
+        for index in self.indexes_for(table)? {
+            self.drop_index_in(txn, index.id)?;
+        }
+        self.delete_rows(txn, COLUMNS_TABLE_ID, 0, table)?;
+        self.delete_rows(txn, TABLES_TABLE_ID, 0, table)?;
+        self.storage.drop_table(txn, table)?;
+        self.write_cache()?.remove_table(table);
+        Ok(())
+    }
+
+    /// [`IndexCatalog::create_index`], joining a caller-owned
+    /// transaction. See [`SystemCatalog::create_table_in`] for the abort
+    /// caveat.
+    pub fn create_index_in(
+        &self,
+        txn: TxnId,
+        name: &str,
+        table: TableId,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexId, FerriteError> {
+        let schema = self.validate_index(name, table, columns)?;
+        let id = {
+            let mut cache = self.write_cache()?;
+            let id = cache.next_id;
+            cache.next_id += 1;
+            id
+        };
+        for (position, column) in columns.iter().enumerate() {
+            self.storage.insert(
+                txn,
+                INDEXES_TABLE_ID,
+                Row::new(vec![
+                    Value::Int8(i64::from(id)),
+                    Value::Int8(i64::from(table)),
+                    Value::Text(name.to_string()),
+                    Value::Int4(to_ordinal(position)?),
+                    Value::Text(column.clone()),
+                    Value::Boolean(unique),
+                ]),
+            )?;
+        }
+        self.write_cache()?.insert_index(
+            IndexDef {
+                id,
+                name: name.to_string(),
+                table,
+                columns: columns.to_vec(),
+                unique,
+            },
+            &schema,
+        );
+        Ok(id)
+    }
+
+    /// [`IndexCatalog::drop_index`], joining a caller-owned transaction.
+    /// See [`SystemCatalog::create_table_in`] for the abort caveat.
+    pub fn drop_index_in(&self, txn: TxnId, index: IndexId) -> Result<(), FerriteError> {
+        {
+            let cache = self.read_cache()?;
+            if !cache.indexes.contains_key(&index) {
+                return Err(catalog_error(format!("index {index} does not exist")));
+            }
+        }
+        self.delete_rows(txn, INDEXES_TABLE_ID, 0, index)?;
+        self.write_cache()?.remove_index(index);
+        Ok(())
+    }
+
     fn bootstrap_in(&self, txn: TxnId) -> Result<(), FerriteError> {
-        self.storage.create_table(txn, TABLES_TABLE_ID)?;
-        self.storage.create_table(txn, COLUMNS_TABLE_ID)?;
-        self.record_table(txn, TABLES_TABLE_ID, CATALOG_SCHEMA, TABLES_TABLE_NAME)?;
-        self.record_columns(txn, TABLES_TABLE_ID, &tables_schema())?;
-        self.record_table(txn, COLUMNS_TABLE_ID, CATALOG_SCHEMA, COLUMNS_TABLE_NAME)?;
-        self.record_columns(txn, COLUMNS_TABLE_ID, &columns_schema())?;
+        let catalog_tables = [
+            (TABLES_TABLE_ID, TABLES_TABLE_NAME, tables_schema()),
+            (COLUMNS_TABLE_ID, COLUMNS_TABLE_NAME, columns_schema()),
+            (INDEXES_TABLE_ID, INDEXES_TABLE_NAME, indexes_schema()),
+        ];
+        // Every table must exist before anything is written into them:
+        // the first table's own metadata already needs the columns table.
+        for (id, _, _) in &catalog_tables {
+            self.storage.create_table(txn, *id)?;
+        }
+        for (id, name, schema) in &catalog_tables {
+            self.record_table(txn, *id, CATALOG_SCHEMA, name)?;
+            self.record_columns(txn, *id, schema)?;
+        }
         Ok(())
     }
 
@@ -246,15 +423,13 @@ impl SystemCatalog {
     }
 
     fn record_columns(&self, txn: TxnId, id: TableId, schema: &Schema) -> Result<(), FerriteError> {
-        for (index, col) in schema.columns.iter().enumerate() {
-            let ordinal = i32::try_from(index)
-                .map_err(|_| catalog_error("a table cannot have that many columns"))?;
+        for (position, col) in schema.columns.iter().enumerate() {
             self.storage.insert(
                 txn,
                 COLUMNS_TABLE_ID,
                 Row::new(vec![
                     Value::Int8(i64::from(id)),
-                    Value::Int4(ordinal),
+                    Value::Int4(to_ordinal(position)?),
                     Value::Text(col.name.clone()),
                     Value::Text(type_name(col.data_type).to_string()),
                     Value::Boolean(col.nullable),
@@ -264,27 +439,28 @@ impl SystemCatalog {
         Ok(())
     }
 
-    fn read_all(&self, txn: TxnId) -> Result<Vec<Entry>, FerriteError> {
+    #[allow(clippy::type_complexity)]
+    fn read_all(&self, txn: TxnId) -> Result<(Vec<Entry>, Vec<IndexDef>), FerriteError> {
         let mut columns: HashMap<TableId, Vec<(usize, ColumnDef)>> = HashMap::new();
         for row in self.storage.scan(txn, COLUMNS_TABLE_ID)? {
             let (_, row) = row?;
-            let id = table_id(&row, 0)?;
-            let ordinal = ordinal(&row, 1)?;
+            let id = object_id(&row, 0)?;
+            let position = ordinal(&row, 1)?;
             let def = ColumnDef {
                 name: text(&row, 2)?,
                 data_type: type_from_name(&text(&row, 3)?)?,
                 nullable: boolean(&row, 4)?,
             };
-            columns.entry(id).or_default().push((ordinal, def));
+            columns.entry(id).or_default().push((position, def));
         }
 
-        let mut entries = Vec::new();
+        let mut tables = Vec::new();
         for row in self.storage.scan(txn, TABLES_TABLE_ID)? {
             let (_, row) = row?;
-            let id = table_id(&row, 0)?;
+            let id = object_id(&row, 0)?;
             let mut cols = columns.remove(&id).unwrap_or_default();
-            cols.sort_by_key(|(ordinal, _)| *ordinal);
-            entries.push(Entry {
+            cols.sort_by_key(|(position, _)| *position);
+            tables.push(Entry {
                 id,
                 schema: text(&row, 1)?,
                 name: text(&row, 2)?,
@@ -293,7 +469,35 @@ impl SystemCatalog {
                 },
             });
         }
-        Ok(entries)
+
+        let mut parts: HashMap<IndexId, (String, TableId, bool, Vec<(usize, String)>)> =
+            HashMap::new();
+        for row in self.storage.scan(txn, INDEXES_TABLE_ID)? {
+            let (_, row) = row?;
+            let id = object_id(&row, 0)?;
+            let entry = parts
+                .entry(id)
+                .or_insert_with(|| (String::new(), 0, false, Vec::new()));
+            entry.0 = text(&row, 2)?;
+            entry.1 = object_id(&row, 1)?;
+            entry.2 = boolean(&row, 5)?;
+            entry.3.push((ordinal(&row, 3)?, text(&row, 4)?));
+        }
+        let indexes = parts
+            .into_iter()
+            .map(|(id, (name, table, unique, mut cols))| {
+                cols.sort_by_key(|(position, _)| *position);
+                IndexDef {
+                    id,
+                    name,
+                    table,
+                    columns: cols.into_iter().map(|(_, name)| name).collect(),
+                    unique,
+                }
+            })
+            .collect();
+
+        Ok((tables, indexes))
     }
 
     /// Commit `txn` when `result` is `Ok`, abort it otherwise. Abort
@@ -311,6 +515,22 @@ impl SystemCatalog {
         }
     }
 
+    /// Run `body` in a transaction of the catalog's own, rolling the
+    /// in-memory index back by reloading if it fails.
+    fn in_own_txn<T>(
+        &self,
+        body: impl FnOnce(TxnId) -> Result<T, FerriteError>,
+    ) -> Result<T, FerriteError> {
+        let txn = self.storage.begin()?;
+        match self.finish(txn, body(txn)) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let _ = self.reload();
+                Err(err)
+            }
+        }
+    }
+
     fn read_cache(&self) -> Result<RwLockReadGuard<'_, Cache>, FerriteError> {
         self.cache
             .read()
@@ -323,7 +543,36 @@ impl SystemCatalog {
             .map_err(|_| catalog_error("index lock poisoned"))
     }
 
-    fn validate(schema: &str, name: &str, columns: &Schema) -> Result<(), FerriteError> {
+    /// Claim the next object id while holding the write lock, so two
+    /// concurrent creates cannot be handed the same one.
+    fn reserve_id(&self, schema: &str, name: &str) -> Result<TableId, FerriteError> {
+        let mut cache = self.write_cache()?;
+        if cache
+            .by_name
+            .contains_key(&(schema.to_string(), name.to_string()))
+        {
+            return Err(catalog_error(format!(
+                "table `{schema}.{name}` already exists"
+            )));
+        }
+        let id = cache.next_id;
+        cache.next_id += 1;
+        Ok(id)
+    }
+
+    fn check_droppable(&self, table: TableId) -> Result<(), FerriteError> {
+        if Self::is_system_table(table) {
+            return Err(FerriteError::PermissionDenied(format!(
+                "table {table} belongs to the system catalog and cannot be dropped"
+            )));
+        }
+        if !self.read_cache()?.by_id.contains_key(&table) {
+            return Err(FerriteError::TableNotFound(table.to_string()));
+        }
+        Ok(())
+    }
+
+    fn validate_table(schema: &str, name: &str, columns: &Schema) -> Result<(), FerriteError> {
         if schema.is_empty() || name.is_empty() {
             return Err(catalog_error("schema and table names must not be empty"));
         }
@@ -335,56 +584,83 @@ impl SystemCatalog {
         if columns.columns.is_empty() {
             return Err(catalog_error("a table needs at least one column"));
         }
-        for (index, col) in columns.columns.iter().enumerate() {
+        for (position, col) in columns.columns.iter().enumerate() {
             if col.name.is_empty() {
                 return Err(catalog_error("column names must not be empty"));
             }
-            if columns.columns[..index].iter().any(|c| c.name == col.name) {
+            if columns.columns[..position]
+                .iter()
+                .any(|c| c.name == col.name)
+            {
                 return Err(catalog_error(format!("duplicate column `{}`", col.name)));
             }
         }
         Ok(())
     }
 
-    /// Row ids in `table` whose column `index` holds this table id.
-    fn rows_for_table(
+    /// Returns the schema the index will live in (its table's).
+    fn validate_index(
+        &self,
+        name: &str,
+        table: TableId,
+        columns: &[String],
+    ) -> Result<String, FerriteError> {
+        if name.is_empty() {
+            return Err(catalog_error("index names must not be empty"));
+        }
+        if columns.is_empty() {
+            return Err(catalog_error("an index needs at least one column"));
+        }
+        let cache = self.read_cache()?;
+        let entry = cache
+            .by_id
+            .get(&table)
+            .ok_or_else(|| FerriteError::TableNotFound(table.to_string()))?;
+        if Self::is_system_table(table) {
+            return Err(FerriteError::PermissionDenied(format!(
+                "table {table} belongs to the system catalog and cannot be indexed"
+            )));
+        }
+        for (position, column) in columns.iter().enumerate() {
+            if entry.columns.column_index(column).is_none() {
+                return Err(FerriteError::ColumnNotFound(column.clone()));
+            }
+            if columns[..position].contains(column) {
+                return Err(catalog_error(format!(
+                    "duplicate column `{column}` in index `{name}`"
+                )));
+            }
+        }
+        if cache
+            .index_by_name
+            .contains_key(&(entry.schema.clone(), name.to_string()))
+        {
+            return Err(catalog_error(format!(
+                "index `{}.{name}` already exists",
+                entry.schema
+            )));
+        }
+        Ok(entry.schema.clone())
+    }
+
+    /// Delete every row of `table` whose column `column` holds `wanted`.
+    fn delete_rows(
         &self,
         txn: TxnId,
         table: TableId,
+        column: usize,
         wanted: TableId,
-    ) -> Result<Vec<RowId>, FerriteError> {
-        let mut ids = Vec::new();
+    ) -> Result<(), FerriteError> {
+        let mut doomed = Vec::new();
         for row in self.storage.scan(txn, table)? {
             let (row_id, row) = row?;
-            if table_id(&row, 0)? == wanted {
-                ids.push(row_id);
+            if object_id(&row, column)? == wanted {
+                doomed.push(row_id);
             }
         }
-        Ok(ids)
-    }
-
-    fn create_in(
-        &self,
-        txn: TxnId,
-        id: TableId,
-        schema: &str,
-        name: &str,
-        columns: &Schema,
-    ) -> Result<(), FerriteError> {
-        self.storage.create_table(txn, id)?;
-        self.record_table(txn, id, schema, name)?;
-        self.record_columns(txn, id, columns)?;
-        Ok(())
-    }
-
-    fn drop_in(&self, txn: TxnId, id: TableId) -> Result<(), FerriteError> {
-        for row_id in self.rows_for_table(txn, COLUMNS_TABLE_ID, id)? {
-            self.storage.delete(txn, COLUMNS_TABLE_ID, row_id)?;
+        for row_id in doomed {
+            self.storage.delete(txn, table, row_id)?;
         }
-        for row_id in self.rows_for_table(txn, TABLES_TABLE_ID, id)? {
-            self.storage.delete(txn, TABLES_TABLE_ID, row_id)?;
-        }
-        self.storage.drop_table(txn, id)?;
         Ok(())
     }
 }
@@ -413,58 +689,11 @@ impl Catalog for SystemCatalog {
         name: &str,
         columns: Schema,
     ) -> Result<TableId, FerriteError> {
-        Self::validate(schema, name, &columns)?;
-
-        let id = {
-            let mut cache = self.write_cache()?;
-            if cache
-                .by_name
-                .contains_key(&(schema.to_string(), name.to_string()))
-            {
-                return Err(catalog_error(format!(
-                    "table `{schema}.{name}` already exists"
-                )));
-            }
-            let id = cache.next_id;
-            // Reserve the id while still holding the lock so two
-            // concurrent creates cannot hand out the same one.
-            cache.next_id += 1;
-            id
-        };
-
-        let txn = self.storage.begin()?;
-        let result = self.create_in(txn, id, schema, name, &columns);
-        self.finish(txn, result)?;
-
-        let mut cache = self.write_cache()?;
-        cache.insert(Entry {
-            id,
-            schema: schema.to_string(),
-            name: name.to_string(),
-            columns,
-        });
-        Ok(id)
+        self.in_own_txn(|txn| self.create_table_in(txn, schema, name, columns))
     }
 
     fn drop_table(&self, table: TableId) -> Result<(), FerriteError> {
-        if Self::is_system_table(table) {
-            return Err(FerriteError::PermissionDenied(format!(
-                "table {table} belongs to the system catalog and cannot be dropped"
-            )));
-        }
-        {
-            let cache = self.read_cache()?;
-            if !cache.by_id.contains_key(&table) {
-                return Err(FerriteError::TableNotFound(table.to_string()));
-            }
-        }
-
-        let txn = self.storage.begin()?;
-        let result = self.drop_in(txn, table);
-        self.finish(txn, result)?;
-
-        self.write_cache()?.remove(table);
-        Ok(())
+        self.in_own_txn(|txn| self.drop_table_in(txn, table))
     }
 
     fn list_tables(&self, schema: &str) -> Result<Vec<(TableId, String)>, FerriteError> {
@@ -477,5 +706,46 @@ impl Catalog for SystemCatalog {
             .collect();
         tables.sort_by(|a, b| a.1.cmp(&b.1));
         Ok(tables)
+    }
+}
+
+impl IndexCatalog for SystemCatalog {
+    fn create_index(
+        &self,
+        name: &str,
+        table: TableId,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexId, FerriteError> {
+        self.in_own_txn(|txn| self.create_index_in(txn, name, table, columns, unique))
+    }
+
+    fn drop_index(&self, index: IndexId) -> Result<(), FerriteError> {
+        self.in_own_txn(|txn| self.drop_index_in(txn, index))
+    }
+
+    fn index(&self, index: IndexId) -> Result<Option<IndexDef>, FerriteError> {
+        Ok(self.read_cache()?.indexes.get(&index).cloned())
+    }
+
+    fn index_by_name(&self, schema: &str, name: &str) -> Result<Option<IndexDef>, FerriteError> {
+        let cache = self.read_cache()?;
+        Ok(cache
+            .index_by_name
+            .get(&(schema.to_string(), name.to_string()))
+            .and_then(|id| cache.indexes.get(id))
+            .cloned())
+    }
+
+    fn indexes_for(&self, table: TableId) -> Result<Vec<IndexDef>, FerriteError> {
+        let cache = self.read_cache()?;
+        let mut found: Vec<IndexDef> = cache
+            .indexes
+            .values()
+            .filter(|def| def.table == table)
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found)
     }
 }

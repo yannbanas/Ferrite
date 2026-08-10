@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use ferrite_catalog::memory::MemoryStorage;
 use ferrite_catalog::{
-    SystemCatalog, CATALOG_SCHEMA, COLUMNS_TABLE_ID, FIRST_USER_TABLE_ID, TABLES_TABLE_ID,
+    IndexCatalog, SystemCatalog, CATALOG_SCHEMA, COLUMNS_TABLE_ID, FIRST_USER_TABLE_ID,
+    INDEXES_TABLE_ID, TABLES_TABLE_ID,
 };
 use ferrite_common::{Catalog, ColumnDef, DataType, FerriteError, Schema, StorageEngine};
 
@@ -40,6 +41,7 @@ fn bootstrap_creates_self_describing_catalog_tables() {
 
     assert!(storage.table_exists(TABLES_TABLE_ID).unwrap());
     assert!(storage.table_exists(COLUMNS_TABLE_ID).unwrap());
+    assert!(storage.table_exists(INDEXES_TABLE_ID).unwrap());
 
     assert_eq!(
         catalog.table_id(CATALOG_SCHEMA, "ferrite_tables").unwrap(),
@@ -63,14 +65,16 @@ fn bootstrap_creates_self_describing_catalog_tables() {
     assert_eq!(columns.columns.len(), 5);
     assert_eq!(columns.columns[4].data_type, DataType::Boolean);
 
-    // Two tables, and one row per column of each.
-    assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), 2);
-    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), 8);
+    // Three catalog tables, and one row per column of each.
+    assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), 3);
+    assert_eq!(storage.rows(COLUMNS_TABLE_ID).unwrap().len(), 3 + 5 + 6);
+    assert!(storage.rows(INDEXES_TABLE_ID).unwrap().is_empty());
 
     assert_eq!(
         catalog.list_tables(CATALOG_SCHEMA).unwrap(),
         vec![
             (COLUMNS_TABLE_ID, "ferrite_columns".to_string()),
+            (INDEXES_TABLE_ID, "ferrite_indexes".to_string()),
             (TABLES_TABLE_ID, "ferrite_tables".to_string()),
         ]
     );
@@ -115,7 +119,7 @@ fn create_allocates_distinct_ids_and_a_storage_table() {
     for id in [a, b, c] {
         assert!(storage.table_exists(id).unwrap());
     }
-    assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), 5);
+    assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), 6);
 }
 
 #[test]
@@ -203,7 +207,7 @@ fn drop_unknown_or_system_table_is_rejected() {
         catalog.drop_table(9999),
         Err(FerriteError::TableNotFound(_))
     ));
-    for id in [TABLES_TABLE_ID, COLUMNS_TABLE_ID] {
+    for id in [TABLES_TABLE_ID, COLUMNS_TABLE_ID, INDEXES_TABLE_ID] {
         assert!(
             matches!(
                 catalog.drop_table(id),
@@ -396,4 +400,247 @@ fn memory_storage_rolls_back_on_abort() {
         storage.insert(txn, 100, ferrite_common::Row::new(vec![])),
         Err(FerriteError::TxnNotActive(_))
     ));
+}
+
+#[test]
+fn index_create_lookup_and_drop() {
+    let (storage, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+
+    assert!(catalog.indexes_for(table).unwrap().is_empty());
+
+    let id = catalog
+        .create_index("users_email_idx", table, &["email".to_string()], true)
+        .unwrap();
+    let by_columns = catalog
+        .create_index(
+            "users_age_email_idx",
+            table,
+            &["age".to_string(), "email".to_string()],
+            false,
+        )
+        .unwrap();
+    assert_ne!(id, by_columns);
+    assert_ne!(id, table, "indexes and tables share one id space");
+
+    let def = catalog.index(id).unwrap().expect("the index");
+    assert_eq!(def.name, "users_email_idx");
+    assert_eq!(def.table, table);
+    assert_eq!(def.columns, vec!["email".to_string()]);
+    assert!(def.unique);
+
+    assert_eq!(
+        catalog
+            .index_by_name("public", "users_email_idx")
+            .unwrap()
+            .map(|d| d.id),
+        Some(id)
+    );
+    assert!(catalog
+        .index_by_name("app", "users_email_idx")
+        .unwrap()
+        .is_none());
+
+    let names: Vec<String> = catalog
+        .indexes_for(table)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "users_age_email_idx".to_string(),
+            "users_email_idx".to_string()
+        ]
+    );
+
+    // One stored row per index column.
+    assert_eq!(storage.rows(INDEXES_TABLE_ID).unwrap().len(), 3);
+
+    catalog.drop_index(id).unwrap();
+    assert!(catalog.index(id).unwrap().is_none());
+    assert_eq!(catalog.indexes_for(table).unwrap().len(), 1);
+    assert_eq!(storage.rows(INDEXES_TABLE_ID).unwrap().len(), 2);
+}
+
+#[test]
+fn index_key_order_survives_a_reopen() {
+    let storage = Arc::new(MemoryStorage::new());
+    let (table, id) = {
+        let catalog = SystemCatalog::bootstrap(storage.clone()).unwrap();
+        let table = catalog.create_table("public", "users", users()).unwrap();
+        let id = catalog
+            .create_index(
+                "composite",
+                table,
+                &["profile".to_string(), "id".to_string(), "age".to_string()],
+                false,
+            )
+            .unwrap();
+        (table, id)
+    };
+
+    let reopened = SystemCatalog::open(storage).unwrap();
+    let def = reopened.index(id).unwrap().expect("the index");
+    assert_eq!(
+        def.columns,
+        vec!["profile".to_string(), "id".to_string(), "age".to_string()],
+        "key order must round-trip through storage"
+    );
+    assert_eq!(def.table, table);
+    assert!(!def.unique);
+    assert_eq!(
+        reopened
+            .index_by_name("public", "composite")
+            .unwrap()
+            .map(|d| d.id),
+        Some(id)
+    );
+}
+
+#[test]
+fn invalid_indexes_are_rejected() {
+    let (_, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let columns = vec!["email".to_string()];
+
+    assert!(catalog.create_index("", table, &columns, false).is_err());
+    assert!(catalog.create_index("i", table, &[], false).is_err());
+    assert!(matches!(
+        catalog.create_index("i", 9999, &columns, false),
+        Err(FerriteError::TableNotFound(_))
+    ));
+    assert!(matches!(
+        catalog.create_index("i", table, &["nope".to_string()], false),
+        Err(FerriteError::ColumnNotFound(_))
+    ));
+    assert!(catalog
+        .create_index(
+            "i",
+            table,
+            &["email".to_string(), "email".to_string()],
+            false
+        )
+        .is_err());
+    assert!(matches!(
+        catalog.create_index("i", TABLES_TABLE_ID, &["table_id".to_string()], false),
+        Err(FerriteError::PermissionDenied(_))
+    ));
+
+    catalog
+        .create_index("taken", table, &columns, false)
+        .unwrap();
+    assert!(catalog
+        .create_index("taken", table, &columns, false)
+        .is_err());
+
+    // Only the one valid index was created.
+    assert_eq!(catalog.indexes_for(table).unwrap().len(), 1);
+}
+
+#[test]
+fn dropping_a_table_drops_its_indexes() {
+    let (storage, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let keep = catalog.create_table("public", "other", users()).unwrap();
+    let doomed = catalog
+        .create_index("users_email_idx", table, &["email".to_string()], true)
+        .unwrap();
+    let survivor = catalog
+        .create_index("other_email_idx", keep, &["email".to_string()], false)
+        .unwrap();
+
+    catalog.drop_table(table).unwrap();
+
+    assert!(catalog.index(doomed).unwrap().is_none());
+    assert!(catalog
+        .index_by_name("public", "users_email_idx")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        catalog.index(survivor).unwrap().map(|d| d.id),
+        Some(survivor)
+    );
+    assert_eq!(storage.rows(INDEXES_TABLE_ID).unwrap().len(), 1);
+
+    // The name is free again.
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    catalog
+        .create_index("users_email_idx", table, &["email".to_string()], true)
+        .unwrap();
+}
+
+#[test]
+fn ddl_can_join_a_caller_owned_transaction() {
+    let storage = Arc::new(MemoryStorage::new());
+    let catalog = SystemCatalog::bootstrap(storage.clone()).unwrap();
+
+    // Committed: the whole DDL batch lands.
+    let txn = storage.begin().unwrap();
+    let table = catalog
+        .create_table_in(txn, "public", "users", users())
+        .unwrap();
+    catalog
+        .create_index_in(txn, "users_email_idx", table, &["email".to_string()], true)
+        .unwrap();
+    storage.commit(txn).unwrap();
+
+    catalog.reload().unwrap();
+    assert_eq!(catalog.table_id("public", "users").unwrap(), Some(table));
+    assert_eq!(catalog.indexes_for(table).unwrap().len(), 1);
+
+    // Aborted: nothing lands, and `reload` is what puts the in-memory
+    // index back in step with storage.
+    let txn = storage.begin().unwrap();
+    let rolled_back = catalog
+        .create_table_in(txn, "public", "temporary", users())
+        .unwrap();
+    storage.abort(txn).unwrap();
+    catalog.reload().unwrap();
+
+    assert_eq!(catalog.table_id("public", "temporary").unwrap(), None);
+    assert!(matches!(
+        catalog.table_schema(rolled_back),
+        Err(FerriteError::TableNotFound(_))
+    ));
+    assert_eq!(
+        catalog.list_tables("public").unwrap(),
+        vec![(table, "users".to_string())]
+    );
+}
+
+#[test]
+fn a_failed_create_leaves_the_index_consistent() {
+    let (storage, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let tables_before = storage.rows(TABLES_TABLE_ID).unwrap().len();
+    let indexes_before = storage.rows(INDEXES_TABLE_ID).unwrap().len();
+
+    assert!(catalog
+        .create_index("bad", table, &["nope".to_string()], false)
+        .is_err());
+    assert!(catalog.create_table("public", "users", users()).is_err());
+
+    assert_eq!(storage.rows(TABLES_TABLE_ID).unwrap().len(), tables_before);
+    assert_eq!(
+        storage.rows(INDEXES_TABLE_ID).unwrap().len(),
+        indexes_before
+    );
+    assert_eq!(catalog.indexes_for(table).unwrap().len(), 0);
+    assert_eq!(catalog.table_id("public", "users").unwrap(), Some(table));
+}
+
+#[test]
+fn usable_behind_an_index_catalog_trait_object() {
+    let (_, catalog) = fresh();
+    let table = catalog.create_table("public", "users", users()).unwrap();
+    let boxed: Box<dyn IndexCatalog> = Box::new(catalog);
+    let id = boxed
+        .create_index("i", table, &["email".to_string()], false)
+        .unwrap();
+    assert_eq!(boxed.indexes_for(table).unwrap().len(), 1);
+    boxed.drop_index(id).unwrap();
+    assert!(boxed.indexes_for(table).unwrap().is_empty());
+    assert!(boxed.drop_index(id).is_err());
 }
