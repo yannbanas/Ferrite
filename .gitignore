@@ -1,1 +1,6 @@
 /target
+# cargo-fuzz builds in its own workspace and stores corpora next to it.
+crates/*/fuzz/target
+crates/*/fuzz/corpus
+crates/*/fuzz/artifacts
+crates/*/fuzz/coverage

@@ -10,15 +10,19 @@ description = "Binary: wires storage + catalog + planner/exec/proc + protocol to
 name = "ferrite-server"
 path = "src/main.rs"
 
+# The engine crates (ferrite-storage, ferrite-catalog, ferrite-sql,
+# ferrite-planner, ferrite-exec, ferrite-proc) are deliberately absent for
+# now: they are still scaffolds, and depending on them would only couple
+# this binary's build to work in progress. They come back in as soon as
+# `ferrite-exec` exposes something that implements `QueryHandler` — see the
+# crate README, §Wiring status.
 [dependencies]
-ferrite-common.workspace = true
-ferrite-storage.workspace = true
-ferrite-catalog.workspace = true
-ferrite-sql.workspace = true
-ferrite-planner.workspace = true
-ferrite-exec.workspace = true
-ferrite-proc.workspace = true
 ferrite-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rcgen = "0.13"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-postgres = "0.7"
