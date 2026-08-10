@@ -242,12 +242,34 @@ c'est la cible de réécriture des trois recherches `LIKE` de PawChat, listées
 dans `docs/pawchat-sql-audit.md`. `LIKE` n'a **pas** été rendu insensible,
 la casse étant le bon comportement partout ailleurs.
 
-Le risque le plus sérieux avant une mise en production n'est pas dialectal :
-`ferrite-storage` n'ayant pas encore d'index secondaire, **aucune contrainte
-`PRIMARY KEY` ou `UNIQUE` n'est appliquée**. Le catalogue les enregistre —
-c'est ce qui donne sa cible à `INSERT OR IGNORE` — mais une écriture qui les
-viole passe. Le replay le montre : réinsérer la ligne `users` de PawChat
-crée un doublon que SQLite refuserait deux fois.
+~~Le risque le plus sérieux avant une mise en production n'est pas dialectal :
+`ferrite-storage` n'ayant pas encore d'index secondaire, aucune contrainte
+`PRIMARY KEY` ou `UNIQUE` n'est appliquée.~~ — *corrigé.* Les contraintes
+d'unicité sont désormais **réellement appliquées** (`23505` sur violation),
+sans index secondaire pour autant : c'est le moteur de stockage qui vérifie,
+sous son verrou, juste avant l'écriture qu'il protège. Deux propriétés que
+l'exécuteur ne pouvait pas se donner tout seul, et qui sont testées
+séparément (`crates/ferrite-storage/tests/unique.rs`) :
+
+- **la vérification voit plus large qu'un snapshot** — une ligne validée
+  après la prise de snapshot, ou écrite par une transaction encore en vol,
+  est invisible d'un `scan` et laissait passer le doublon ; l'unicité est
+  une propriété de la table, pas d'une vue ;
+- **vérification et écriture sont un seul pas** — vérifier puis écrire est
+  un TOCTOU classique : deux transactions concurrentes ne trouvaient rien
+  chacune de son côté et écrivaient toutes les deux.
+
+Le coût d'un scan complet par écriture est évité par un cache négatif de
+hachages de clés (`crates/ferrite-storage/src/unique.rs`) : un sur-ensemble
+des clés vivantes, donc une absence y est une preuve d'absence et le scan
+n'a lieu que sur suspicion de conflit. Sa justesse ne dépend que de
+l'invariant de sur-ensemble, jamais de sa précision.
+
+Limite assumée : une ligne en cours de suppression par une transaction
+encore en vol est comptée comme présente. PostgreSQL attendrait cette
+transaction ; sans gestionnaire de verrous pour attendre, refuser est la
+seule réponse qui ne peut pas produire de doublon — trop stricte, jamais
+fausse.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 

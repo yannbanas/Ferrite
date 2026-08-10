@@ -167,6 +167,42 @@ aborted `xmax`es are cleared, and versions deleted by a transaction older
 than every live snapshot are discarded. When a chain empties, the key leaves
 the tree.
 
+## Unique constraints
+
+Ferrite has no secondary indexes yet, so there is no B-tree to make a
+duplicate key impossible by construction. `insert_unique`/`update_unique`
+enforce it anyway, and they live behind the `StorageEngine` trait rather
+than above it because two of the guarantees cannot be reconstructed from
+outside:
+
+- **The check ignores the caller's snapshot.** A row committed after the
+  writer's snapshot was taken, or written by a transaction still in flight,
+  is invisible to `scan` — checking through one would let the duplicate in.
+  Uniqueness is a property of the table, which is why PostgreSQL's unique
+  index does not consult a snapshot either.
+- **The check and the write share one acquisition of the engine lock.**
+  Checking first and writing after is a time-of-check/time-of-use race:
+  two transactions inserting the same key would both find nothing.
+
+A version counts as present unless its creator aborted, or its deleter
+committed, or its deleter is the checking transaction itself. A row being
+deleted by a transaction still in flight is therefore counted as present:
+PostgreSQL would wait on that transaction and admit the insert if the
+delete commits, and with no lock manager to wait on, refusing is the only
+answer that cannot produce a duplicate. Over-strict, never wrong.
+
+Scanning the table on every write would make a bulk load quadratic, so a
+negative cache (`src/unique.rs`) sits in front. It holds, per constraint, a
+set of key hashes that is a **superset** of the live keys: a hash it does
+not hold cannot be in the table, and the write proceeds with no scan. A
+hash it does hold only means "look properly". Correctness rests on the
+superset invariant alone — never on precision — so the maintenance rules
+are blunt: a checked write records its hash, a write that skipped the check
+invalidates the table's caches, and a delete needs nothing (removing a row
+only makes the set more of a superset). The cache is per process, capped at
+`StorageConfig::unique_filter_capacity` entries, and rebuilt by one scan on
+first use.
+
 ## Journal
 
 `docs/architecture.md` left the journal format to this crate. Ferrite v1
@@ -236,12 +272,17 @@ visibility logic, only who may touch a page.
 
 ## Configuration
 
-`StorageConfig` has two knobs: `cache_pages` (default 1024, i.e. 8 MiB) and
-`fsync` (default on). Turning `fsync` off trades durability for speed and is
-only appropriate for data you are willing to lose.
+`StorageConfig` has three knobs: `cache_pages` (default 1024, i.e. 8 MiB),
+`fsync` (default on), and `unique_filter_capacity` (default 2^20 hashes per
+constraint). Turning `fsync` off trades durability for speed and is only
+appropriate for data you are willing to lose; lowering the filter capacity
+trades scans for memory and never changes which writes are accepted.
 
 ## Known limitations
 
+- **A unique constraint costs a scan on the first write of each process,
+  and on any write whose key hash the negative cache holds.** A real
+  secondary index removes both.
 - **No node merging.** Deletions leave underfull B-tree nodes in place.
   Space comes back when a table is dropped, not when its rows are.
 - **Aborted DDL leaks pages.** A `create_table` that is rolled back leaves

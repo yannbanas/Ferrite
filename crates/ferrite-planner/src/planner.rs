@@ -1,7 +1,8 @@
 //! Rule-based planner: `ferrite-sql` AST -> logical plan -> physical plan.
 
 use ferrite_common::{
-    Catalog, ColumnDef, ColumnDefault, FerriteError, IndexCatalog, IndexDef, Schema, Value,
+    Catalog, ColumnDef, ColumnDefault, FerriteError, IndexCatalog, IndexDef, Schema, TableId,
+    UniqueKey, Value,
 };
 use ferrite_sql::ast as sql;
 
@@ -735,6 +736,7 @@ impl<'a> Planner<'a> {
                 let on_conflict = on_conflict
                     .map(|clause| bind_on_conflict(clause, &conflict_scope))
                     .transpose()?;
+                let unique = self.unique_keys(source.id, &source.schema)?;
                 Ok((
                     PhysicalPlan::Insert {
                         table: source.id,
@@ -742,6 +744,7 @@ impl<'a> Planner<'a> {
                         schema: source.schema,
                         rows,
                         on_conflict,
+                        unique,
                     },
                     Scope::empty(),
                 ))
@@ -758,6 +761,7 @@ impl<'a> Planner<'a> {
                     .iter()
                     .map(|(position, expr)| Ok((*position, bind(expr, &scope)?)))
                     .collect::<Result<Vec<_>, FerriteError>>()?;
+                let unique = self.unique_keys(source.id, &source.schema)?;
                 Ok((
                     PhysicalPlan::Update {
                         table: source.id,
@@ -765,6 +769,7 @@ impl<'a> Planner<'a> {
                         schema: source.schema,
                         source: Box::new(scan),
                         assignments,
+                        unique,
                     },
                     Scope::empty(),
                 ))
@@ -813,6 +818,38 @@ impl<'a> Planner<'a> {
     /// else stays as a residual filter. Range predicates never select an
     /// index in v1 — an equality lookup is the only access path
     /// `ferrite-storage` is asked to provide beyond a full scan.
+    /// Every unique index the catalog records on `table`, with its columns
+    /// resolved to positions in `schema`.
+    ///
+    /// An index naming a column the table no longer has is skipped rather
+    /// than raising: it cannot be violated by a row that has no such
+    /// value, and refusing every write to the table because a stale index
+    /// entry survived a schema change would be the worse failure.
+    fn unique_keys(&self, table: TableId, schema: &Schema) -> Result<Vec<UniqueKey>, FerriteError> {
+        let mut out = Vec::new();
+        for index in self.indexes.indexes_for(table)? {
+            if !index.unique {
+                continue;
+            }
+            let positions: Option<Vec<usize>> = index
+                .columns
+                .iter()
+                .map(|name| schema.column_index(name))
+                .collect();
+            match positions {
+                Some(columns) if !columns.is_empty() => {
+                    out.push(UniqueKey::new(index.name, columns))
+                }
+                _ => tracing::warn!(
+                    index = %index.name,
+                    table,
+                    "unique index names a column the table does not have: not enforced"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     fn access_path(
         &self,
         source: &TableSource,

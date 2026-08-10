@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use ferrite_common::{
     Catalog, ColumnDefault, DataType, FerriteError, Identity, Permission, Row, RowId, Schema,
-    StorageEngine, TableId, TxnId, Value,
+    StorageEngine, TableId, TxnId, UniqueKey, Value,
 };
 use ferrite_planner::{
     JoinType, PhysConflictAction, PhysExpr, PhysOnConflict, PhysSortKey, PhysicalPlan,
@@ -125,6 +125,7 @@ impl<'a> Session<'a> {
                 schema,
                 rows,
                 on_conflict,
+                unique,
             } => {
                 self.procs
                     .authorize(self.identity, txn, Permission::Insert)?;
@@ -141,7 +142,15 @@ impl<'a> Session<'a> {
                         .authorize(self.identity, txn, Permission::Update)?;
                 }
                 self.check_schema(*table, table_name, schema)?;
-                self.run_insert(txn, *table, table_name, schema, rows, on_conflict.as_ref())
+                self.run_insert(
+                    txn,
+                    *table,
+                    table_name,
+                    schema,
+                    rows,
+                    on_conflict.as_ref(),
+                    unique,
+                )
             }
 
             PhysicalPlan::Update {
@@ -150,11 +159,12 @@ impl<'a> Session<'a> {
                 schema,
                 source,
                 assignments,
+                unique,
             } => {
                 self.procs
                     .authorize(self.identity, txn, Permission::Update)?;
                 self.check_schema(*table, table_name, schema)?;
-                self.run_update(txn, *table, table_name, schema, source, assignments)
+                self.run_update(txn, *table, table_name, schema, source, assignments, unique)
             }
 
             PhysicalPlan::Delete {
@@ -399,6 +409,7 @@ impl<'a> Session<'a> {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_insert(
         &self,
         txn: TxnId,
@@ -407,6 +418,7 @@ impl<'a> Session<'a> {
         schema: &Schema,
         rows: &[Vec<PhysExpr>],
         on_conflict: Option<&PhysOnConflict>,
+        unique: &[UniqueKey],
     ) -> Result<QueryResult, FerriteError> {
         let empty = Row::new(Vec::new());
         let ctx = self
@@ -439,13 +451,13 @@ impl<'a> Session<'a> {
                     self.conflicting_row(txn, table, schema, &clause.target, &row)?
                 {
                     affected += self.resolve_conflict(
-                        txn, table, table_name, schema, clause, rid, existing, row,
+                        txn, table, table_name, schema, clause, rid, existing, row, unique,
                     )?;
                     continue;
                 }
             }
 
-            self.storage.insert(txn, table, row)?;
+            self.storage.insert_unique(txn, table, row, unique)?;
             affected += 1;
         }
         Ok(QueryResult::Affected(affected))
@@ -456,10 +468,19 @@ impl<'a> Session<'a> {
     ///
     /// This is a scan. Ferrite's storage layer has no secondary indexes
     /// yet (`docs/architecture.md`), so a unique key exists in the catalog
-    /// as metadata but has nothing to probe — and nothing enforces it
-    /// either, which is precisely why the conflict has to be looked for
-    /// rather than caught. The cost is linear in the table, per inserted
-    /// row; it becomes an index probe the day secondary indexes land.
+    /// as metadata but has nothing to probe. It becomes an index probe the
+    /// day secondary indexes land.
+    ///
+    /// It is not the constraint check, and does not replace it. The two
+    /// answer different questions: this one needs the conflicting row
+    /// itself — its `RowId` and its values — so that `DO UPDATE` has
+    /// something to rewrite, which means it can only consider rows this
+    /// transaction can *see*. `StorageEngine::insert_unique` looks past
+    /// the snapshot at rows no transaction could hand back, and refuses.
+    /// So an upsert racing a concurrent insert of the same key does not
+    /// find a row to update here, falls through to the insert, and is
+    /// refused there — a clean `23505` the client can retry, rather than
+    /// the silent duplicate this scan alone would have allowed.
     fn conflicting_row(
         &self,
         txn: TxnId,
@@ -502,6 +523,7 @@ impl<'a> Session<'a> {
         rid: RowId,
         existing: Row,
         excluded: Row,
+        unique: &[UniqueKey],
     ) -> Result<usize, FerriteError> {
         let PhysConflictAction::Update {
             assignments,
@@ -546,10 +568,12 @@ impl<'a> Session<'a> {
             ProcDecision::Replace(row) => row,
         };
         conform_row(schema, &mut updated, table_name)?;
-        self.storage.update(txn, table, rid, updated)?;
+        self.storage
+            .update_unique(txn, table, rid, updated, unique)?;
         Ok(1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_update(
         &self,
         txn: TxnId,
@@ -558,6 +582,7 @@ impl<'a> Session<'a> {
         schema: &Schema,
         source: &PhysicalPlan,
         assignments: &[(usize, PhysExpr)],
+        unique: &[UniqueKey],
     ) -> Result<QueryResult, FerriteError> {
         let targets = self.stream(txn, source)?;
         let mut affected = 0;
@@ -593,7 +618,7 @@ impl<'a> Session<'a> {
             };
 
             conform_row(schema, &mut row, table_name)?;
-            self.storage.update(txn, table, rid, row)?;
+            self.storage.update_unique(txn, table, rid, row, unique)?;
             affected += 1;
         }
         Ok(QueryResult::Affected(affected))

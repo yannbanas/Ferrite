@@ -24,6 +24,6 @@ pub use catalog::{Catalog, IndexCatalog, IndexDef, IndexId};
 pub use error::FerriteError;
 pub use identity::{Identity, Permission, Role};
 pub use schema::{ColumnDef, ColumnDefault, Schema, TableId};
-pub use storage::{RowId, ScanIter, StorageEngine};
+pub use storage::{check_unique_by_scan, RowId, ScanIter, StorageEngine, UniqueKey};
 pub use txn::{Snapshot, TxnId};
 pub use value::{DataType, Row, Value};

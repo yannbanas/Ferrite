@@ -45,7 +45,12 @@ Every statement goes through the same sequence, and each step can stop it:
    *applied*, not merely permitted — a value stored under a variant its
    column does not declare would be read back and put on the wire under the
    column's OID.
-5. **Storage write**.
+5. **Unique constraints** — every unique index the catalog records on the
+   table is checked by storage, atomically with the write it guards. The
+   constraints travel *in the plan* (`PhysicalPlan::Insert::unique`), so a
+   write plan that forgot to carry them cannot be built: `Planner::new`
+   already requires an `IndexCatalog`.
+6. **Storage write**.
 
 `UPDATE` evaluates its assignments against the row's pre-image, as SQL
 requires, and hands the trigger both versions (`row` = new,

@@ -294,6 +294,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-common",
  "ferrite-sql",
+ "tracing",
 ]
 
 [[package]]

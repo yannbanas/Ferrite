@@ -722,3 +722,160 @@ async fn unsupported_sql_is_an_error_not_a_dropped_connection() {
         .expect("the connection survived every refusal");
     assert_eq!(row.get::<_, i64>(0), 1);
 }
+
+/// The exact statement the PawChat replay used to duplicate, over the real
+/// wire, against PawChat's own `users` shape: `id` is the primary key and
+/// `username` is `UNIQUE`. Before unique enforcement both inserts were
+/// accepted and the table ended up holding two rows with `id = 'demo-1'`;
+/// the follow-up `SELECT` then returned two rows against Ferrite and one
+/// against SQLite.
+#[tokio::test]
+async fn a_duplicate_primary_key_is_refused_over_the_wire() {
+    let data = scratch("unique");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute(
+            "CREATE TABLE users (
+                 id TEXT NOT NULL PRIMARY KEY,
+                 username TEXT NOT NULL UNIQUE,
+                 password TEXT NOT NULL
+             )",
+        )
+        .await
+        .expect("CREATE TABLE users");
+
+    let insert = "INSERT INTO users (id, username, password) \
+                  VALUES ('demo-1', 'demo', 'scrypt$x')";
+    client.batch_execute(insert).await.expect("the first row");
+
+    let duplicate = client
+        .batch_execute(insert)
+        .await
+        .expect_err("the same primary key twice must be refused");
+    assert_eq!(
+        duplicate.code().map(|c| c.code()),
+        Some("23505"),
+        "a duplicate row is a unique violation, not {duplicate}"
+    );
+
+    // The unique constraint on `username` is enforced on its own, so a
+    // different id carrying the same username is refused too.
+    let same_username = client
+        .batch_execute(
+            "INSERT INTO users (id, username, password) \
+             VALUES ('demo-2', 'demo', 'scrypt$y')",
+        )
+        .await
+        .expect_err("a duplicate username must be refused");
+    assert_eq!(same_username.code().map(|c| c.code()), Some("23505"));
+
+    let rows = client
+        .query("SELECT id FROM users WHERE username = 'demo'", &[])
+        .await
+        .expect("read the table back");
+    assert_eq!(rows.len(), 1, "exactly one row may carry this key");
+
+    // An `UPDATE` cannot walk a row onto a key another row holds either.
+    client
+        .batch_execute(
+            "INSERT INTO users (id, username, password) \
+             VALUES ('demo-3', 'other', 'scrypt$z')",
+        )
+        .await
+        .expect("a distinct row");
+    let collide = client
+        .batch_execute("UPDATE users SET username = 'demo' WHERE id = 'demo-3'")
+        .await
+        .expect_err("an UPDATE onto a taken key must be refused");
+    assert_eq!(collide.code().map(|c| c.code()), Some("23505"));
+
+    // The connection is still usable after all of it.
+    assert_eq!(
+        client
+            .query("SELECT id FROM users", &[])
+            .await
+            .expect("the connection survived")
+            .len(),
+        2
+    );
+}
+
+/// Two connections inserting the same key at the same time. Whatever the
+/// interleaving, one wins and one gets a `23505` — never two rows.
+#[tokio::test]
+async fn concurrent_connections_cannot_both_insert_one_key() {
+    let data = scratch("unique-race");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let setup = connect(port).await;
+    setup
+        .batch_execute("CREATE TABLE codes (code TEXT NOT NULL PRIMARY KEY)")
+        .await
+        .expect("CREATE TABLE codes");
+
+    let a = connect(port).await;
+    let b = connect(port).await;
+    let statement = "INSERT INTO codes (code) VALUES ('SAME')";
+    let (first, second) = tokio::join!(a.batch_execute(statement), b.batch_execute(statement));
+
+    let refused = [&first, &second]
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .count();
+    assert_eq!(refused, 1, "exactly one of the two must be refused");
+    for result in [&first, &second] {
+        if let Err(err) = result {
+            assert_eq!(err.code().map(|c| c.code()), Some("23505"), "{err}");
+        }
+    }
+
+    assert_eq!(
+        setup
+            .query("SELECT code FROM codes", &[])
+            .await
+            .expect("read back")
+            .len(),
+        1
+    );
+}
+
+/// A unique index cannot be declared over data that already contradicts
+/// it: the duplicates would survive, unreachable through the constraint
+/// meant to describe them.
+#[tokio::test]
+async fn a_unique_index_is_refused_when_the_data_already_violates_it() {
+    let data = scratch("unique-index");
+    let port = free_port();
+    let _server = spawn(port, &data, &[("FERRITE_TLS_DISABLE", "1")]);
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE TABLE tags (name TEXT NOT NULL)")
+        .await
+        .expect("CREATE TABLE");
+    for _ in 0..2 {
+        client
+            .batch_execute("INSERT INTO tags (name) VALUES ('dup')")
+            .await
+            .expect("a table with no constraint accepts both");
+    }
+
+    let refused = client
+        .batch_execute("CREATE UNIQUE INDEX tags_name ON tags (name)")
+        .await
+        .expect_err("the existing rows violate it");
+    assert_eq!(refused.code().map(|c| c.code()), Some("23505"), "{refused}");
+
+    // A non-unique index over the same column is fine.
+    client
+        .batch_execute("CREATE INDEX tags_name ON tags (name)")
+        .await
+        .expect("a plain index makes no promise about duplicates");
+}

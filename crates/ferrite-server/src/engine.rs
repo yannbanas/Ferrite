@@ -350,6 +350,9 @@ impl SessionHandle {
                     }
                     return Err(FerriteError::ObjectAlreadyExists(create.name.clone()));
                 }
+                if create.unique {
+                    self.check_unique_holds(txn, id, &create.name, &create.columns)?;
+                }
                 catalog.create_index_in(txn, &create.name, id, &create.columns, create.unique)?;
                 "CREATE INDEX"
             }
@@ -370,6 +373,45 @@ impl SessionHandle {
             }
         };
         Ok(QueryResult::command(CommandTag::Other(tag.into())))
+    }
+
+    /// Refuse a `CREATE UNIQUE INDEX` the table's existing rows already
+    /// violate.
+    ///
+    /// Without this the index would be recorded and enforced from that
+    /// moment on, leaving the duplicates that predate it in place and
+    /// permanently unrepairable through the constraint that is supposed to
+    /// describe them. PostgreSQL refuses the same statement for the same
+    /// reason.
+    fn check_unique_holds(
+        &self,
+        txn: TxnId,
+        table: ferrite_common::TableId,
+        index: &str,
+        columns: &[String],
+    ) -> Result<(), FerriteError> {
+        let schema = self.inner.catalog.table_schema(table)?;
+        let positions = columns
+            .iter()
+            .map(|name| {
+                schema
+                    .column_index(name)
+                    .ok_or_else(|| FerriteError::ColumnNotFound(name.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let key = ferrite_common::UniqueKey::new(index, positions);
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in self.inner.storage.scan(txn, table)? {
+            let (_, row) = entry?;
+            let Some(values) = key.extract(&row) else {
+                continue;
+            };
+            if !seen.insert(format!("{values:?}")) {
+                return Err(key.violation(&values));
+            }
+        }
+        Ok(())
     }
 
     /// Refuse an `ADD COLUMN` whose result would contradict itself.

@@ -35,6 +35,7 @@ mod crc;
 mod engine;
 mod page;
 mod pager;
+mod unique;
 mod version;
 mod wal;
 

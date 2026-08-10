@@ -1,7 +1,7 @@
 //! Physical plan: an access-path decision plus expressions bound to column
 //! positions, so the executor never resolves a name at runtime.
 
-use ferrite_common::{ColumnDef, DataType, FerriteError, Schema, TableId, Value};
+use ferrite_common::{ColumnDef, DataType, FerriteError, Schema, TableId, UniqueKey, Value};
 
 use crate::expr::{AggregateFunc, BinaryOp, Expr};
 use crate::logical::{JoinType, LogicalPlan};
@@ -450,6 +450,19 @@ pub enum PhysicalPlan {
         /// One `PhysExpr` per table column, in schema order.
         rows: Vec<Vec<PhysExpr>>,
         on_conflict: Option<PhysOnConflict>,
+        /// Every unique index the catalog records on this table, resolved
+        /// to column positions.
+        ///
+        /// These travel *in the plan* rather than being looked up by the
+        /// executor because [`crate::Planner::new`] cannot be built
+        /// without an
+        /// [`IndexCatalog`](ferrite_common::IndexCatalog): carrying them
+        /// here makes it impossible to assemble a write plan that forgot
+        /// to enforce a constraint. The cost is that a plan is only as
+        /// current as the index catalog was when it was built, which
+        /// matters the day plans are cached — the same staleness
+        /// `Session::check_schema` already guards for columns.
+        unique: Vec<UniqueKey>,
     },
     Update {
         table: TableId,
@@ -459,6 +472,9 @@ pub enum PhysicalPlan {
         /// here — the planner never puts a projection underneath.
         source: Box<PhysicalPlan>,
         assignments: Vec<(usize, PhysExpr)>,
+        /// See [`PhysicalPlan::Insert`]. An `UPDATE` can move a row onto a
+        /// key another row already holds, so it needs the same check.
+        unique: Vec<UniqueKey>,
     },
     Delete {
         table: TableId,

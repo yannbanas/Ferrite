@@ -131,6 +131,7 @@ fn a_crashed_transaction_id_is_never_handed_out_again() {
             ferrite_storage::StorageConfig {
                 cache_pages: 8,
                 fsync: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -319,7 +320,7 @@ proptest::proptest! {
         let open = || {
             ferrite_storage::FerriteStorage::open_with(
                 scratch.path(),
-                ferrite_storage::StorageConfig { cache_pages: 8, fsync: false },
+                ferrite_storage::StorageConfig { cache_pages: 8, fsync: false, ..Default::default() },
             )
             .expect("open storage")
         };
@@ -371,6 +372,7 @@ fn crash_child() {
         ferrite_storage::StorageConfig {
             cache_pages: 32,
             fsync: true,
+            ..Default::default()
         },
     )
     .expect("open storage");
