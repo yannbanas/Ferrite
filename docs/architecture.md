@@ -279,6 +279,46 @@ transaction ; sans gestionnaire de verrous pour attendre, refuser est la
 seule réponse qui ne peut pas produire de doublon — trop stricte, jamais
 fausse.
 
+## Passe durcissement crash/corruption (août 2026)
+
+Menée avec une seule question en tête : « impossible de corrompre les
+données, aucun crash possible, et s'il y en a un, un redémarrage et tout
+remarche ». Ce qui a été trouvé et corrigé, dans l'ordre de gravité :
+
+1. **Aucune contrainte d'unicité n'était appliquée** — voir la section
+   ci-dessus, corrigé et prouvé par le replay.
+2. **Une chaîne `OR` plate abattait le process.** 192 termes,
+   quelques kilo-octets de SQL : le parseur ne récursait pas (c'est une
+   boucle), donc son garde de profondeur ne voyait rien, mais l'arbre
+   produit gagnait un niveau par terme et tout le reste le parcourt
+   récursivement. Un débordement de pile *abort* le process — ni
+   `catch_unwind` ni l'isolation par tâche tokio ne le rattrapent. `AND`/`OR`
+   sont désormais pliés en arbre équilibré, l'expansion de `IN (liste)`
+   aussi.
+3. **Un `CASE` imbriqué partait en exponentielle.** `infer()` inférait la
+   première branche pour le type puis toutes les branches pour la
+   nullabilité : `2^profondeur`. 32 niveaux et la connexion ne revenait
+   jamais, en tenant un thread bloquant.
+4. **Le journal grossissait sans borne.** Un seul replay du schéma PawChat
+   laissait 13 Mio de base derrière **5,8 Gio** de journal, parce que rien
+   ne le tronquait avant l'arrêt. Remplir le disque est un crash, et le
+   seul dont la récupération ne sauve pas. `commit` checkpointe désormais
+   au-delà de 64 Mio : quatre replays consécutifs tiennent maintenant dans
+   ~40 Mio de journal au lieu de ~23 Gio.
+5. **Une page corrompue indexait hors bornes.** Le checksum prouve que les
+   octets sont ceux qui ont été écrits, pas qu'ils décrivent une page
+   cohérente ; `slot_count`, `free_end` et l'étendue de chaque slot
+   venaient du disque et indexaient le tampon plus loin. Validés à
+   l'arrivée.
+6. **Rien n'empêchait deux instances sur le même `FERRITE_DATA`.** Verrou
+   exclusif tenu par le noyau sur un handle ouvert — donc relâché même si
+   le process est tué, ce qu'un fichier-verrou ne fait pas.
+
+Plus : isolation d'un panic à la connexion fautive (avec un vrai
+`ErrorResponse` plutôt qu'une socket qui tombe), timeout d'énoncé et de
+transaction, borne sur le jeu de résultats matérialisé, plafond de
+connexions simultanées.
+
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 
 - Endpoint de métriques Prometheus — pas encore de crate/emplacement défini.
