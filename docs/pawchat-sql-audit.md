@@ -86,9 +86,11 @@ Counts are occurrences / distinct files, over the 1287 real literals.
 | `lower(…)` | 4 | 3 | **implemented** |
 | `substr(…)` | 3 | 2 | **implemented** |
 | `hex(…)` / `randomblob(…)` | 4 | 2 | **implemented** |
+| `GROUP BY <select-list alias>` | 9 | 2 | **implemented** |
 | `UNION ALL` | 2 | 2 | *not implemented* — see below |
 | `PRAGMA table_info(…)` | 1 | 1 | *not implemented* — see below |
 | subquery in `FROM` | 1 | 1 | *not implemented* — see below |
+| `SELECT` with no `FROM` | 1 | 1 | *not implemented* — see below |
 | `ILIKE` | 0 | 0 | **implemented** — migration target for SQLite `LIKE` |
 
 `EXISTS`, `NOT EXISTS`, `GLOB`, `LIMIT -1`, `RETURNING`, window functions,
@@ -132,6 +134,48 @@ Ferrite already has, is sufficient. Savepoints are not needed.
 they are SQLite storage-engine knobs with no Postgres equivalent and no
 application-visible semantics to preserve.
 
+## Before production: Ferrite enforces no constraint at all
+
+This is the largest single risk in the port, and it is not a dialect
+question.
+
+`ferrite-storage` has no secondary indexes yet (`docs/architecture.md`
+§*Reste à faire*). Nothing enforces `PRIMARY KEY`, nothing enforces
+`UNIQUE`. `CREATE TABLE` and `CREATE INDEX` record the keys in the catalog —
+this audit added the `PRIMARY KEY`/`UNIQUE` recording so that
+`INSERT OR IGNORE` has a conflict target — but a write that violates one is
+accepted.
+
+The replay demonstrates it rather than asserting it. Replaying PawChat's own
+`users` row a second time:
+
+```sql
+INSERT INTO "users" ("id", "username", "password")
+  VALUES ('demo-1', 'demo', 'scrypt$…')
+```
+
+SQLite rejects this twice over: `id` is the primary key and `username` is
+`UNIQUE COLLATE NOCASE`. Ferrite accepts it, and `users` then holds two rows
+with `id = 'demo-1'`. The subsequent
+`SELECT "id" FROM "users" WHERE "username" = 'Demo' COLLATE NOCASE` returns
+**2 rows against Ferrite and 1 against SQLite** — not because `COLLATE
+NOCASE` behaves differently, but because the duplicate got in.
+
+Consequences for PawChat specifically:
+
+- Every `INSERT OR IGNORE` (30 sites) exists to lean on a unique constraint.
+  They now work, because this audit implements conflict detection by
+  *looking for* the conflicting row rather than waiting for a violation —
+  but that only covers the statements that ask for it. A plain `INSERT` of a
+  duplicate still succeeds.
+- Registration, invite-code generation and the E2E key directory all assume
+  the database refuses a duplicate. None of them is safe until unique
+  indexes are enforced in storage.
+
+Nothing in this audit fixes that; it is a storage-layer feature. It is
+recorded here because "the SQL all runs" and "the data stays correct" are
+different claims, and only the first one is now true.
+
 ## Behaviour differences that cannot be translated away
 
 These are the places where SQLite and Postgres genuinely disagree. They are
@@ -152,6 +196,19 @@ Every `LIKE` in PawChat relies on the SQLite default:
 
 Ported unchanged to Ferrite, these three searches become case-sensitive and
 stop matching what users expect. **They must be rewritten as `ILIKE`.**
+
+Measured on the real PawChat database, over `vr_room_objects.name`
+(394 rows):
+
+| query | SQLite | Ferrite |
+|---|---:|---:|
+| `WHERE name LIKE '%a%'` | 144 | 136 |
+| `WHERE name LIKE '%A%'` | 144 | — |
+| `WHERE name ILIKE '%A%'` | — | 144 |
+
+SQLite gives the same 144 either way. Ferrite's `LIKE` finds 136 — eight rows
+short — and its `ILIKE` reproduces SQLite's 144 exactly. That eight-row gap
+is what a `LIKE` ported unchanged costs, and nothing reports it.
 
 The remaining three `LIKE`s are prefix tests against a lowercase literal
 (`u.display_font LIKE 'pf:%'`) where casing cannot vary; those are safe as-is.
@@ -246,14 +303,55 @@ once per statement for the same reason.
 | correlated scalar subquery in select list | 9 | Needs a per-outer-row subplan executor. Every occurrence is a `(SELECT COUNT(*) … WHERE x = outer.id)` counter that can be rewritten as a `LEFT JOIN … GROUP BY` in the application. Rejected with a clear plan error, never mis-planned. |
 | `UNION ALL` | 2 | `src/app/api/fonts/route.ts:26` and `src/lib/channelStore.ts:692`. Both are two-branch merges the application can do in TypeScript. |
 | subquery in `FROM` | 1 | Parses; the planner rejects it. Same call site as the second `UNION ALL`. |
+| `SELECT` with no `FROM` | 1 | `src/app/api/servers/[serverId]/invite/regenerate/route.ts:18` — `SELECT lower(hex(randomblob(4))) AS code`. The functions all work; what is missing is a one-row source node, which is a planner structure rather than a dialect feature. The application can generate the code in TypeScript, or select the same expression from any table with `LIMIT 1`. |
 | `PRAGMA table_info(…)` | 1 | `src/lib/dmStore.ts:4`, a runtime column-existence probe. Has no Postgres syntax; the port should query `information_schema.columns`, which `ferrite-catalog` already serves. |
 
-All four fail loudly with a `FerriteError::Plan` naming the construct. None is
+All five fail loudly with a `FerriteError::Plan` naming the construct. None is
 silently accepted.
 
 ## Coverage after this audit
 
-Of the 1287 real SQL literals, the constructs left unsupported appear in **12
-literals across 10 files** (9 correlated scalar subqueries, 2 `UNION ALL`, 1
-`PRAGMA`, with one file overlapping). Every other construct and all 13 functions
-PawChat calls are now parsed, planned and executed by Ferrite.
+Of the 1287 real SQL literals, the constructs left unsupported appear in **13
+literals across 11 files** (9 correlated scalar subqueries, 2 `UNION ALL`, 1
+`PRAGMA`, 1 `SELECT` without `FROM`, with one file overlapping). Every other
+construct and all 13 functions PawChat calls are now parsed, planned and
+executed by Ferrite.
+
+## Verification
+
+`tools/sqlite_to_ferrite.py` translates the real PawChat database and now
+emits, on top of the DDL and DML it already covered:
+
+- one query per construct in the table above, derived from the schema;
+- the upsert idioms replayed against a row that is genuinely already there,
+  so `DO NOTHING` and `DO UPDATE` are told apart rather than both no-oping;
+- twelve queries **copied from the PawChat sources**, each carrying the file
+  and line it came from, translated only by quoting identifiers, replacing
+  `?` with a constant, and rewriting the three flagged `LIKE`s as `ILIKE`.
+
+Replayed against a running `ferrite-server` over the PostgreSQL wire
+protocol:
+
+```
+72 tables, 938 rows
+424/426 statements accepted
+```
+
+The two refusals are the same statement twice (the read set runs before and
+after the migrations): `SELECT lower(hex(randomblob(4))) AS code`, refused
+for the missing `FROM`-less select documented above.
+
+Two bugs were found by that replay and by nothing else, both now fixed with
+regression tests:
+
+- `datetime('now')` was folded to a literal in the *physical* layer, after
+  literal-to-column type alignment had already run. Since the translator maps
+  an ISO-text column to `TIMESTAMP`, `WHERE created_at >= datetime('now',
+  '-30 days')` failed with `expected Timestamp, got Text` — as did every
+  `ON CONFLICT … SET updated_at = excluded.updated_at`. Folding moved into
+  the lowerer, where the result is still a literal that can be coerced.
+- `SELECT date(created_at) AS day … GROUP BY day` — grouping on a select-list
+  alias, which PostgreSQL accepts and PawChat's analytics queries rely on.
+
+Both had passed unit tests and `cargo clippy` beforehand. Neither was
+reachable without a real schema and real rows.

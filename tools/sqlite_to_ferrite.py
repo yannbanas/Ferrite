@@ -17,7 +17,10 @@ everything that had to be dropped; `crates/ferrite-server/tests/replay.rs`
 replays the result and reports what got in and what answered.
 
 Note when migrating off SQLite: `LIKE` is case-insensitive there and
-case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ.
+case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ — on this
+database, `name LIKE '%a%'` finds 144 rows in SQLite and 136 in Ferrite, and
+`ILIKE` is what reproduces the 144. `docs/pawchat-sql-audit.md` lists the
+three call sites that have to be rewritten.
 
 Type mapping, and why:
 
@@ -36,9 +39,12 @@ Type mapping, and why:
   dropped, unless it is empty in this database, in which case it becomes
   `TEXT`.
 
-Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `UNIQUE`,
-`COLLATE`, `AUTOINCREMENT` and `CHECK`. `PRIMARY KEY`, `NOT NULL` and
-`DEFAULT` are kept. Every identifier is quoted: Ferrite reserves nearly every
+Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `AUTOINCREMENT`
+and `CHECK`. `PRIMARY KEY`, `NOT NULL` and `DEFAULT` are kept. A table-level
+`UNIQUE (a, b)` is re-emitted as a `CREATE UNIQUE INDEX` in `_after.sql`,
+because that is what an `INSERT OR IGNORE` with no explicit target conflicts
+on — note that Ferrite records such a key but does not yet enforce it, so a
+duplicate write still succeeds (see the audit document). Every identifier is quoted: Ferrite reserves nearly every
 keyword, and application schemas are full of columns called `type`,
 `position` and `content`.
 
@@ -48,7 +54,10 @@ a `DEFAULT` it cannot evaluate rather than accepting one it would ignore.
 SQLite's `datetime('now')` and `CURRENT_TIMESTAMP` both map to
 `CURRENT_TIMESTAMP`.
 
-`_after.sql` holds what only makes sense once every table exists, and is
+`_after.sql` also carries one statement per SQL construct the audit found
+PawChat emitting (`ILIKE`, `COLLATE NOCASE`, `datetime`/`date`, `CASE`,
+`CAST`, `coalesce`, `IN (SELECT ...)`, the upsert idioms), plus a dozen
+queries copied verbatim from the PawChat sources. It is
 where the two features an application actually depends on get exercised
 against real data: one `ALTER TABLE ... ADD COLUMN` of each shape per table
 (nullable, and `NOT NULL DEFAULT`, which is what PawChat's migrations look
