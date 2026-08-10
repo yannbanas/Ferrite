@@ -5,9 +5,16 @@
 
 Emits one `<table>.sql` per table under `out/`: the `CREATE TABLE`, then one
 `INSERT` per row, separated by a sentinel line so a statement may itself
-contain newlines. `types.md` records every type decision and everything that
-had to be dropped; `crates/ferrite-server/tests/replay.rs` replays the result
-and reports what got in.
+contain newlines. `_after.sql` holds what only makes sense once every table
+exists — the index DDL, and one query per shape a real application reads
+through (`count(*)`, `ORDER BY ... LIMIT`, `LIKE`, a `JOIN` across a
+`<x>_id` column, `GROUP BY ... HAVING`, `DISTINCT`), derived from this schema
+rather than hand-written. `types.md` records every type decision and
+everything that had to be dropped; `crates/ferrite-server/tests/replay.rs`
+replays the result and reports what got in and what answered.
+
+Note when migrating off SQLite: `LIKE` is case-insensitive there and
+case-sensitive in Ferrite, as in PostgreSQL. Row counts will differ.
 
 Type mapping, and why:
 
@@ -108,6 +115,119 @@ def ferrite_type(decl, values, name):
     return "TEXT", "TEXT -> TEXT"
 
 
+INDEX_DDL = re.compile(
+    r"^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+(\S+)\s+ON\s+(\S+?)\s*\((.*?)\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def after_statements(cur, notes):
+    """The index DDL and the query shapes a real application runs.
+
+    Loading rows only proves the write path. An application also reads, and
+    it reads through joins, counts and sorts — so the replay ends with a
+    representative query per shape, derived from this schema rather than
+    hand-written, and reports which ones the server accepts.
+    """
+    by_name = {n["table"]: n for n in notes}
+    out = []
+
+    for row in cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+    ).fetchall():
+        ddl = row[0].decode() if isinstance(row[0], bytes) else row[0]
+        match = INDEX_DDL.match(" ".join(ddl.split()))
+        # A partial index (`... WHERE status = 'paid'`) does not match, and
+        # Ferrite v1 has no equivalent, so it is left out rather than
+        # silently widened into a total one.
+        if not match:
+            continue
+        unique, name, table, columns = match.groups()
+        table = table.strip('"')
+        if table not in by_name:
+            continue
+        columns = [c.strip().strip('"') for c in columns.split(",")]
+        if any(c not in by_name[table]["types"] for c in columns):
+            continue
+        out.append(
+            f'CREATE {"UNIQUE " if unique else ""}INDEX {quote(name.strip(chr(34)))} '
+            f'ON {quote(table)} ({", ".join(quote(c) for c in columns)})'
+        )
+
+    def columns_of(note, *types):
+        return [c for c, ty in note["types"].items() if ty in types]
+
+    ranked = sorted(notes, key=lambda n: -(n["rows"] - n["skipped_rows"]))
+    populated = [n for n in ranked if n["rows"] - n["skipped_rows"] > 0]
+    if not populated:
+        return out
+
+    biggest = populated[0]
+    out.append(f'SELECT count(*) FROM {quote(biggest["table"])}')
+
+    for note in populated:
+        stamps = columns_of(note, "TIMESTAMP")
+        if stamps:
+            out.append(
+                f'SELECT * FROM {quote(note["table"])} '
+                f'ORDER BY {quote(stamps[0])} DESC LIMIT 20'
+            )
+            break
+
+    for note in populated:
+        texts = columns_of(note, "TEXT")
+        if texts:
+            out.append(
+                f'SELECT count(*) FROM {quote(note["table"])} '
+                f"WHERE {quote(texts[0])} LIKE '%a%'"
+            )
+            break
+
+    # A `<x>_id` column naming a table whose single-column primary key it
+    # can be compared against is the closest thing to a foreign key left
+    # after the translation drops them.
+    joins = 0
+    for note in populated:
+        for column in note["types"]:
+            if not column.endswith("_id") or joins >= 2:
+                continue
+            stem = column[:-3]
+            target = next(
+                (
+                    by_name[c]
+                    for c in (stem, stem + "s", stem + "es")
+                    if c in by_name
+                    and by_name[c]["pk"]
+                    and by_name[c]["types"].get(by_name[c]["pk"])
+                    == note["types"][column]
+                ),
+                None,
+            )
+            if target is None or target["table"] == note["table"]:
+                continue
+            left, right = note["table"], target["table"]
+            key = target["pk"]
+            out.append(
+                f"SELECT {quote(left)}.{quote(column)}, {quote(right)}.{quote(key)} "
+                f"FROM {quote(left)} JOIN {quote(right)} "
+                f"ON {quote(right)}.{quote(key)} = {quote(left)}.{quote(column)} LIMIT 20"
+            )
+            out.append(
+                f"SELECT {quote(right)}.{quote(key)}, count(*) "
+                f"FROM {quote(right)} LEFT JOIN {quote(left)} "
+                f"ON {quote(left)}.{quote(column)} = {quote(right)}.{quote(key)} "
+                f"GROUP BY {quote(right)}.{quote(key)} "
+                f"HAVING count(*) > 1"
+            )
+            out.append(
+                f"SELECT DISTINCT {quote(column)} FROM {quote(left)} "
+                f"ORDER BY {quote(column)}"
+            )
+            joins += 1
+
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     db = sqlite3.connect(DB)
@@ -206,8 +326,13 @@ def main():
                 "rows": len(rows),
                 "skipped_rows": skipped_rows,
                 "decisions": decisions,
+                "types": {c["name"]: ty for _, c, ty in kept},
+                "pk": pk[0] if len(pk) == 1 else None,
             }
         )
+
+    with open(os.path.join(OUT, "_after.sql"), "w", encoding="utf-8") as f:
+        f.write(("\n" + SENTINEL + "\n").join(after_statements(cur, notes)))
 
     with open(os.path.join(OUT, "manifest.txt"), "w", encoding="utf-8") as f:
         for n in notes:

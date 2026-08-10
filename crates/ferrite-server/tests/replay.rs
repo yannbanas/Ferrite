@@ -180,12 +180,37 @@ async fn replay_a_translated_schema() {
     {
         total += 1;
         let one_line = statement.split_whitespace().collect::<Vec<_>>().join(" ");
-        match client.batch_execute(statement).await {
-            Ok(()) => {
+        // A query goes through `query` rather than `batch_execute` so the
+        // report can say how many rows came back. "Accepted" and "answered"
+        // are not the same claim, and for a `JOIN` or a `count(*)` only the
+        // second one is interesting.
+        let outcome = if one_line.to_uppercase().starts_with("SELECT") {
+            client.query(statement, &[]).await.map(|rows| {
+                // A single integer is almost always a `count(*)`, and its
+                // value is checkable against the source database by hand,
+                // so it is worth printing rather than counting.
+                match rows.first().map(|row| row.try_get::<_, i64>(0)) {
+                    Some(Ok(scalar)) if rows.len() == 1 && rows[0].len() == 1 => {
+                        format!("ok, = {scalar}")
+                    }
+                    _ => format!("ok, {} rows", rows.len()),
+                }
+            })
+        } else {
+            client
+                .batch_execute(statement)
+                .await
+                .map(|()| "ok".to_string())
+        };
+        match outcome {
+            Ok(note) => {
                 ok += 1;
-                println!("  ok      {one_line}");
+                println!("  {note:<12} {one_line}");
             }
-            Err(err) => println!("  REFUSED {one_line}\n            {}", describe(&err)),
+            Err(err) => println!(
+                "  REFUSED      {one_line}\n                {}",
+                describe(&err)
+            ),
         }
     }
     println!("{ok}/{total} accepted");

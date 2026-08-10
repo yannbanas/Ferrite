@@ -114,16 +114,35 @@ ce test fait ressortir :
    planificateur l'ignore. Une colonne omise reçoit `NULL`, ce qui échoue sur
    `NOT NULL` (visible) mais passe silencieusement sur une colonne nullable
    (invisible). Le plus dangereux des manques actuels.
-3. **`JOIN`** — un schéma relationnel normalisé n'est lisible qu'à travers
-   des jointures ; c'est le manque le plus visible côté requêtes.
-4. **Agrégats (`count`/`sum`/…) et `ORDER BY`** — présents dans presque
-   toutes les pages de liste d'une application.
-5. **`LIKE`, sous-requêtes, index partiels** — ensuite.
+3. ~~**`JOIN`**~~ — fait.
+4. ~~**Agrégats (`count`/`sum`/…) et `ORDER BY`**~~ — faits, avec
+   `GROUP BY`/`HAVING`, `DISTINCT` et `LIKE`.
+5. **Sous-requêtes, `CASE`, `CAST`, index partiels** — ensuite.
 
 Les contraintes que la traduction a dû jeter faute d'équivalent : 4 `FOREIGN
 KEY`, 13 `UNIQUE`, 239 `DEFAULT`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun
 `CHECK`, aucun trigger, aucune vue dans ce schéma. 6 des 7 index se créent ;
 le septième est partiel (`WHERE status = 'paid'`).
+
+### Côté lecture (mesuré après la passe JOIN/agrégats)
+
+`sqlite_to_ferrite.py` dérive maintenant du schéma un `_after.sql` : le DDL
+d'index, plus une requête par forme que toute application écrit. Rejouées
+contre le vrai serveur, **15/15 sont acceptées, contre 6/15 avant cette
+passe** — les 6 étant les `CREATE INDEX`, c'est-à-dire qu'aucune requête ne
+passait. Et elles répondent, elles ne sont pas seulement acceptées :
+`count(*)` sur `vr_room_objects` rend 394, exactement ce que rend SQLite ;
+`ORDER BY created_at DESC LIMIT 20` rend ses 20 lignes ; le `JOIN` réel
+`user_badges`/`users` et le `LEFT JOIN ... GROUP BY ... HAVING count(*) > 1`
+rendent le même nombre de groupes que la requête équivalente sur la base
+d'origine.
+
+Une différence de sémantique à connaître avant de migrer : `LIKE` est
+**sensible à la casse** dans Ferrite, comme dans PostgreSQL, alors qu'il est
+insensible dans SQLite. Sur la même donnée, `WHERE name LIKE '%a%'` rend 136
+lignes ici et 144 dans SQLite — l'écart est exactement ce que SQLite rend
+avec `GLOB '*a*'`. Toute recherche `LIKE` de PawChat changera de résultat ;
+il n'y a pas encore de `ILIKE`.
 
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 
