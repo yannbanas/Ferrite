@@ -867,3 +867,113 @@ fn a_scalar_subquery_and_exists_are_still_refused_by_name() {
         assert!(error.to_string().contains(wanted), "{sql}: {error}");
     }
 }
+
+/// A table whose timestamp column is a real `TIMESTAMP`, which is what the
+/// SQLite translator produces for a text column holding ISO dates.
+fn setup_events() -> (MemStorage, MemCatalog, TableId) {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table(
+            "public",
+            "events",
+            Schema {
+                columns: vec![
+                    column("id", DataType::Int8, false),
+                    column("at", DataType::Timestamp, true),
+                ],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+    (storage, catalog, table)
+}
+
+#[test]
+fn datetime_now_compares_against_a_timestamp_column() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2000-01-01 00:00:00'), (2, '2999-01-01 00:00:00')",
+    )
+    .unwrap();
+
+    // The regression: `datetime()` renders SQLite's text shape, so folding
+    // it late left a Text on one side of a Timestamp comparison and the
+    // whole query was refused.
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT id FROM events WHERE at >= datetime('now', '-30 days')",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Int8(2));
+}
+
+#[test]
+fn group_by_can_name_a_select_list_alias() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2026-08-10 01:00:00'), \
+         (2, '2026-08-10 20:00:00'), (3, '2026-08-11 05:00:00')",
+    )
+    .unwrap();
+
+    let rows = rows_of(
+        run(
+            &storage,
+            &catalog,
+            &procs,
+            OWNER,
+            "SELECT date(at) AS day, count(*) AS n FROM events \
+             GROUP BY day ORDER BY day ASC",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Text("2026-08-10".into()));
+    assert_eq!(rows[0].values[1], Value::Int8(2));
+    assert_eq!(rows[1].values[1], Value::Int8(1));
+}
+
+#[test]
+fn a_real_input_column_wins_over_a_select_list_alias_of_the_same_name() {
+    let (storage, catalog, _) = setup_events();
+    let procs = full_access();
+    run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "INSERT INTO events VALUES (1, '2026-08-10 01:00:00'), (2, '2026-08-10 20:00:00')",
+    )
+    .unwrap();
+
+    // `id` names both a column and the alias of `date(at)`. PostgreSQL
+    // resolves a `GROUP BY` name to the input column, and choosing it
+    // leaves `at` ungrouped — so this error is the proof that the alias did
+    // not win. Had the alias won, the query would have succeeded.
+    let error = run(
+        &storage,
+        &catalog,
+        &procs,
+        OWNER,
+        "SELECT date(at) AS id, count(*) FROM events GROUP BY id",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("at must appear"), "{error}");
+}

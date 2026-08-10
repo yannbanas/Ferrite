@@ -5,7 +5,7 @@ use ferrite_common::{
 };
 use ferrite_sql::ast as sql;
 
-use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, Expr};
+use crate::expr::{AggregateCall, AggregateFunc, BinaryOp, ColumnRef, Expr};
 use crate::logical::{
     split_conjunction, ConflictAction, JoinType, LogicalPlan, OnConflict, ProjectionItem, SortKey,
     TableSource,
@@ -145,7 +145,7 @@ impl<'a> Planner<'a> {
         let mut group_keys = Vec::new();
         let scope = if grouped {
             for key in &select.group_by {
-                group_keys.push(lowerer.expr(key)?);
+                group_keys.push(group_key(key, &select.projection, &from_scope, &lowerer)?);
             }
             let aggregates = calls
                 .iter()
@@ -1058,6 +1058,35 @@ fn sort_keys(
         });
     }
     Ok(keys)
+}
+
+/// Lower one `GROUP BY` key, letting it name a select-list alias.
+///
+/// `SELECT date(created_at) AS day ... GROUP BY day` is how PawChat writes
+/// its analytics queries, and PostgreSQL accepts it. An input column of the
+/// same name wins over the alias, which is the disambiguation rule
+/// PostgreSQL documents — hence the scope check: the alias is only used
+/// for a name the `FROM` clause does not already provide.
+fn group_key(
+    key: &sql::Expr,
+    projection: &[sql::SelectItem],
+    from_scope: &Scope,
+    lowerer: &Lowerer<'_>,
+) -> Result<Expr, FerriteError> {
+    let sql::Expr::Column(name) = key else {
+        return lowerer.expr(key);
+    };
+    if name.qualifier().is_some() || from_scope.can_resolve(&ColumnRef::new(name.base())) {
+        return lowerer.expr(key);
+    }
+    let aliased = projection.iter().find_map(|item| match item {
+        sql::SelectItem::Expr {
+            expr,
+            alias: Some(alias),
+        } if alias == name.base() => Some(expr),
+        _ => None,
+    });
+    lowerer.expr(aliased.unwrap_or(key))
 }
 
 fn select_list_reference(

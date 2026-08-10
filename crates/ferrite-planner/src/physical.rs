@@ -178,10 +178,7 @@ pub fn bind_with(
                 .iter()
                 .map(|arg| bind(arg, scope))
                 .collect::<Result<Vec<_>, FerriteError>>()?;
-            match fold_temporal(*func, &args)? {
-                Some(folded) => PhysExpr::Literal(folded),
-                None => PhysExpr::Function { func: *func, args },
-            }
+            PhysExpr::Function { func: *func, args }
         }
         Expr::InSubquery {
             expr,
@@ -205,33 +202,6 @@ pub fn bind_with(
             }
         }
     })
-}
-
-/// Evaluate `datetime`/`date` over literal arguments once, at plan time.
-///
-/// `datetime('now')` is constant for the duration of a statement in
-/// SQLite, and PawChat relies on that: a `WHERE created_at >=
-/// datetime('now', '-30 days')` evaluated per row could straddle a second
-/// boundary mid-scan and admit rows inconsistently. Folding here gives the
-/// whole statement one reading of the clock.
-///
-/// Only these two functions are folded. `randomblob` is deliberately left
-/// alone — SQLite re-rolls it per row, and folding would hand every row
-/// the same bytes.
-fn fold_temporal(func: ScalarFunc, args: &[PhysExpr]) -> Result<Option<Value>, FerriteError> {
-    let with_time = match func {
-        ScalarFunc::Datetime => true,
-        ScalarFunc::Date => false,
-        _ => return Ok(None),
-    };
-    let mut values = Vec::with_capacity(args.len());
-    for arg in args {
-        match arg {
-            PhysExpr::Literal(value) => values.push(value.clone()),
-            _ => return Ok(None),
-        }
-    }
-    ferrite_common::datetime::eval_datetime(&values, with_time).map(Some)
 }
 
 fn align_comparison(

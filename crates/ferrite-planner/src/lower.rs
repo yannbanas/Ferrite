@@ -56,6 +56,37 @@ fn folds_case(expr: &sql::Expr) -> Result<bool, FerriteError> {
     }
 }
 
+/// Evaluate `datetime`/`date` over literal arguments once, here, rather
+/// than per row.
+///
+/// Two reasons, both load-bearing. `datetime('now')` is constant for the
+/// duration of a statement in SQLite and PawChat depends on it: a `WHERE
+/// created_at >= datetime('now', '-30 days')` re-read per row could
+/// straddle a second boundary mid-scan and admit rows inconsistently. And
+/// folding *before* the physical layer is what lets the result be coerced
+/// to the column it is compared against — `datetime()` returns SQLite's
+/// text shape, while a column holding ISO timestamps translates to
+/// `TIMESTAMP`, and only a literal gets aligned across that gap.
+///
+/// Only these two functions fold. `randomblob` is deliberately left alone:
+/// SQLite re-rolls it per row, and folding would hand every row the same
+/// bytes.
+fn fold_temporal(func: ScalarFunc, args: &[Expr]) -> Result<Option<Value>, FerriteError> {
+    let with_time = match func {
+        ScalarFunc::Datetime => true,
+        ScalarFunc::Date => false,
+        _ => return Ok(None),
+    };
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            Expr::Literal(value) => values.push(value.clone()),
+            _ => return Ok(None),
+        }
+    }
+    ferrite_common::datetime::eval_datetime(&values, with_time).map(Some)
+}
+
 /// Wrap an already-lowered operand in the case fold, unless it is one
 /// already — `a COLLATE NOCASE = b COLLATE NOCASE` folds each side once.
 fn fold_case(expr: Expr) -> Expr {
@@ -365,12 +396,13 @@ impl<'a> Lowerer<'a> {
                 )));
             }
             func.check_arity(args.len())?;
-            return Ok(Expr::Function {
-                func,
-                args: args
-                    .iter()
-                    .map(|arg| self.expr(arg))
-                    .collect::<Result<_, FerriteError>>()?,
+            let args = args
+                .iter()
+                .map(|arg| self.expr(arg))
+                .collect::<Result<Vec<_>, FerriteError>>()?;
+            return Ok(match fold_temporal(func, &args)? {
+                Some(folded) => Expr::Literal(folded),
+                None => Expr::Function { func, args },
             });
         }
         let Some(slots) = self.aggregates else {
