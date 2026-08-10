@@ -80,6 +80,10 @@ pub struct Journal {
     /// produced it.
     next_lsn: u64,
     sync_on_commit: bool,
+    /// Bytes appended since the last truncation, tracked rather than
+    /// queried: the size is consulted after every commit, and a `stat`
+    /// per commit is a syscall this does not need.
+    bytes: u64,
 }
 
 impl Journal {
@@ -91,10 +95,15 @@ impl Journal {
             .truncate(false)
             .open(path)
             .map_err(|e| io_err("opening journal", e))?;
+        let bytes = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| io_err("sizing journal", e))?;
         Ok(Self {
             file,
             next_lsn: 1,
             sync_on_commit,
+            bytes,
         })
     }
 
@@ -115,7 +124,14 @@ impl Journal {
         framed.extend_from_slice(payload);
         self.file
             .write_all(&framed)
-            .map_err(|e| io_err("appending to journal", e))
+            .map_err(|e| io_err("appending to journal", e))?;
+        self.bytes += framed.len() as u64;
+        Ok(())
+    }
+
+    /// How large the journal has grown since it was last truncated.
+    pub fn len(&self) -> u64 {
+        self.bytes
     }
 
     pub fn log_page_image(
@@ -179,6 +195,7 @@ impl Journal {
         self.file
             .sync_data()
             .map_err(|e| io_err("syncing truncated journal", e))?;
+        self.bytes = 0;
         Ok(())
     }
 

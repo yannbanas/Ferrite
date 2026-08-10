@@ -30,6 +30,12 @@ use crate::version::{decode_chain, encode_chain, Version, NO_TXN};
 pub const DATA_FILE: &str = "ferrite.db";
 pub const JOURNAL_FILE: &str = "ferrite.wal";
 
+/// Journal size that triggers an automatic checkpoint. 64 MiB is roughly
+/// eight thousand page images: often enough that the journal never becomes
+/// the largest thing on the disk, rare enough that the fsync it costs is
+/// amortised over thousands of commits.
+pub const DEFAULT_CHECKPOINT_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Tunables for [`FerriteStorage::open_with`].
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -43,6 +49,18 @@ pub struct StorageConfig {
     /// trying to prove absence — see `src/unique.rs`. Lowering it trades
     /// memory for scans; it never affects which writes are accepted.
     pub unique_filter_capacity: usize,
+    /// Journal size past which a commit also checkpoints, in bytes.
+    ///
+    /// Without this the journal only shrinks on an orderly shutdown, and a
+    /// physical journal of *full page images* grows fast: replaying a real
+    /// application schema — 72 tables, 938 rows, a few hundred statements —
+    /// left a 13 MiB database behind a **5.8 GiB** journal. A long-running
+    /// server fills the disk, and filling the disk is a crash, and the
+    /// recovery that follows has to replay all of it.
+    ///
+    /// `0` disables the automatic checkpoint, which is only reasonable for
+    /// a process that will not run long.
+    pub checkpoint_journal_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -51,6 +69,7 @@ impl Default for StorageConfig {
             cache_pages: DEFAULT_CACHE_PAGES,
             fsync: true,
             unique_filter_capacity: DEFAULT_FILTER_CAPACITY,
+            checkpoint_journal_bytes: DEFAULT_CHECKPOINT_JOURNAL_BYTES,
         }
     }
 }
@@ -80,6 +99,7 @@ struct Inner {
 pub struct FerriteStorage {
     inner: Mutex<Inner>,
     dir: PathBuf,
+    checkpoint_journal_bytes: u64,
 }
 
 impl FerriteStorage {
@@ -110,6 +130,7 @@ impl FerriteStorage {
                 filters: KeyFilters::new(config.unique_filter_capacity),
             }),
             dir,
+            checkpoint_journal_bytes: config.checkpoint_journal_bytes,
         })
     }
 
@@ -543,6 +564,18 @@ impl StorageEngine for FerriteStorage {
         clog::mark_committed(&mut inner.pager, txn)?;
         inner.pager.commit_to_journal(txn)?;
         let state = inner.active.remove(&txn).expect("presence checked above");
+
+        // Fold the journal into the data file once it has grown past its
+        // budget. A checkpoint is safe with other transactions still open:
+        // uncommitted work is allowed to reach the data file, and the
+        // commit bitmap is what makes it invisible.
+        if self.checkpoint_journal_bytes > 0
+            && inner.pager.journal_len() >= self.checkpoint_journal_bytes
+        {
+            let before = inner.pager.journal_len();
+            inner.pager.checkpoint()?;
+            tracing::debug!(before, "journal checkpointed automatically");
+        }
 
         if !state.dropped.is_empty() && inner.active.is_empty() {
             // Reclaiming a dropped table's pages is only safe with no other

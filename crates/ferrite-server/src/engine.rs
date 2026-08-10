@@ -22,6 +22,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ferrite_catalog::SystemCatalog;
@@ -29,7 +30,7 @@ use ferrite_common::{
     Catalog, FerriteError, Identity, IndexCatalog, Permission, Row, Schema, StorageEngine, TxnId,
     Value,
 };
-use ferrite_exec::{QueryResult as ExecResult, Session};
+use ferrite_exec::{Limits, QueryResult as ExecResult, Session};
 use ferrite_planner::{Planner, DEFAULT_NAMESPACE};
 use ferrite_proc::ProcRegistry;
 use ferrite_protocol::{
@@ -37,7 +38,7 @@ use ferrite_protocol::{
     TransactionStatus,
 };
 use ferrite_sql::ast as sql;
-use ferrite_storage::{FerriteStorage, DATA_FILE};
+use ferrite_storage::{FerriteStorage, StorageConfig, DATA_FILE};
 use tracing::debug;
 
 use crate::describe::parameter_types;
@@ -52,19 +53,56 @@ struct Inner {
     storage: Arc<FerriteStorage>,
     catalog: Arc<SystemCatalog>,
     procs: Arc<ProcRegistry>,
+    limits: Limits,
+    transaction_timeout: Option<Duration>,
+}
+
+/// The resource budget the engine applies to whatever it is handed.
+///
+/// Every one of these bounds something otherwise unbounded: a statement
+/// that never returns, a result set materialized in full, a transaction
+/// left open with a snapshot that stops MVCC pruning for every table it
+/// can see.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineLimits {
+    pub statement_timeout: Option<Duration>,
+    pub transaction_timeout: Option<Duration>,
+    pub max_result_rows: usize,
+    pub checkpoint_journal_bytes: u64,
+}
+
+impl Default for EngineLimits {
+    fn default() -> Self {
+        Self {
+            statement_timeout: Some(ferrite_exec::DEFAULT_STATEMENT_TIMEOUT),
+            transaction_timeout: Some(crate::settings::DEFAULT_TRANSACTION_TIMEOUT),
+            max_result_rows: ferrite_exec::DEFAULT_MAX_ROWS,
+            checkpoint_journal_bytes: ferrite_storage::DEFAULT_CHECKPOINT_JOURNAL_BYTES,
+        }
+    }
 }
 
 impl Engine {
-    /// Open the database in `dir`, bootstrapping the catalog if the data
-    /// file is not there yet.
+    /// Open the database in `dir` under `limits`, bootstrapping the
+    /// catalog if the data file is not there yet.
     ///
     /// The freshness test is the presence of the data file rather than a
     /// failed `SystemCatalog::open`: falling back to `bootstrap` on any
     /// error would turn a corrupt catalog into a silently empty database.
-    pub fn open(dir: impl AsRef<Path>, procs: ProcRegistry) -> Result<Self, FerriteError> {
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        procs: ProcRegistry,
+        limits: EngineLimits,
+    ) -> Result<Self, FerriteError> {
         let dir = dir.as_ref();
         let fresh = !dir.join(DATA_FILE).exists();
-        let storage = Arc::new(FerriteStorage::open(dir)?);
+        let storage = Arc::new(FerriteStorage::open_with(
+            dir,
+            StorageConfig {
+                checkpoint_journal_bytes: limits.checkpoint_journal_bytes,
+                ..Default::default()
+            },
+        )?);
 
         let catalog = if fresh {
             SystemCatalog::bootstrap(storage.clone() as Arc<dyn StorageEngine>)?
@@ -77,6 +115,11 @@ impl Engine {
                 storage,
                 catalog: Arc::new(catalog),
                 procs: Arc::new(procs),
+                limits: Limits {
+                    max_rows: limits.max_result_rows,
+                    statement_timeout: limits.statement_timeout,
+                },
+                transaction_timeout: limits.transaction_timeout,
             }),
         })
     }
@@ -101,6 +144,9 @@ impl Engine {
 #[derive(Default)]
 struct SessionState {
     txn: Option<TxnId>,
+    /// When the open transaction began, for the age check in
+    /// [`SessionHandle::expire_stale_transaction`].
+    opened_at: Option<Instant>,
     /// Set when DDL ran inside `txn`. `ferrite-catalog` updates its
     /// in-memory index optimistically, so an aborted transaction that ran
     /// DDL has to be followed by `reload()`.
@@ -176,7 +222,8 @@ impl SessionHandle {
                     self.inner.catalog.as_ref(),
                     self.inner.procs.as_ref(),
                     caller,
-                );
+                )
+                .with_limits(self.inner.limits);
                 Ok(to_wire(session.execute(txn, &plan)?, other))
             }),
         }
@@ -194,6 +241,7 @@ impl SessionHandle {
         body: impl FnOnce(TxnId) -> Result<T, FerriteError>,
     ) -> Result<T, FerriteError> {
         if let Some(txn) = self.current_txn()? {
+            self.expire_stale_transaction(txn)?;
             self.inner.storage.snapshot(txn)?;
             return body(txn);
         }
@@ -214,6 +262,45 @@ impl SessionHandle {
         Ok(self.lock()?.txn)
     }
 
+    /// Rolls back a transaction that has been open past its budget.
+    ///
+    /// An open transaction pins a snapshot, and a pinned snapshot stops
+    /// every version it could see from being pruned: one forgotten BEGIN
+    /// is enough to make a busy table grow without bound.
+    ///
+    /// The check runs when the session speaks again, so a connection that
+    /// opens a transaction and then goes silent is caught on its next
+    /// statement, or when it disconnects and Drop aborts it. Reaping a
+    /// genuinely idle one sooner needs a background reaper able to abort a
+    /// transaction out from under a live session, which is a larger change
+    /// than this one and is not pretended here.
+    fn expire_stale_transaction(&self, txn: TxnId) -> Result<(), FerriteError> {
+        let Some(budget) = self.inner.transaction_timeout else {
+            return Ok(());
+        };
+        let Some(age) = self.lock()?.opened_at.map(|at| at.elapsed()) else {
+            return Ok(());
+        };
+        if age < budget {
+            return Ok(());
+        }
+
+        let ran_ddl = {
+            let mut state = self.lock()?;
+            state.txn = None;
+            state.opened_at = None;
+            std::mem::take(&mut state.ddl)
+        };
+        let _ = self.inner.storage.abort(txn);
+        if ran_ddl {
+            self.inner.catalog.reload()?;
+        }
+        tracing::warn!(txn, ?age, "transaction exceeded its budget: rolled back");
+        Err(FerriteError::Timeout(format!(
+            "the transaction was open for {age:?}, past the {budget:?} budget, and has been              rolled back"
+        )))
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionState>, FerriteError> {
         self.state
             .lock()
@@ -224,6 +311,7 @@ impl SessionHandle {
         let mut state = self.lock()?;
         if state.txn.is_none() {
             state.txn = Some(self.inner.storage.begin()?);
+            state.opened_at = Some(Instant::now());
         }
         Ok(QueryResult::command(CommandTag::Begin)
             .with_transaction(TransactionStatus::InTransaction))
@@ -233,6 +321,7 @@ impl SessionHandle {
         let mut state = self.lock()?;
         if let Some(txn) = state.txn.take() {
             state.ddl = false;
+            state.opened_at = None;
             self.inner.storage.commit(txn)?;
         }
         Ok(QueryResult::command(CommandTag::Commit).with_transaction(TransactionStatus::Idle))
@@ -241,6 +330,7 @@ impl SessionHandle {
     fn rollback(&self) -> Result<QueryResult, FerriteError> {
         let mut state = self.lock()?;
         if let Some(txn) = state.txn.take() {
+            state.opened_at = None;
             let _ = self.inner.storage.abort(txn);
             if std::mem::take(&mut state.ddl) {
                 // The catalog updated its in-memory index when the DDL ran;

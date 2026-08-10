@@ -447,3 +447,92 @@ fn killed_process_leaves_a_consistent_database() {
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The journal is a physical log of *full page images*, so it grows far
+/// faster than the data it describes: replaying a real application schema
+/// (72 tables, 938 rows, a few hundred statements) once left a 13 MiB
+/// database behind a 5.8 GiB journal, because nothing truncated it until
+/// shutdown. Filling the disk is a crash, and it is the one crash recovery
+/// cannot help with.
+#[test]
+fn the_journal_is_checkpointed_before_it_outgrows_the_database() {
+    let scratch = Scratch::new("crash_journal_bound");
+    const BUDGET: u64 = 256 * 1024;
+
+    let storage = ferrite_storage::FerriteStorage::open_with(
+        scratch.path(),
+        ferrite_storage::StorageConfig {
+            cache_pages: 16,
+            fsync: false,
+            checkpoint_journal_bytes: BUDGET,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let setup = storage.begin().unwrap();
+    storage.create_table(setup, T).unwrap();
+    storage.commit(setup).unwrap();
+
+    let journal = scratch.path().join(ferrite_storage::JOURNAL_FILE);
+    let mut peak = 0;
+    for i in 0..400i64 {
+        let txn = storage.begin().unwrap();
+        storage.insert(txn, T, int_row(i)).unwrap();
+        storage.commit(txn).unwrap();
+        peak = peak.max(std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0));
+    }
+
+    // The budget is a threshold checked after a commit, not a hard cap, so
+    // the journal may overshoot by whatever that commit wrote. What must
+    // not happen is unbounded growth.
+    assert!(
+        peak < BUDGET * 4,
+        "the journal reached {peak} bytes against a {BUDGET}-byte budget"
+    );
+
+    // And the data is all there, through the checkpoints.
+    let reader = storage.begin().unwrap();
+    assert_eq!(values(&storage, reader), (0..400).collect::<Vec<i64>>());
+    storage.commit(reader).unwrap();
+}
+
+/// An automatic checkpoint runs while other transactions are open, so it
+/// has to leave their uncommitted work invisible — the commit bitmap is
+/// what makes that safe, and this is the test that says so.
+#[test]
+fn a_checkpoint_taken_mid_transaction_does_not_publish_uncommitted_rows() {
+    let scratch = Scratch::new("crash_journal_midtxn");
+    let storage = ferrite_storage::FerriteStorage::open_with(
+        scratch.path(),
+        ferrite_storage::StorageConfig {
+            cache_pages: 16,
+            fsync: false,
+            checkpoint_journal_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let setup = storage.begin().unwrap();
+    storage.create_table(setup, T).unwrap();
+    storage.commit(setup).unwrap();
+
+    // Open and write, then leave it in flight while other commits drive
+    // the journal past its budget.
+    let doomed = storage.begin().unwrap();
+    for i in 1000..1100i64 {
+        storage.insert(doomed, T, int_row(i)).unwrap();
+    }
+    for i in 0..200i64 {
+        let txn = storage.begin().unwrap();
+        storage.insert(txn, T, int_row(i)).unwrap();
+        storage.commit(txn).unwrap();
+    }
+    std::mem::drop(storage);
+
+    let storage = scratch.open();
+    let txn = storage.begin().unwrap();
+    assert_eq!(values(&storage, txn), (0..200).collect::<Vec<i64>>());
+    storage.commit(txn).unwrap();
+}

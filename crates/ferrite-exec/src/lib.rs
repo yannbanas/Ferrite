@@ -19,6 +19,8 @@ mod scalar;
 mod subquery;
 
 pub use eval::{compare, eval, eval_predicate, like_matches};
-pub use executor::{QueryResult, Session, Tuple};
+pub use executor::{
+    Limits, QueryResult, Session, Tuple, DEFAULT_MAX_ROWS, DEFAULT_STATEMENT_TIMEOUT,
+};
 pub use index::IndexProvider;
 pub use scalar::{call, cast};

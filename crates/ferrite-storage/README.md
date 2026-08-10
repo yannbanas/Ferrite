@@ -250,8 +250,16 @@ the commit bitmap makes it harmless. Two ordering rules make that safe:
 
 `checkpoint()` writes every cached change into the data file, fsyncs it, and
 truncates the journal; after that the data file alone is a complete
-database. It is optional — recovery reaches the same state from the journal
-— but it bounds both recovery time and journal size. The journal is also
+database. Recovery reaches the same state from the journal without it, but
+it bounds both recovery time and journal size — and with full page images
+that size grows fast. Replaying a real application schema once (72 tables,
+938 rows, a few hundred statements) left a 13 MiB database behind a
+**5.8 GiB** journal, because nothing truncated it until shutdown. Filling
+the disk is a crash, and it is the one crash recovery cannot help with, so
+`commit` now checkpoints on its own once the journal passes
+`StorageConfig::checkpoint_journal_bytes` (64 MiB by default). That is safe
+with other transactions still open for the same reason uncommitted work may
+reach the data file at all: the commit bitmap is what makes it invisible. The journal is also
 truncated at the end of recovery, once its records have been applied and the
 data file fsynced.
 
@@ -272,9 +280,10 @@ visibility logic, only who may touch a page.
 
 ## Configuration
 
-`StorageConfig` has three knobs: `cache_pages` (default 1024, i.e. 8 MiB),
-`fsync` (default on), and `unique_filter_capacity` (default 2^20 hashes per
-constraint). Turning `fsync` off trades durability for speed and is only
+`StorageConfig` has four knobs: `cache_pages` (default 1024, i.e. 8 MiB),
+`fsync` (default on), `unique_filter_capacity` (default 2^20 hashes per
+constraint), and `checkpoint_journal_bytes` (default 64 MiB, `0` to
+disable). Turning `fsync` off trades durability for speed and is only
 appropriate for data you are willing to lose; lowering the filter capacity
 trades scans for memory and never changes which writes are accepted.
 

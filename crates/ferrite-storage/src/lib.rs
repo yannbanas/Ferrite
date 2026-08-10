@@ -42,6 +42,8 @@ mod wal;
 #[cfg(test)]
 mod testutil;
 
-pub use engine::{FerriteStorage, StorageConfig, DATA_FILE, JOURNAL_FILE};
+pub use engine::{
+    FerriteStorage, StorageConfig, DATA_FILE, DEFAULT_CHECKPOINT_JOURNAL_BYTES, JOURNAL_FILE,
+};
 pub use page::PAGE_SIZE;
 pub use pager::DEFAULT_CACHE_PAGES;

@@ -257,3 +257,135 @@ fn an_index_probe_on_a_hostile_key_never_panics() {
         let _ = session.execute(1, &plan);
     }
 }
+
+/// A materializing executor turns one `SELECT *` on a large table into
+/// resident memory proportional to the table, and an accidental cross join
+/// into the product of two of them. Refusing is the point: the alternative
+/// is the process growing until the operating system kills it, which takes
+/// every other connection with it.
+#[test]
+fn a_result_set_past_the_budget_is_refused_rather_than_materialized() {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table(
+            "public",
+            "t",
+            Schema {
+                columns: vec![column("id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+    // A second table rather than a self-join: a scope reaches a relation
+    // by name as well as by alias, so `FROM t JOIN t t2` is refused as
+    // ambiguous (a known planner limit, documented in docs/architecture.md).
+    let other = catalog
+        .create_table(
+            "public",
+            "u",
+            Schema {
+                columns: vec![column("id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, other).unwrap();
+    for id in 0..200i64 {
+        storage
+            .insert(0, table, Row::new(vec![Value::Int8(id)]))
+            .unwrap();
+        storage
+            .insert(0, other, Row::new(vec![Value::Int8(id)]))
+            .unwrap();
+    }
+    let procs = everything();
+    let run = |sql: &str, max_rows: usize| {
+        let statement = ferrite_sql::parse_statement(sql).unwrap();
+        let plan = Planner::new(&catalog, &catalog).plan(&statement).unwrap();
+        Session::new(&storage, &catalog, &procs, CALLER)
+            .with_limits(ferrite_exec::Limits {
+                max_rows,
+                statement_timeout: None,
+            })
+            .execute(1, &plan)
+    };
+
+    assert!(
+        matches!(
+            run("SELECT id FROM t", 50),
+            Err(ferrite_common::FerriteError::ResourceLimit(_))
+        ),
+        "200 rows must not fit a 50-row budget"
+    );
+    assert!(run("SELECT id FROM t", 500).is_ok());
+
+    // The cross join is the case a budget on the *inputs* alone misses:
+    // both sides fit, their product does not.
+    assert!(matches!(
+        run("SELECT t.id FROM t JOIN u ON 1 = 1", 500),
+        Err(ferrite_common::FerriteError::ResourceLimit(_))
+    ));
+}
+
+/// A statement that runs long holds a blocking thread and an MVCC
+/// snapshot, so it needs a deadline rather than only a size bound.
+#[test]
+fn a_statement_past_its_deadline_is_abandoned() {
+    let storage = MemStorage::new();
+    let catalog = MemCatalog::new();
+    let table = catalog
+        .create_table(
+            "public",
+            "t",
+            Schema {
+                columns: vec![column("id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, table).unwrap();
+    let other = catalog
+        .create_table(
+            "public",
+            "u",
+            Schema {
+                columns: vec![column("id", DataType::Int8, false)],
+            },
+        )
+        .unwrap();
+    storage.create_table(0, other).unwrap();
+    for id in 0..4000i64 {
+        storage
+            .insert(0, table, Row::new(vec![Value::Int8(id)]))
+            .unwrap();
+        storage
+            .insert(0, other, Row::new(vec![Value::Int8(id)]))
+            .unwrap();
+    }
+    let procs = everything();
+
+    // A cross join over 4000 rows is sixteen million comparisons, which
+    // takes far longer than the budget allows.
+    let statement = ferrite_sql::parse_statement("SELECT t.id FROM t JOIN u ON 1 = 1").unwrap();
+    let plan = Planner::new(&catalog, &catalog).plan(&statement).unwrap();
+    let outcome = Session::new(&storage, &catalog, &procs, CALLER)
+        .with_limits(ferrite_exec::Limits {
+            max_rows: 0,
+            statement_timeout: Some(std::time::Duration::from_millis(50)),
+        })
+        .execute(1, &plan);
+    assert!(
+        matches!(outcome, Err(ferrite_common::FerriteError::Timeout(_))),
+        "expected a timeout, got {outcome:?}"
+    );
+
+    // The same session answers a cheap statement within the same budget.
+    let statement = ferrite_sql::parse_statement("SELECT id FROM t LIMIT 1").unwrap();
+    let plan = Planner::new(&catalog, &catalog).plan(&statement).unwrap();
+    assert!(Session::new(&storage, &catalog, &procs, CALLER)
+        .with_limits(ferrite_exec::Limits {
+            max_rows: 0,
+            statement_timeout: Some(std::time::Duration::from_secs(30)),
+        })
+        .execute(1, &plan)
+        .is_ok());
+}

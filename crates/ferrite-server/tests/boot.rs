@@ -879,3 +879,88 @@ async fn a_unique_index_is_refused_when_the_data_already_violates_it() {
         .await
         .expect("a plain index makes no promise about duplicates");
 }
+
+/// The limits, through the real binary and its environment variables.
+///
+/// Each of these bounds something that is otherwise unbounded, and the
+/// point of testing them here rather than in a unit test is that the
+/// wiring — environment variable to setting to engine to executor — is
+/// where a limit silently goes missing.
+#[tokio::test]
+async fn the_configured_limits_are_enforced_end_to_end() {
+    let data = scratch("limits");
+    let port = free_port();
+    let _server = spawn(
+        port,
+        &data,
+        &[
+            ("FERRITE_TLS_DISABLE", "1"),
+            ("FERRITE_MAX_RESULT_ROWS", "10"),
+            ("FERRITE_TRANSACTION_TIMEOUT_MS", "300"),
+            ("FERRITE_MAX_CONNECTIONS", "8"),
+        ],
+    );
+    wait_for_port(port).await;
+
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE TABLE big (id BIGINT NOT NULL)")
+        .await
+        .expect("CREATE TABLE");
+    for id in 0..40 {
+        client
+            .execute("INSERT INTO big (id) VALUES ($1)", &[&(id as i64)])
+            .await
+            .expect("INSERT");
+    }
+
+    let refused = client
+        .query("SELECT id FROM big", &[])
+        .await
+        .expect_err("40 rows must not fit a 10-row budget");
+    assert_eq!(refused.code().map(|c| c.code()), Some("54000"), "{refused}");
+
+    // A `LIMIT` does *not* rescue it: the scan under the limit collects the
+    // whole table first, because the v1 executor materializes every node
+    // and there is no limit pushdown. A `WHERE` clause does, because a
+    // sequential scan filters as it reads. Asserting both is the point —
+    // that asymmetry is the honest shape of this budget.
+    assert!(client
+        .query("SELECT id FROM big LIMIT 5", &[])
+        .await
+        .is_err());
+    assert_eq!(
+        client
+            .query("SELECT id FROM big WHERE id = 3", &[])
+            .await
+            .expect("a selective read stays inside the budget")
+            .len(),
+        1
+    );
+
+    // A transaction left open past its budget is rolled back rather than
+    // holding its snapshot — and holding back MVCC pruning — forever.
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .execute("INSERT INTO big (id) VALUES (999)", &[])
+        .await
+        .expect("a write inside the transaction");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let expired = client
+        .execute("INSERT INTO big (id) VALUES (1000)", &[])
+        .await
+        .expect_err("the transaction is past its budget");
+    assert_eq!(expired.code().map(|c| c.code()), Some("57014"), "{expired}");
+
+    // Rolled back, so neither write landed, and the connection is usable.
+    let survivors = connect(port).await;
+    assert_eq!(
+        survivors
+            .query("SELECT id FROM big WHERE id = 999", &[])
+            .await
+            .expect("the server is still serving")
+            .len(),
+        0,
+        "the expired transaction was rolled back, so its write is not there"
+    );
+}

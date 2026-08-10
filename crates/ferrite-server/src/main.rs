@@ -21,7 +21,7 @@ mod describe;
 mod engine;
 mod settings;
 
-use engine::Engine;
+use engine::{Engine, EngineLimits};
 use settings::Settings;
 
 /// Stack every runtime thread gets.
@@ -86,13 +86,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&engine) as Arc<dyn QueryHandler>,
         Arc::new(authenticator),
         tls,
-    );
+    )
+    .with_max_connections(settings.max_connections);
 
     let server = Server::bind(&settings.listen, config).await?;
     info!(
         addr = %server.local_addr()?,
         tls = settings.tls_description(),
         data = %settings.data_dir.display(),
+        max_connections = settings.max_connections,
+        statement_timeout = ?settings.statement_timeout,
+        transaction_timeout = ?settings.transaction_timeout,
+        max_result_rows = settings.max_result_rows,
         "ferrite-server listening"
     );
 
@@ -147,7 +152,16 @@ fn build_handler(
     procs.grant_role(superuser, superuser_role());
 
     std::fs::create_dir_all(&settings.data_dir)?;
-    Ok(Arc::new(Engine::open(&settings.data_dir, procs)?))
+    Ok(Arc::new(Engine::open_with(
+        &settings.data_dir,
+        procs,
+        EngineLimits {
+            statement_timeout: settings.statement_timeout,
+            transaction_timeout: settings.transaction_timeout,
+            max_result_rows: settings.max_result_rows,
+            checkpoint_journal_bytes: settings.checkpoint_journal_bytes,
+        },
+    )?))
 }
 
 fn build_tls(settings: &Settings) -> Result<TlsMode, Box<dyn std::error::Error>> {

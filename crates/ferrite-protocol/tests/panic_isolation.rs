@@ -117,3 +117,52 @@ async fn the_extended_query_flow_is_guarded_too() {
         1
     );
 }
+
+/// Accepting without bound means one runaway client exhausts file
+/// descriptors and memory for every other one. The refusal has to be a
+/// real `ErrorResponse` — a pooler that sees a bare reset retries, which
+/// is exactly the wrong reaction to a full server.
+#[tokio::test]
+async fn a_full_listener_refuses_with_too_many_connections() {
+    let addr = start(config(TlsMode::Disabled).with_max_connections(2)).await;
+
+    let first = client_on(addr).await;
+    let second = client_on(addr).await;
+    assert!(first.simple_query("SELECT 1").await.is_ok());
+    assert!(second.simple_query("SELECT 1").await.is_ok());
+
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user={USER} password={PASSWORD} dbname={DATABASE} sslmode=disable",
+        addr.port()
+    );
+    let refused = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .err()
+        .expect("the third connection must be refused");
+    // A client that reads the message reports the SQLSTATE; one that gives
+    // up on the closed socket first reports a transport failure. Both are a
+    // refusal, which is the guarantee — but when the message does arrive it
+    // has to be the right one.
+    if let Some(db) = refused.as_db_error() {
+        assert_eq!(db.code().code(), "53300");
+        assert!(
+            db.message().contains("too many clients"),
+            "{}",
+            db.message()
+        );
+    }
+
+    // Freeing a slot lets the next client in, so the count is live rather
+    // than a high-water mark.
+    drop(second);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let third = client_on(addr).await;
+    assert_eq!(
+        third
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("a freed slot must be reusable")
+            .get::<_, i32>(0),
+        1
+    );
+}

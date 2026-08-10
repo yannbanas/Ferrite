@@ -97,6 +97,31 @@ planner → physical plan → executor — against the in-memory
 `ferrite-storage` (Agent 1) and `ferrite-catalog` (Agent 2) own the real
 ones, and there is no MVCC visibility in the fakes.
 
+## Resource budget
+
+`Session::with_limits` bounds what one statement may consume:
+
+| | |
+| --- | --- |
+| `max_rows` | rows a single plan node may materialize (default 10 million, `0` for none) |
+| `statement_timeout` | wall-clock budget for one statement (default 60 s, `None` for none) |
+
+Both bound something otherwise unbounded. A statement that never returns
+holds a blocking thread *and* an MVCC snapshot, which stops every version
+that snapshot can see from being pruned; a materializing executor turns one
+`SELECT *` on a large table into resident memory proportional to the table,
+and an accidental cross join into the product of two of them.
+
+The row bound is on what a node **materializes**, not on what the client
+receives. `LIMIT 5` over a table larger than the budget is still refused —
+the scan underneath collects the whole table first, and there is no limit
+pushdown to stop it — while a `WHERE` clause does help, because a `SeqScan`
+filters as it reads. That asymmetry belongs to the materializing execution
+model, not to the budget, and it goes away with a pull pipeline.
+
+The deadline is checked once every 512 rows in each loop that can run long,
+so it costs a counter increment per row rather than a clock read.
+
 ## Known limits
 
 - No DDL: `CREATE TABLE` and friends are not in the v1 plan set.

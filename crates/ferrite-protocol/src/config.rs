@@ -6,6 +6,12 @@ use crate::handler::QueryHandler;
 use crate::message::StartupParams;
 use crate::tls::TlsMode;
 
+/// Concurrent sessions a listener serves by default. PostgreSQL's own
+/// `max_connections` default is 100; this is higher because a Ferrite
+/// connection costs a task rather than a process, and still bounded
+/// because "as many as the client opens" is not a bound.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
+
 /// Everything a listener needs, shared by every connection it accepts.
 pub struct ServerConfig {
     pub handler: Arc<dyn QueryHandler>,
@@ -13,6 +19,11 @@ pub struct ServerConfig {
     /// TLS is required unless this is explicitly [`TlsMode::Disabled`].
     pub tls: TlsMode,
     pub max_message_size: usize,
+    /// Sessions the listener will serve at once. A refused connection is
+    /// answered with SQLSTATE `53300` and closed, which is what a client
+    /// pool understands; accepting without bound instead means one runaway
+    /// client can exhaust file descriptors and memory for everyone.
+    pub max_connections: usize,
     /// Reported as the `server_version` parameter. Clients gate features on
     /// it, so it claims a PostgreSQL version and names Ferrite alongside.
     pub server_version: String,
@@ -29,12 +40,18 @@ impl ServerConfig {
             authenticator,
             tls,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             server_version: format!("16.0 (Ferrite {})", env!("CARGO_PKG_VERSION")),
         }
     }
 
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = bytes;
+        self
+    }
+
+    pub fn with_max_connections(mut self, connections: usize) -> Self {
+        self.max_connections = connections.max(1);
         self
     }
 
