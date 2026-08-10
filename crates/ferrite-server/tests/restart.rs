@@ -277,6 +277,167 @@ async fn a_crash_under_load_needs_nothing_but_a_restart() {
     assert!(metric(&body, "ferrite_uptime_seconds") < 60.0);
 }
 
+/// Repeated `SIGKILL` under load on one data directory, with the same
+/// table dropped and recreated on every cycle — and, on every cycle, the
+/// interleaving that used to write the duplicate.
+///
+/// The reported symptom was a `DROP TABLE IF EXISTS stress` that appeared
+/// to succeed followed by a `CREATE TABLE stress` refused as `42710`,
+/// after several crash-and-restart cycles under the stress suite. The
+/// cause is not the crash itself: the catalog's in-memory index is shared
+/// by every connection and is updated when the DDL *runs*, not when it
+/// commits. A session that drops the table inside an open transaction
+/// therefore makes it look absent to everyone else, and a second session
+/// creating it then passes the existence check and writes a **second**
+/// `ferrite_tables` row naming the same table. Whichever of the two a
+/// later `reload` happens to index decides whether the next `DROP` and
+/// `CREATE` pair works or fails — a coin flip, which is why it only
+/// surfaced after a few restarts.
+///
+/// So this drives that interleaving directly, once per cycle, and kills
+/// the server on top of it. The assertion that discriminates is the count
+/// of catalog rows: before the fix this reproduces two of them, and the
+/// second create is accepted rather than refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_crashes_never_leave_the_catalog_holding_one_table_twice() {
+    const CYCLES: usize = 4;
+    const CREATE: &str = "CREATE TABLE stress (id BIGINT NOT NULL, writer BIGINT NOT NULL)";
+
+    let data = scratch("catalog-cycles");
+
+    for cycle in 0..CYCLES {
+        let port = free_port();
+        let metrics_port = free_port();
+        let mut server = spawn(port, metrics_port, &data);
+        wait_for_health(metrics_port).await;
+
+        let client = connect(port).await;
+        // The exact pair that used to fail, on every cycle including the
+        // ones that follow a crash mid-write.
+        client
+            .batch_execute("DROP TABLE IF EXISTS stress")
+            .await
+            .unwrap_or_else(|err| panic!("cycle {cycle}: DROP TABLE IF EXISTS: {err}"));
+        client
+            .batch_execute(CREATE)
+            .await
+            .unwrap_or_else(|err| panic!("cycle {cycle}: CREATE TABLE after the drop: {err}"));
+        drop(client);
+
+        // One session drops the table and does not commit; another creates
+        // it while that drop is in flight. Storage refuses the second row
+        // outright, so the catalog cannot come out of this holding two.
+        let dropper = connect(port).await;
+        dropper.batch_execute("BEGIN").await.expect("BEGIN");
+        dropper
+            .batch_execute("DROP TABLE stress")
+            .await
+            .unwrap_or_else(|err| panic!("cycle {cycle}: the uncommitted DROP: {err}"));
+        let creator = connect(port).await;
+        let raced = creator
+            .batch_execute(CREATE)
+            .await
+            .expect_err("a table another transaction is dropping cannot be created underneath it");
+        assert_eq!(
+            raced.code().map(|c| c.code()),
+            Some("23505"),
+            "cycle {cycle}: the racing CREATE was answered with {raced} rather than a \
+             unique violation on the catalog's own key"
+        );
+        dropper.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+        drop(dropper);
+        drop(creator);
+
+        let acknowledged: Vec<Arc<AtomicI64>> =
+            (0..WRITERS).map(|_| Arc::new(AtomicI64::new(-1))).collect();
+        let mut writers = Vec::new();
+        for w in 0..WRITERS {
+            let progress = Arc::clone(&acknowledged[w as usize]);
+            writers.push(tokio::spawn(async move {
+                let client = connect(port).await;
+                let mut n = 0i64;
+                loop {
+                    let id = w * WRITER_STRIDE + n;
+                    if client
+                        .execute(
+                            "INSERT INTO stress (id, writer) VALUES ($1, $2)",
+                            &[&id, &w],
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    progress.store(n, Ordering::SeqCst);
+                    n += 1;
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let acked = || -> i64 {
+            acknowledged
+                .iter()
+                .map(|p| p.load(Ordering::SeqCst) + 1)
+                .sum()
+        };
+        while acked() < MIN_ACKNOWLEDGED && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            acked() >= MIN_ACKNOWLEDGED,
+            "cycle {cycle}: the load was too light for the kill to land mid-write"
+        );
+
+        // No SIGTERM, so the DDL of this cycle is recovered from the
+        // journal on the next start rather than from a checkpoint.
+        server.kill();
+        for writer in writers.drain(..) {
+            let _ = writer.await;
+        }
+    }
+
+    let port = free_port();
+    let metrics_port = free_port();
+    let _server = spawn(port, metrics_port, &data);
+    wait_for_health(metrics_port).await;
+    let client = connect(port).await;
+
+    // The catalog is stored in ordinary tables, so the duplicate is
+    // observable as data: exactly one row may name this table.
+    let rows = client
+        .query(
+            "SELECT table_id FROM ferrite_catalog.ferrite_tables \
+             WHERE schema_name = 'public' AND table_name = 'stress'",
+            &[],
+        )
+        .await
+        .expect("read the catalog back");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the catalog holds {} rows naming `stress` after {CYCLES} crash cycles",
+        rows.len()
+    );
+
+    // And the sequence that used to fail still works after all of them.
+    client
+        .batch_execute("DROP TABLE IF EXISTS stress")
+        .await
+        .expect("DROP TABLE IF EXISTS after the last crash");
+    client
+        .batch_execute(CREATE)
+        .await
+        .expect("CREATE TABLE after the drop: a 42710 here is the bug returning");
+    assert_eq!(
+        client
+            .execute("INSERT INTO stress (id, writer) VALUES (1, 1)", &[])
+            .await
+            .expect("the recreated table takes writes"),
+        1
+    );
+}
+
 /// A restart with no crash at all still has to work: the orderly path
 /// check points on `SIGTERM`, so the next start replays nothing, and the
 /// health endpoint must go green just the same.
