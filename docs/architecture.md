@@ -98,6 +98,33 @@ Ordre de dépendance : Storage → (Catalog, SQL) → (Planner, Exec, Proc) → 
 
 Même patron que `chronotopedb`/`pawchat-kv` (dépôts sœurs du même auteur) : Dockerfile multi-stage `cargo-chef` + cible musl statique + image `alpine` finale, CI GitHub Actions (`fmt`, `clippy -D warnings`, `test` + `test --doc`, `cargo-audit --deny warnings`), publication `ghcr.io/mairie-creusot/ferrite` sur push vers `main`, package GHCR privé (pas de raison de le rendre public pour un projet à ce stade).
 
+## Ce que coûte un vrai schéma applicatif (mesuré, août 2026)
+
+Le schéma SQLite de PawChat (72 tables, 672 colonnes, 938 lignes réelles) a
+été traduit dans le sous-ensemble Ferrite (`tools/sqlite_to_ferrite.py`) puis
+rejoué contre un vrai serveur (`crates/ferrite-server/tests/replay.rs`) :
+**72/72 tables créées, 938/938 lignes chargées et relues**. Le DDL et les
+données passent. Ce qui bloque est ailleurs, et voici l'ordre de priorité que
+ce test fait ressortir :
+
+1. **`ALTER TABLE`** — PawChat porte 195 `ALTER TABLE ... ADD COLUMN` sur 22
+   tables ; c'est sa mécanique de migration. Sans ça, une application ne peut
+   pas évoluer sur Ferrite, seulement démarrer.
+2. **`DEFAULT` appliqué à l'insertion** — la grammaire le parse et le
+   planificateur l'ignore. Une colonne omise reçoit `NULL`, ce qui échoue sur
+   `NOT NULL` (visible) mais passe silencieusement sur une colonne nullable
+   (invisible). Le plus dangereux des manques actuels.
+3. **`JOIN`** — un schéma relationnel normalisé n'est lisible qu'à travers
+   des jointures ; c'est le manque le plus visible côté requêtes.
+4. **Agrégats (`count`/`sum`/…) et `ORDER BY`** — présents dans presque
+   toutes les pages de liste d'une application.
+5. **`LIKE`, sous-requêtes, index partiels** — ensuite.
+
+Les contraintes que la traduction a dû jeter faute d'équivalent : 4 `FOREIGN
+KEY`, 13 `UNIQUE`, 239 `DEFAULT`, 1 `COLLATE`, 47 `AUTOINCREMENT`. Aucun
+`CHECK`, aucun trigger, aucune vue dans ce schéma. 6 des 7 index se créent ;
+le septième est partiel (`WHERE status = 'paid'`).
+
 ## Reste à faire (pas encore scaffoldé, à trancher plus tard)
 
 - Endpoint de métriques Prometheus — pas encore de crate/emplacement défini.

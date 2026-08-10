@@ -1,0 +1,234 @@
+"""Translate a SQLite database into Ferrite's SQL subset.
+
+    python tools/sqlite_to_ferrite.py app.db out
+    FERRITE_REPLAY_DIR=out cargo test -p ferrite-server --test replay -- --ignored
+
+Emits one `<table>.sql` per table under `out/`: the `CREATE TABLE`, then one
+`INSERT` per row, separated by a sentinel line so a statement may itself
+contain newlines. `types.md` records every type decision and everything that
+had to be dropped; `crates/ferrite-server/tests/replay.rs` replays the result
+and reports what got in.
+
+Type mapping, and why:
+
+- `INTEGER -> BIGINT`. SQLite has no boolean type, so a flag and a small
+  counter look identical in the data — PawChat's `is_public` is 0/1 but its
+  `nsfw_level` is 0/1/2. Guessing would corrupt one of them, and `BIGINT` is
+  lossless for both. Narrowing to `BOOLEAN` needs the application's own
+  types, not the database's.
+- `REAL -> DOUBLE PRECISION`.
+- `TEXT` splits three ways on the *values*, since SQLite stores all three as
+  text: every non-null value parsing as an ISO date gives `TIMESTAMP`, every
+  non-null value parsing as a JSON object or array gives `JSON`, anything
+  else stays `TEXT`. Ferrite's planner coerces the string literal to the
+  column's type on insert, so no value has to be rewritten.
+- `BLOB` has no counterpart in `ferrite_common::DataType`; such a column is
+  dropped, unless it is empty in this database, in which case it becomes
+  `TEXT`.
+
+Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `UNIQUE`,
+`DEFAULT` (parsed but never applied, so keeping it would be misleading),
+`COLLATE`, `AUTOINCREMENT` and `CHECK`. `PRIMARY KEY` and `NOT NULL` are
+kept. Every identifier is quoted: Ferrite reserves nearly every keyword, and
+application schemas are full of columns called `type`, `position` and
+`content`.
+"""
+
+import json
+import os
+import re
+import sqlite3
+import sys
+
+SENTINEL = "-- @@STATEMENT@@"
+DB = sys.argv[1] if len(sys.argv) > 1 else ".data/pawchat.db"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "out"
+
+TS = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?)?Z?$")
+
+
+def is_timestamp(v):
+    return isinstance(v, str) and bool(TS.match(v.strip()))
+
+
+def is_json(v):
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if not s or s[0] not in "[{":
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
+
+
+def quote(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def literal(v):
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, bytes):
+        return None  # BLOB: no representation in Ferrite v1
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def ferrite_type(decl, values, name):
+    """Pick a `ferrite_common::DataType` for one column.
+
+    The declared SQLite type is the starting point; the actual values
+    decide between TEXT, TIMESTAMP and JSON, since SQLite stores all three
+    as TEXT and only the content tells them apart.
+    """
+    decl = (decl or "").upper()
+    present = [v for v in values if v is not None]
+
+    if "INT" in decl:
+        return "BIGINT", "INTEGER -> BIGINT"
+    if "REAL" in decl or "FLOA" in decl or "DOUB" in decl:
+        return "DOUBLE PRECISION", "REAL -> DOUBLE PRECISION"
+    if "BLOB" in decl:
+        if not present:
+            return "TEXT", "BLOB, empty in this database -> TEXT"
+        return None, "BLOB: no binary type in Ferrite v1"
+
+    if present and all(is_timestamp(v) for v in present):
+        return "TIMESTAMP", "TEXT holding ISO dates -> TIMESTAMP"
+    if present and all(is_json(v) for v in present):
+        return "JSON", "TEXT holding JSON -> JSON"
+    return "TEXT", "TEXT -> TEXT"
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    db = sqlite3.connect(DB)
+    db.text_factory = bytes
+    db.row_factory = None
+    cur = db.cursor()
+
+    tables = [
+        r[0].decode()
+        for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    ]
+
+    notes = []
+    for table in tables:
+        info = cur.execute(f'PRAGMA table_info("{table}")').fetchall()
+        cols = [
+            {
+                "name": c[1].decode(),
+                "decl": c[2].decode() if c[2] else "",
+                "notnull": bool(c[3]),
+                "pk": c[5],
+            }
+            for c in info
+        ]
+        rows = cur.execute(f'SELECT * FROM "{table}"').fetchall()
+
+        # Decode bytes back to str where the value is text.
+        def decode(v):
+            if isinstance(v, bytes):
+                try:
+                    return v.decode("utf-8")
+                except UnicodeDecodeError:
+                    return v
+            return v
+
+        rows = [[decode(v) for v in row] for row in rows]
+
+        kept, dropped, decisions = [], [], []
+        for i, col in enumerate(cols):
+            values = [r[i] for r in rows]
+            ty, why = ferrite_type(col["decl"], values, col["name"])
+            if ty is None:
+                dropped.append((col["name"], why))
+                continue
+            kept.append((i, col, ty))
+            decisions.append((col["name"], col["decl"] or "(none)", ty, why))
+
+        pk = [c["name"] for c in cols if c["pk"]]
+        pieces = []
+        for _, col, ty in kept:
+            piece = f'  {quote(col["name"])} {ty}'
+            if col["notnull"] and col["name"] not in pk:
+                piece += " NOT NULL"
+            pieces.append(piece)
+        if len(pk) == 1 and any(c["name"] == pk[0] for _, c, _ in kept):
+            pieces = [
+                p + " PRIMARY KEY" if p.strip().startswith(quote(pk[0])) else p
+                for p in pieces
+            ]
+        elif len(pk) > 1 and all(any(c["name"] == p for _, c, _ in kept) for p in pk):
+            pieces.append("  PRIMARY KEY (" + ", ".join(quote(p) for p in pk) + ")")
+
+        ddl = f"CREATE TABLE {quote(table)} (\n" + ",\n".join(pieces) + "\n)"
+
+        statements = [ddl]
+        skipped_rows = 0
+        names = ", ".join(quote(c["name"]) for _, c, _ in kept)
+        for row in rows:
+            values = []
+            bad = False
+            for i, col, ty in kept:
+                lit = literal(row[i])
+                if lit is None:
+                    bad = True
+                    break
+                values.append(lit)
+            if bad:
+                skipped_rows += 1
+                continue
+            statements.append(
+                f"INSERT INTO {quote(table)} ({names}) VALUES (" + ", ".join(values) + ")"
+            )
+
+        with open(os.path.join(OUT, f"{table}.sql"), "w", encoding="utf-8") as f:
+            f.write(("\n" + SENTINEL + "\n").join(statements))
+
+        notes.append(
+            {
+                "table": table,
+                "columns": len(cols),
+                "kept": len(kept),
+                "dropped": dropped,
+                "rows": len(rows),
+                "skipped_rows": skipped_rows,
+                "decisions": decisions,
+            }
+        )
+
+    with open(os.path.join(OUT, "manifest.txt"), "w", encoding="utf-8") as f:
+        for n in notes:
+            f.write(f'{n["table"]}\t{n["rows"] - n["skipped_rows"]}\n')
+
+    with open(os.path.join(OUT, "types.md"), "w", encoding="utf-8") as f:
+        for n in notes:
+            f.write(f'## {n["table"]} ({n["rows"]} rows, {n["kept"]}/{n["columns"]} columns)\n\n')
+            for name, decl, ty, why in n["decisions"]:
+                f.write(f"- `{name}`: {decl} -> {ty} ({why})\n")
+            for name, why in n["dropped"]:
+                f.write(f"- **dropped** `{name}`: {why}\n")
+            if n["skipped_rows"]:
+                f.write(f'- **{n["skipped_rows"]} rows skipped** (unrepresentable value)\n')
+            f.write("\n")
+
+    total_rows = sum(n["rows"] - n["skipped_rows"] for n in notes)
+    print(f"{len(tables)} tables, {total_rows} rows, out={OUT}")
+    for n in notes:
+        if n["dropped"] or n["skipped_rows"]:
+            print(f'  {n["table"]}: dropped={[d[0] for d in n["dropped"]]} skipped={n["skipped_rows"]}')
+
+
+main()
