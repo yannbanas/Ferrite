@@ -44,8 +44,18 @@ FROM alpine:3.20 AS runtime
 RUN addgroup -S ferrite && adduser -S -G ferrite ferrite
 COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-musl/release/ferrite-server /usr/local/bin/
 
+# Le repertoire de donnees est cree ici, possede par l'utilisateur non
+# root du conteneur : un volume nomme monte sur un chemin vide herite des
+# droits du repertoire de l'image, alors qu'un /data cree par le moteur
+# Docker appartiendrait a root et le serveur echouerait au demarrage sur
+# un EACCES. VOLUME le declare pour que `docker run` sans -v ne perde pas
+# les donnees dans la couche ecrivable.
+RUN mkdir -p /data && chown ferrite:ferrite /data
+VOLUME ["/data"]
+
 EXPOSE 5432
-ENV RUST_LOG=info
+ENV RUST_LOG=info \
+    FERRITE_DATA=/data
 USER ferrite
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD nc -z 127.0.0.1 5432 || exit 1

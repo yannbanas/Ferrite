@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::select! {
         result = server.run() => result?,
-        _ = tokio::signal::ctrl_c() => info!("shutting down"),
+        _ = shutdown() => info!("shutting down"),
     }
 
     // Fold the journal into the data file so a restart has nothing to
@@ -90,6 +90,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %err, "checkpoint on shutdown failed");
     }
     Ok(())
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// `docker stop` sends `SIGTERM` and only escalates to `SIGKILL` after the
+/// grace period, so without this the container never shuts down cleanly and
+/// every restart pays for journal recovery it did not need.
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "cannot listen for SIGTERM");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Builds the engine every connection is served from.
