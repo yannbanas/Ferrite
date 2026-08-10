@@ -1,7 +1,7 @@
 //! `ferrite-sql` AST → the planner's IR.
 //!
 //! `ferrite-sql` parses more than `ferrite-exec` can run: subqueries, set
-//! operations, `CASE`, `CAST`, common table expressions. Everything this
+//! operations, common table expressions. Everything this
 //! module cannot project onto [`crate::expr`] becomes a
 //! [`FerriteError::Plan`], never a panic and never a silently wrong plan.
 //! The rejections are all in one place so the gap between "parses" and
@@ -11,9 +11,61 @@ use ferrite_common::{ColumnDefault, DataType, FerriteError, Schema, Value};
 use ferrite_sql::ast as sql;
 
 use crate::expr::{BinaryOp, ColumnRef, Expr};
+use crate::scalar::ScalarFunc;
 
 pub(crate) fn unsupported(what: &str) -> FerriteError {
     FerriteError::Plan(format!("{what} is not supported by the v1 planner"))
+}
+
+/// The collations Ferrite recognises. SQLite's third built-in, `RTRIM`, is
+/// not among them: nothing in the audited corpus uses it, and accepting it
+/// as a no-op would compare strings SQLite considers equal as different.
+enum Collation {
+    /// Byte-order comparison — the default, so an explicit `COLLATE
+    /// BINARY` lowers to nothing at all.
+    Binary,
+    /// Case-insensitive comparison.
+    Nocase,
+}
+
+fn collation_kind(name: &str) -> Result<Collation, FerriteError> {
+    if name.eq_ignore_ascii_case("nocase") {
+        return Ok(Collation::Nocase);
+    }
+    if name.eq_ignore_ascii_case("binary") {
+        return Ok(Collation::Binary);
+    }
+    Err(unsupported(&format!("the collation {name}")))
+}
+
+/// Whether an operand carries an explicit `COLLATE NOCASE`, validating any
+/// collation name it does carry so an unknown one is refused rather than
+/// silently ignored.
+fn folds_case(expr: &sql::Expr) -> Result<bool, FerriteError> {
+    match expr {
+        sql::Expr::Collate { collation, .. } => {
+            Ok(matches!(collation_kind(collation)?, Collation::Nocase))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Wrap an already-lowered operand in the case fold, unless it is one
+/// already — `a COLLATE NOCASE = b COLLATE NOCASE` folds each side once.
+fn fold_case(expr: Expr) -> Expr {
+    if matches!(
+        &expr,
+        Expr::Function {
+            func: ScalarFunc::Nocase,
+            ..
+        }
+    ) {
+        return expr;
+    }
+    Expr::Function {
+        func: ScalarFunc::Nocase,
+        args: vec![expr],
+    }
 }
 
 /// Resolve every `DEFAULT` in a freshly parsed schema against the type of
@@ -128,9 +180,20 @@ impl<'a> Lowerer<'a> {
                 },
             },
 
+            // SQL takes the collation of a comparison from whichever
+            // operand carries an explicit one, so `username = ? COLLATE
+            // NOCASE` has to fold *both* sides, not just the parameter.
             sql::Expr::BinaryOp { left, op, right } => {
                 let op = binary_op(*op);
-                Ok(Expr::binary(self.expr(left)?, op, self.expr(right)?))
+                let (lowered_left, lowered_right) = (self.expr(left)?, self.expr(right)?);
+                if op.is_comparison() && (folds_case(left)? || folds_case(right)?) {
+                    return Ok(Expr::binary(
+                        fold_case(lowered_left),
+                        op,
+                        fold_case(lowered_right),
+                    ));
+                }
+                Ok(Expr::binary(lowered_left, op, lowered_right))
             }
 
             sql::Expr::IsNull { expr, negated } => {
@@ -192,16 +255,56 @@ impl<'a> Lowerer<'a> {
                 expr,
                 pattern,
                 negated,
-            } => Ok(Expr::Like {
+                case_insensitive,
+            } => {
+                // An explicit `COLLATE NOCASE` on either operand makes the
+                // match case-insensitive, exactly as `ILIKE` does.
+                let nocase = folds_case(expr)? || folds_case(pattern)?;
+                Ok(Expr::Like {
+                    expr: Box::new(self.expr(expr)?),
+                    pattern: Box::new(self.expr(pattern)?),
+                    negated: *negated,
+                    case_insensitive: *case_insensitive || nocase,
+                })
+            }
+
+            sql::Expr::Collate { expr, collation } => {
+                let inner = self.expr(expr)?;
+                Ok(match collation_kind(collation)? {
+                    Collation::Binary => inner,
+                    Collation::Nocase => Expr::Function {
+                        func: ScalarFunc::Nocase,
+                        args: vec![inner],
+                    },
+                })
+            }
+
+            sql::Expr::Cast { expr, data_type } => Ok(Expr::Cast {
                 expr: Box::new(self.expr(expr)?),
-                pattern: Box::new(self.expr(pattern)?),
-                negated: *negated,
+                data_type: *data_type,
+            }),
+
+            sql::Expr::Case {
+                operand,
+                branches,
+                else_result,
+            } => Ok(Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| self.expr(o).map(Box::new))
+                    .transpose()?,
+                branches: branches
+                    .iter()
+                    .map(|(when, then)| Ok((self.expr(when)?, self.expr(then)?)))
+                    .collect::<Result<_, FerriteError>>()?,
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| self.expr(e).map(Box::new))
+                    .transpose()?,
             }),
 
             sql::Expr::Function(call) => self.function(call),
 
-            sql::Expr::Cast { .. } => Err(unsupported("CAST")),
-            sql::Expr::Case { .. } => Err(unsupported("CASE")),
             sql::Expr::Subquery(_) | sql::Expr::InSubquery { .. } | sql::Expr::Exists { .. } => {
                 Err(unsupported("subqueries"))
             }
@@ -209,11 +312,33 @@ impl<'a> Lowerer<'a> {
     }
 
     /// An aggregate call is a reference to a column the `Aggregate` node
-    /// below has already computed; anything else is a function the v1
-    /// executor has no implementation for.
+    /// below has already computed. A scalar call lowers to itself. Anything
+    /// else is a function the executor has no implementation for.
     fn function(&self, call: &sql::FunctionCall) -> Result<Expr, FerriteError> {
         if !sql::is_aggregate(&call.name) {
-            return Err(unsupported(&format!("the function {}", call.name)));
+            let Some(func) = ScalarFunc::parse(&call.name) else {
+                return Err(unsupported(&format!("the function {}", call.name)));
+            };
+            let sql::FunctionArgs::List(args) = &call.args else {
+                return Err(FerriteError::Plan(format!(
+                    "{}(*) is not a valid call; `*` is only an argument to count()",
+                    call.name
+                )));
+            };
+            if call.distinct {
+                return Err(FerriteError::Plan(format!(
+                    "DISTINCT is only meaningful inside an aggregate, not in {}()",
+                    call.name
+                )));
+            }
+            func.check_arity(args.len())?;
+            return Ok(Expr::Function {
+                func,
+                args: args
+                    .iter()
+                    .map(|arg| self.expr(arg))
+                    .collect::<Result<_, FerriteError>>()?,
+            });
         }
         let Some(slots) = self.aggregates else {
             return Err(FerriteError::Plan(format!(
@@ -317,6 +442,7 @@ fn walk(
         sql::Expr::UnaryOp { expr, .. }
         | sql::Expr::IsNull { expr, .. }
         | sql::Expr::Cast { expr, .. }
+        | sql::Expr::Collate { expr, .. }
         | sql::Expr::InSubquery { expr, .. } => walk(expr, visit)?,
         sql::Expr::BinaryOp { left, right, .. } => {
             walk(left, visit)?;
@@ -383,10 +509,40 @@ pub(crate) fn substitute_group_keys(expr: Expr, keys: &[Expr]) -> Expr {
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => Expr::Like {
             expr: Box::new(substitute_group_keys(*expr, keys)),
             pattern: Box::new(substitute_group_keys(*pattern, keys)),
             negated,
+            case_insensitive,
+        },
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(substitute_group_keys(*expr, keys)),
+            data_type,
+        },
+        Expr::Function { func, args } => Expr::Function {
+            func,
+            args: args
+                .into_iter()
+                .map(|arg| substitute_group_keys(arg, keys))
+                .collect(),
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_result,
+        } => Expr::Case {
+            operand: operand.map(|o| Box::new(substitute_group_keys(*o, keys))),
+            branches: branches
+                .into_iter()
+                .map(|(when, then)| {
+                    (
+                        substitute_group_keys(when, keys),
+                        substitute_group_keys(then, keys),
+                    )
+                })
+                .collect(),
+            else_result: else_result.map(|e| Box::new(substitute_group_keys(*e, keys))),
         },
         other => other,
     }

@@ -5,6 +5,7 @@ use ferrite_common::{ColumnDef, DataType, FerriteError, Schema, TableId, Value};
 
 use crate::expr::{AggregateFunc, BinaryOp, Expr};
 use crate::logical::JoinType;
+use crate::scalar::ScalarFunc;
 use crate::scope::Scope;
 
 /// Expression with every column reference resolved to its position in the
@@ -24,6 +25,20 @@ pub enum PhysExpr {
         expr: Box<PhysExpr>,
         pattern: Box<PhysExpr>,
         negated: bool,
+        case_insensitive: bool,
+    },
+    Case {
+        operand: Option<Box<PhysExpr>>,
+        branches: Vec<(PhysExpr, PhysExpr)>,
+        else_result: Option<Box<PhysExpr>>,
+    },
+    Cast {
+        expr: Box<PhysExpr>,
+        data_type: DataType,
+    },
+    Function {
+        func: ScalarFunc,
+        args: Vec<PhysExpr>,
     },
 }
 
@@ -82,12 +97,73 @@ pub fn bind(expr: &Expr, scope: &Scope) -> Result<PhysExpr, FerriteError> {
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => PhysExpr::Like {
             expr: Box::new(bind(expr, scope)?),
             pattern: Box::new(bind(pattern, scope)?),
             negated: *negated,
+            case_insensitive: *case_insensitive,
         },
+        Expr::Case {
+            operand,
+            branches,
+            else_result,
+        } => PhysExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| bind(o, scope).map(Box::new))
+                .transpose()?,
+            branches: branches
+                .iter()
+                .map(|(when, then)| Ok((bind(when, scope)?, bind(then, scope)?)))
+                .collect::<Result<_, FerriteError>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|e| bind(e, scope).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Cast { expr, data_type } => PhysExpr::Cast {
+            expr: Box::new(bind(expr, scope)?),
+            data_type: *data_type,
+        },
+        Expr::Function { func, args } => {
+            let args = args
+                .iter()
+                .map(|arg| bind(arg, scope))
+                .collect::<Result<Vec<_>, FerriteError>>()?;
+            match fold_temporal(*func, &args)? {
+                Some(folded) => PhysExpr::Literal(folded),
+                None => PhysExpr::Function { func: *func, args },
+            }
+        }
     })
+}
+
+/// Evaluate `datetime`/`date` over literal arguments once, at plan time.
+///
+/// `datetime('now')` is constant for the duration of a statement in
+/// SQLite, and PawChat relies on that: a `WHERE created_at >=
+/// datetime('now', '-30 days')` evaluated per row could straddle a second
+/// boundary mid-scan and admit rows inconsistently. Folding here gives the
+/// whole statement one reading of the clock.
+///
+/// Only these two functions are folded. `randomblob` is deliberately left
+/// alone — SQLite re-rolls it per row, and folding would hand every row
+/// the same bytes.
+fn fold_temporal(func: ScalarFunc, args: &[PhysExpr]) -> Result<Option<Value>, FerriteError> {
+    let with_time = match func {
+        ScalarFunc::Datetime => true,
+        ScalarFunc::Date => false,
+        _ => return Ok(None),
+    };
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            PhysExpr::Literal(value) => values.push(value.clone()),
+            _ => return Ok(None),
+        }
+    }
+    ferrite_common::datetime::eval_datetime(&values, with_time).map(Some)
 }
 
 fn align_comparison(
@@ -140,6 +216,48 @@ pub fn infer(expr: &Expr, scope: &Scope) -> Result<(DataType, bool), FerriteErro
         // is what PostgreSQL falls back to as well.
         Expr::Literal(value) => (value.data_type().unwrap_or(DataType::Text), value.is_null()),
         Expr::Not(_) | Expr::IsNull(_) | Expr::Like { .. } => (DataType::Boolean, true),
+        Expr::Cast { data_type, .. } => (*data_type, true),
+        // `coalesce` and `nocase` take the type of their first argument;
+        // for the rest the argument's type is irrelevant, so inferring it
+        // is only ever a way to reject an unresolvable column reference.
+        Expr::Function { func, args } => {
+            let inferred = args
+                .iter()
+                .map(|arg| infer(arg, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first = inferred.first().map_or(DataType::Text, |(t, _)| *t);
+            // `coalesce` is null only when every argument is; every other
+            // function propagates a null argument to its result.
+            let nullable = match func.is_null_preserving() {
+                true => inferred.iter().any(|(_, n)| *n),
+                false => inferred.iter().all(|(_, n)| *n),
+            };
+            (func.result_type(first), nullable)
+        }
+        // The branch results decide the type; a `CASE` with no `ELSE`
+        // yields null when nothing matches, so it is always nullable.
+        Expr::Case {
+            branches,
+            else_result,
+            ..
+        } => {
+            let data_type = match branches.first() {
+                Some((_, then)) => infer(then, scope)?.0,
+                None => DataType::Text,
+            };
+            let exhaustive = else_result
+                .as_ref()
+                .map(|e| infer(e, scope).map(|(_, n)| !n))
+                .transpose()?
+                .unwrap_or(false);
+            let any_branch_nullable = branches
+                .iter()
+                .map(|(_, then)| infer(then, scope).map(|(_, n)| n))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|n| n);
+            (data_type, !exhaustive || any_branch_nullable)
+        }
         Expr::Binary { left, op, right } if op.is_arithmetic() => {
             let (left, left_null) = infer(left, scope)?;
             let (right, right_null) = infer(right, scope)?;

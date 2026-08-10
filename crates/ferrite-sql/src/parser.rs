@@ -357,6 +357,8 @@ impl Parser {
                 constraints.push(ColumnConstraint::Unique);
             } else if self.eat_keyword(Keyword::Default) {
                 constraints.push(ColumnConstraint::Default(self.parse_expr()?));
+            } else if self.eat_keyword(Keyword::Collate) {
+                constraints.push(ColumnConstraint::Collate(self.parse_identifier()?));
             } else {
                 break;
             }
@@ -1052,23 +1054,37 @@ impl Parser {
             Token::Keyword(Keyword::Is)
             | Token::Keyword(Keyword::In)
             | Token::Keyword(Keyword::Between)
-            | Token::Keyword(Keyword::Like) => 4,
+            | Token::Keyword(Keyword::Like)
+            | Token::Keyword(Keyword::Ilike) => 4,
             Token::Keyword(Keyword::Not) => match self.peek_at(1) {
                 Token::Keyword(Keyword::In)
                 | Token::Keyword(Keyword::Between)
-                | Token::Keyword(Keyword::Like) => 4,
+                | Token::Keyword(Keyword::Like)
+                | Token::Keyword(Keyword::Ilike) => 4,
                 _ => return None,
             },
             Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => 5,
             Token::Concat => 6,
             Token::Plus | Token::Minus => 7,
             Token::Star | Token::Slash | Token::Percent => 8,
+            // `COLLATE` binds tighter than every operator, so
+            // `a = b COLLATE nocase` attaches the collation to `b` rather
+            // than to the comparison. The planner then propagates it to
+            // both operands, which is where SQL says the collation of a
+            // comparison comes from.
+            Token::Keyword(Keyword::Collate) => 9,
             _ => return None,
         };
         Some(p)
     }
 
     fn parse_infix(&mut self, left: Expr, precedence: u8) -> Result<Expr, ParseError> {
+        if self.eat_keyword(Keyword::Collate) {
+            return Ok(Expr::Collate {
+                expr: Box::new(left),
+                collation: self.parse_identifier()?,
+            });
+        }
         if self.eat_keyword(Keyword::Is) {
             let negated = self.eat_keyword(Keyword::Not);
             self.expect_keyword(Keyword::Null)?;
@@ -1096,13 +1112,16 @@ impl Parser {
                 high: Box::new(high),
             });
         }
-        if self.eat_keyword(Keyword::Like) {
-            let pattern = self.parse_subexpr(precedence)?;
-            return Ok(Expr::Like {
-                expr: Box::new(left),
-                pattern: Box::new(pattern),
-                negated,
-            });
+        for (keyword, case_insensitive) in [(Keyword::Like, false), (Keyword::Ilike, true)] {
+            if self.eat_keyword(keyword) {
+                let pattern = self.parse_subexpr(precedence)?;
+                return Ok(Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
+                    negated,
+                    case_insensitive,
+                });
+            }
         }
         if self.eat_keyword(Keyword::In) {
             self.expect(&Token::LParen)?;
@@ -1133,7 +1152,7 @@ impl Parser {
             });
         }
         if negated {
-            return self.expected("`IN`, `BETWEEN` or `LIKE` after `NOT`");
+            return self.expected("`IN`, `BETWEEN`, `LIKE` or `ILIKE` after `NOT`");
         }
 
         let op = match self.peek() {

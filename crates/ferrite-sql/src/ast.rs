@@ -220,6 +220,11 @@ pub enum ColumnConstraint {
     PrimaryKey,
     Unique,
     Default(Expr),
+    /// `COLLATE name` written on the column itself. Recorded so the DDL
+    /// parses, but Ferrite stores no per-column collation: it does not
+    /// change the column's type and it does not make a `UNIQUE` on that
+    /// column case-insensitive. See `docs/pawchat-sql-audit.md`.
+    Collate(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -507,6 +512,16 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+        /// `ILIKE` rather than `LIKE`.
+        case_insensitive: bool,
+    },
+    /// `expr COLLATE name`. Only the collation SQLite calls `NOCASE` has
+    /// a meaning in Ferrite; the planner rejects any other name rather
+    /// than dropping it, since a dropped collation silently changes which
+    /// rows a query returns.
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
     },
     Case {
         operand: Option<Box<Expr>>,

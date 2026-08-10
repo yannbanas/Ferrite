@@ -4,6 +4,7 @@
 //! for the eight scalar types it supports. That is what lets an unmodified
 //! driver decode a `DataRow` without ever querying `pg_type`.
 
+use ferrite_common::datetime::{parse_timestamp, parts_from_micros};
 use ferrite_common::{DataType, Value};
 
 use crate::error::{ProtocolError, Result};
@@ -252,15 +253,7 @@ fn parse_uuid(s: &str) -> Option<u128> {
 /// `ISO, MDY` rendering, e.g. `2026-08-10 09:15:00.123456+00`, matching the
 /// `DateStyle` the server advertises at startup.
 fn format_timestamp(micros: i64) -> String {
-    let days = micros.div_euclid(86_400_000_000);
-    let rem = micros.rem_euclid(86_400_000_000);
-    let (y, m, d) = civil_from_days(days);
-    let (h, min, s, us) = (
-        rem / 3_600_000_000,
-        rem / 60_000_000 % 60,
-        rem / 1_000_000 % 60,
-        rem % 1_000_000,
-    );
+    let (y, m, d, h, min, s, us) = parts_from_micros(micros);
     let base = format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}");
     if us == 0 {
         format!("{base}+00")
@@ -270,69 +263,10 @@ fn format_timestamp(micros: i64) -> String {
     }
 }
 
-fn parse_timestamp(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (date, rest) = s.split_once([' ', 'T'])?;
-    let mut dparts = date.split('-');
-    let y: i64 = dparts.next()?.parse().ok()?;
-    let m: u32 = dparts.next()?.parse().ok()?;
-    let d: u32 = dparts.next()?.parse().ok()?;
-    if dparts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let time = rest
-        .split_once('+')
-        .map(|(t, _)| t)
-        .unwrap_or(rest)
-        .trim_end_matches('Z');
-    let mut tparts = time.split(':');
-    let h: i64 = tparts.next()?.parse().ok()?;
-    let min: i64 = tparts.next()?.parse().ok()?;
-    let (sec, frac) = match tparts.next() {
-        Some(sec) => match sec.split_once('.') {
-            Some((whole, frac)) => (whole.parse::<i64>().ok()?, {
-                let f: String = frac.chars().take(6).collect();
-                f.parse::<i64>().ok()? * 10i64.pow(6 - f.len() as u32)
-            }),
-            None => (sec.parse::<i64>().ok()?, 0),
-        },
-        None => (0, 0),
-    };
-    if tparts.next().is_some() || h > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-    let days = days_from_civil(y, m, d);
-    Some((days * 86_400 + h * 3_600 + min * 60 + sec) * 1_000_000 + frac)
-}
-
-/// Howard Hinnant's proleptic-Gregorian day-number algorithms; used instead
-/// of pulling in a date crate for the one type that needs calendar math.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrite_common::datetime::days_from_civil;
 
     #[test]
     fn every_data_type_round_trips_through_its_oid() {

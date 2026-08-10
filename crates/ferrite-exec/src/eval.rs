@@ -6,6 +6,8 @@ use ferrite_common::{DataType, FerriteError, Row, Value};
 use ferrite_planner::BinaryOp;
 use ferrite_planner::PhysExpr;
 
+use crate::scalar;
+
 /// Evaluate `expr` against `row`. Column references are positions, resolved
 /// by the planner, so this never touches a schema.
 pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
@@ -25,12 +27,17 @@ pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
             expr,
             pattern,
             negated,
+            case_insensitive,
         } => {
             let (subject, pattern) = (eval(expr, row)?, eval(pattern, row)?);
             Ok(match (&subject, &pattern) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 (Value::Text(subject), Value::Text(pattern)) => {
-                    Value::Boolean(like_matches(subject, pattern) != *negated)
+                    let matched = match case_insensitive {
+                        true => like_matches(&subject.to_lowercase(), &pattern.to_lowercase()),
+                        false => like_matches(subject, pattern),
+                    };
+                    Value::Boolean(matched != *negated)
                 }
                 _ => {
                     return Err(FerriteError::TypeMismatch {
@@ -44,24 +51,29 @@ pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
                 }
             })
         }
+        // `AND` and `OR` short-circuit: a `false` left operand settles an
+        // `AND` whatever the right one would do, including raise. SQL
+        // permits this, and real queries depend on it — a guard such as
+        // `col LIKE 'pf:%' AND id = CAST(substr(col, 4) AS INTEGER)`
+        // evaluates the cast only on rows the guard admitted.
         PhysExpr::Binary { left, op, right } => match op {
             op if op.is_arithmetic() => arithmetic(*op, eval(left, row)?, eval(right, row)?),
-            BinaryOp::And => {
-                let (l, r) = (as_bool(&eval(left, row)?)?, as_bool(&eval(right, row)?)?);
-                Ok(match (l, r) {
-                    (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
+            BinaryOp::And => Ok(match as_bool(&eval(left, row)?)? {
+                Some(false) => Value::Boolean(false),
+                left => match (left, as_bool(&eval(right, row)?)?) {
+                    (_, Some(false)) => Value::Boolean(false),
                     (Some(true), Some(true)) => Value::Boolean(true),
                     _ => Value::Null,
-                })
-            }
-            BinaryOp::Or => {
-                let (l, r) = (as_bool(&eval(left, row)?)?, as_bool(&eval(right, row)?)?);
-                Ok(match (l, r) {
-                    (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
+                },
+            }),
+            BinaryOp::Or => Ok(match as_bool(&eval(left, row)?)? {
+                Some(true) => Value::Boolean(true),
+                left => match (left, as_bool(&eval(right, row)?)?) {
+                    (_, Some(true)) => Value::Boolean(true),
                     (Some(false), Some(false)) => Value::Boolean(false),
                     _ => Value::Null,
-                })
-            }
+                },
+            }),
             comparison => {
                 let (l, r) = (eval(left, row)?, eval(right, row)?);
                 Ok(match compare(&l, &r)? {
@@ -70,6 +82,36 @@ pub fn eval(expr: &PhysExpr, row: &Row) -> Result<Value, FerriteError> {
                 })
             }
         },
+        PhysExpr::Cast { expr, data_type } => scalar::cast(&eval(expr, row)?, *data_type),
+        PhysExpr::Function { func, args } => {
+            let args = args
+                .iter()
+                .map(|arg| eval(arg, row))
+                .collect::<Result<Vec<_>, _>>()?;
+            scalar::call(*func, &args)
+        }
+        // A `CASE` evaluates branches in order and stops at the first
+        // match, so a later branch that would raise is never reached.
+        PhysExpr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            let operand = operand.as_ref().map(|o| eval(o, row)).transpose()?;
+            for (when, then) in branches {
+                let matched = match &operand {
+                    Some(operand) => compare(operand, &eval(when, row)?)? == Some(Ordering::Equal),
+                    None => matches!(eval(when, row)?, Value::Boolean(true)),
+                };
+                if matched {
+                    return eval(then, row);
+                }
+            }
+            match else_result {
+                Some(else_result) => eval(else_result, row),
+                None => Ok(Value::Null),
+            }
+        }
     }
 }
 

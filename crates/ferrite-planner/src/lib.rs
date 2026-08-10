@@ -11,8 +11,8 @@
 //! ```
 //!
 //! `ferrite-sql` parses more than `ferrite-exec` can run. Everything
-//! outside the executable subset — subqueries, set operations, `CASE`,
-//! `CAST`, DDL, transaction control — leaves
+//! outside the executable subset — subqueries, set operations, DDL,
+//! transaction control — leaves
 //! [`Planner::build_logical`] as a
 //! [`FerriteError::Plan`](ferrite_common::FerriteError::Plan) rather than
 //! as a plan that would be silently wrong; the `lower` module holds every
@@ -37,6 +37,7 @@ mod lower;
 pub mod physical;
 pub mod planner;
 pub mod rules;
+pub mod scalar;
 pub mod scope;
 
 pub use expr::{AggregateCall, AggregateFunc, BinaryOp, ColumnRef, Expr};
@@ -45,4 +46,5 @@ pub use lower::typecheck_defaults;
 pub use physical::{bind, PhysAggregate, PhysExpr, PhysSortKey, PhysicalPlan};
 pub use planner::{Planner, DEFAULT_NAMESPACE};
 pub use rules::optimize;
+pub use scalar::ScalarFunc;
 pub use scope::{Scope, ScopeColumn};
