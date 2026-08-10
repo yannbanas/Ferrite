@@ -16,6 +16,7 @@ use rand::Rng;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod banner;
 mod describe;
 mod engine;
 mod settings;
@@ -25,6 +26,8 @@ use settings::Settings;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    banner::banner();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("FERRITE_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
