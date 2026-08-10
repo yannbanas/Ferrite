@@ -176,6 +176,14 @@ réconcilie pas l'arité d'abord.
 72/72 tables, 938/938 lignes, 337/337 énoncés `_after` acceptés
 ```
 
+Après l'application réelle des contraintes d'unicité, le même replay rend
+`433/435` (les deux refus restants étant le `SELECT` sans `FROM`, joué deux
+fois), et trois énoncés y sont désormais *attendus en échec* : réinsérer la
+ligne `users` de PawChat rend un `23505` et le `count(*)` reste à 22 de part
+et d'autre. Le probe de migration, lui, recopiait la clé primaire d'une
+ligne existante — un doublon depuis toujours, que seule l'absence de
+contrainte rendait acceptable ; il génère maintenant une clé fraîche.
+
 `count(*)` sur `vr_room_objects` rend 394 avant les migrations et 395 après,
 la ligne de plus étant l'`INSERT` qui ne nomme que les colonnes obligatoires
 et laisse le reste aux `DEFAULT`. La même bascule se lit sur le

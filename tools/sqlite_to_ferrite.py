@@ -43,8 +43,9 @@ Dropped, because Ferrite v1 has no equivalent: `FOREIGN KEY`, `AUTOINCREMENT`
 and `CHECK`. `PRIMARY KEY`, `NOT NULL` and `DEFAULT` are kept. A table-level
 `UNIQUE (a, b)` is re-emitted as a `CREATE UNIQUE INDEX` in `_after.sql`,
 because that is what an `INSERT OR IGNORE` with no explicit target conflicts
-on — note that Ferrite records such a key but does not yet enforce it, so a
-duplicate write still succeeds (see the audit document). Every identifier is quoted: Ferrite reserves nearly every
+on. Ferrite enforces those keys, so `_after.sql` also carries statements that
+are *expected to fail*, marked `-- @@EXPECT <sqlstate>@@`: re-inserting a row
+that is already there must come back as a `23505`, not as a second row. Every identifier is quoted: Ferrite reserves nearly every
 keyword, and application schemas are full of columns called `type`,
 `position` and `content`.
 
@@ -67,12 +68,14 @@ application never mentions.
 """
 
 import json
+import itertools
 import os
 import re
 import sqlite3
 import sys
 
 SENTINEL = "-- @@STATEMENT@@"
+EXPECT = "-- @@EXPECT %s@@"
 DB = sys.argv[1] if len(sys.argv) > 1 else ".data/pawchat.db"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "out"
 
@@ -493,6 +496,94 @@ def upsert_shapes(cur, notes):
     return out
 
 
+PROBE_KEY = itertools.count(1)
+
+
+def key_columns(cur, table, pk):
+    """Every column of `table` covered by a primary key or a unique index,
+    whether declared inline, at table level, or as a `CREATE UNIQUE INDEX`.
+
+    A generated probe row has to give all of them a value of its own; any
+    one it copies from an existing row is a duplicate key.
+    """
+    out = set(pk)
+    for row in cur.execute('PRAGMA index_list("%s")' % table).fetchall():
+        name = row[1].decode() if isinstance(row[1], bytes) else row[1]
+        if not bool(row[2]):
+            continue
+        for c in cur.execute('PRAGMA index_info("%s")' % name).fetchall():
+            out.add(c[2].decode() if isinstance(c[2], bytes) else c[2])
+    return out
+
+
+def fresh_key(ty):
+    """A key value no row can already hold, or `None` when the type gives
+    no way to be sure of that."""
+    n = next(PROBE_KEY)
+    if ty == "BIGINT":
+        # Far above any autoincrement this database has handed out.
+        return str(8_000_000_000 + n)
+    if ty == "TEXT":
+        return "'ferrite-probe-%d'" % n
+    return None
+
+
+def constraint_shapes(cur, notes):
+    """Plain duplicate writes against tables that really have a primary key.
+
+    These are the only statements in the replay that must *fail*, so they
+    carry an `EXPECT` marker the replay reads. The point is the pair: the
+    row count either side of the duplicate has to be identical, which is
+    what tells a refused write apart from an accepted one that happened to
+    report an error.
+    """
+    out = []
+    tried = 0
+    # A natural key first — an application invents those (a username, an
+    # invite code) and collides on them; an integer surrogate is handed out
+    # by the database and rarely does.
+    ordered = sorted(
+        notes, key=lambda n: (n["types"].get(n["pk"] or "") != "TEXT", n["table"])
+    )
+    for note in ordered:
+        if not note["pk"] or note["rows"] - note["skipped_rows"] == 0 or tried >= 3:
+            continue
+        table = note["table"]
+        rows = cur.execute('SELECT * FROM "%s" LIMIT 1' % table).fetchall()
+        if not rows:
+            continue
+        info = cur.execute('PRAGMA table_info("%s")' % table).fetchall()
+        names = [c[1].decode() if isinstance(c[1], bytes) else c[1] for c in info]
+        pairs = []
+        for name, value in zip(names, rows[0]):
+            if name not in note["types"]:
+                continue
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-8")
+                except UnicodeDecodeError:
+                    pairs = []
+                    break
+            lit = literal(value)
+            if lit is None:
+                pairs = []
+                break
+            pairs.append((name, lit))
+        if not pairs:
+            continue
+        cols = ", ".join(quote(n) for n, _ in pairs)
+        vals = ", ".join(v for _, v in pairs)
+        out.append("SELECT count(*) FROM %s" % quote(table))
+        out.append(
+            EXPECT % "23505"
+            + "\n"
+            + "INSERT INTO %s (%s) VALUES (%s)" % (quote(table), cols, vals)
+        )
+        out.append("SELECT count(*) FROM %s" % quote(table))
+        tried += 1
+    return out
+
+
 def real_queries(notes):
     """Queries copied from the PawChat sources, translated rather than
     paraphrased: identifiers quoted, `?` replaced by a constant, and the
@@ -711,11 +802,21 @@ def main():
         # An INSERT naming only the columns the application has no choice
         # but to supply. Every other column has to come from its DEFAULT,
         # which is the case that used to write a wrong value or fail.
+        #
+        # Every key column gets a value of its own rather than the sample
+        # row's: copying it made this a duplicate-key insert, which used to
+        # be accepted only because nothing enforced the key.
         probe = None
+        keyed = key_columns(cur, table, pk)
         if defaults and mandatory and rows:
-            values = [
-                literal(rows[0][i]) for i, col, _ in kept if col["name"] in mandatory
-            ]
+            values = []
+            for i, col, ty in kept:
+                if col["name"] not in mandatory:
+                    continue
+                if col["name"] in keyed:
+                    values.append(fresh_key(ty))
+                else:
+                    values.append(literal(rows[0][i]))
             if all(v is not None for v in values):
                 probe = (
                     f"INSERT INTO {quote(table)} ("
@@ -749,6 +850,7 @@ def main():
         index_ddl(cur, notes)
         + reads
         + upsert_shapes(cur, notes)
+        + constraint_shapes(cur, notes)
         + migrations(notes)
         + reads
     )

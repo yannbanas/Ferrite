@@ -345,16 +345,37 @@ emits, on top of the DDL and DML it already covered:
   `?` with a constant, and rewriting the three flagged `LIKE`s as `ILIKE`.
 
 Replayed against a running `ferrite-server` over the PostgreSQL wire
-protocol:
+protocol, after unique enforcement landed:
 
 ```
-72 tables, 938 rows
-424/426 statements accepted
+72/72 tables, 938/938 rows, read back with the expected row count
+433/435 statements accepted
 ```
 
 The two refusals are the same statement twice (the read set runs before and
 after the migrations): `SELECT lower(hex(randomblob(4))) AS code`, refused
 for the missing `FROM`-less select documented above.
+
+Three of the accepted statements are accepted *because they fail*. They
+carry an `-- @@EXPECT 23505@@` marker and re-insert a row that is already
+in the table, PawChat's own `users` row among them:
+
+```
+ok, = 22       SELECT count(*) FROM "users"
+refused 23505  INSERT INTO "users" ("id", "username", "password", …)
+                 VALUES ('demo-1', 'demo', 'scrypt$…', …)
+ok, = 22       SELECT count(*) FROM "users"
+```
+
+The count either side is what makes it a proof rather than an assertion:
+before enforcement that insert was accepted and the count went to 23.
+
+Enforcement also caught a latent bug in the translator itself. The
+`_after.sql` migration probe — the `INSERT` naming only the columns an
+application has no choice but to supply — copied its values from an
+existing row, primary key included. It was a duplicate-key insert all
+along, and only ever succeeded because nothing enforced the key. It now
+generates a fresh value for every column covered by a key.
 
 Two bugs were found by that replay and by nothing else, both now fixed with
 regression tests:
