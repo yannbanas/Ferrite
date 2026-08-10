@@ -389,3 +389,143 @@ async fn a_container_restart_keeps_everything_committed() {
         );
     }
 }
+
+/// Runs `docker inspect` and returns one templated field.
+fn inspect(container: &str, template: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "-f", template, container])
+        .output()
+        .expect("docker inspect");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The loop an operator is actually relying on, with nothing standing in
+/// for anything: the server process ends, **Docker** starts it again by
+/// itself because of the container's restart policy, and the container
+/// goes back to `healthy` — which, since the healthcheck is `/health` and
+/// not a port probe, means the engine answers again.
+///
+/// Two things about how the death is caused, both learned the hard way:
+///
+/// - `docker kill` is **not** usable here. Docker records an externally
+///   requested kill as a manual stop and suppresses the restart policy;
+///   measured on Docker 29.6.2, the container stays down with
+///   `RestartCount` at 0. Only a process that ends on its own — a panic,
+///   an abort, the OOM killer — gets restarted, which is exactly the case
+///   this test has to reproduce.
+/// - `kill -9 1` from inside does nothing either: the kernel does not
+///   deliver an uncatchable signal to PID 1 of a namespace from within
+///   that namespace. `SIGTERM` is delivered because `ferrite-server`
+///   installs a handler for it.
+///
+/// So the process here ends *cleanly*, and journal recovery is not what is
+/// under test — `tests/restart.rs` covers that, with a real `SIGKILL` and
+/// no checkpoint. What is under test is everything around it: the policy,
+/// the volume, the healthcheck, and the data still being there.
+///
+/// ```bash
+/// docker run -d --name ferrite --restart=unless-stopped \
+///   -p 15432:5432 -p 19187:9187 \
+///   -e FERRITE_TLS_DISABLE=1 -e FERRITE_PASSWORD=hunter2 \
+///   -v ferrite-data:/data ferrite-server
+/// FERRITE_STRESS_DOCKER=ferrite \
+///   cargo test -p ferrite-server --test stress -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a running ferrite-server in Docker; see the module docs"]
+async fn a_dying_process_is_restarted_by_docker_alone() {
+    let Ok(container) = std::env::var("FERRITE_STRESS_DOCKER") else {
+        println!("FERRITE_STRESS_DOCKER is unset: skipping");
+        return;
+    };
+    let policy = inspect(&container, "{{.HostConfig.RestartPolicy.Name}}");
+    assert!(
+        matches!(policy.as_str(), "always" | "unless-stopped" | "on-failure"),
+        "this test is about the restart policy, and this container has {policy:?}: \
+         start it with --restart=unless-stopped"
+    );
+
+    let client = connect().await;
+    reset(
+        &client,
+        "CREATE TABLE relaunched (id BIGINT NOT NULL, name TEXT NOT NULL)",
+    )
+    .await;
+    let writer = tokio::spawn(async move {
+        let mut committed: Vec<i64> = Vec::new();
+        for id in 0..100_000i64 {
+            match client
+                .execute("INSERT INTO relaunched VALUES ($1, $2)", &[&id, &"x"])
+                .await
+            {
+                Ok(_) => committed.push(id),
+                Err(_) => break,
+            }
+        }
+        committed
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let restarts_before: u32 = inspect(&container, "{{.RestartCount}}")
+        .parse()
+        .expect("RestartCount");
+    let killed = std::process::Command::new("docker")
+        .args(["exec", &container, "kill", "-TERM", "1"])
+        .status()
+        .expect("docker exec kill");
+    assert!(killed.success(), "could not signal the server process");
+
+    let committed = writer.await.expect("writer task");
+    assert!(
+        !committed.is_empty(),
+        "the writer never committed anything before the process ended"
+    );
+
+    // Nothing below restarts anything. Docker does, on its own.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let restarts: u32 = inspect(&container, "{{.RestartCount}}")
+            .parse()
+            .unwrap_or(0);
+        let health = inspect(&container, "{{.State.Health.Status}}");
+        if restarts > restarts_before && health == "healthy" {
+            println!("docker restarted the container on its own ({restarts_before} -> {restarts})");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the container never came back healthy on its own \
+             (restarts {restarts_before} -> {restarts}, health {health:?})"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let (client, connection) = tokio_postgres::connect(&conn_str(), NoTls)
+        .await
+        .expect("reconnect to the restarted container");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let rows = client
+        .query("SELECT id FROM relaunched", &[])
+        .await
+        .expect("read back after the restart");
+    let mut found: Vec<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+    found.sort_unstable();
+    println!("acknowledged={} recovered={}", committed.len(), found.len());
+    for id in &committed {
+        assert!(
+            found.binary_search(id).is_ok(),
+            "row {id} was acknowledged as committed but is gone after the restart"
+        );
+    }
+
+    // And it takes writes again, with no operator step in between.
+    client
+        .execute(
+            "INSERT INTO relaunched VALUES ($1, $2)",
+            &[&999_999i64, &"after"],
+        )
+        .await
+        .expect("the restarted container accepts new writes");
+}

@@ -57,6 +57,16 @@ docker run -d --name ferrite \
 `unless-stopped` plutôt qu'`always` : un `docker stop` volontaire de
 l'opérateur reste respecté au redémarrage du démon Docker, une panne non.
 
+**Ce que la politique couvre, et ce qu'elle ne couvre pas** (mesuré sur
+Docker 29.6.2) : elle relance le conteneur quand le process se termine de
+lui-même — panique, `abort`, OOM killer, sortie non nulle. Elle ne le
+relance **pas** après un `docker kill` ni un `docker stop` : Docker les
+enregistre comme un arrêt volontaire de l'opérateur et suspend la
+politique, le conteneur reste à terre avec `RestartCount` à 0. C'est le
+comportement voulu, mais il rend `docker kill` inutilisable pour tester
+qu'un redémarrage automatique fonctionne — voir
+`crates/ferrite-server/tests/stress.rs`.
+
 Le plus simple reste [`docker-compose.yml`](docker-compose.yml), qui porte
 la politique, le volume, le healthcheck et les variables d'environnement au
 même endroit :
