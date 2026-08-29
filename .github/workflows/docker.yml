@@ -1,6 +1,6 @@
 name: Docker
 
-# Publie ghcr.io/mairie-creusot/ferrite (ferrite-server, voir Dockerfile).
+# Publie ghcr.io/${{ github.repository_owner }}/ferrite (ferrite-server, voir Dockerfile).
 # Meme patron que docker.yml de chronotopedb et docker-pawchat.yml du fork
 # SpacetimeDB de PawChat : push sur main touchant le code, ou declenchement
 # manuel.
@@ -42,11 +42,11 @@ jobs:
 
       - id: tags
         run: |
-          tags="ghcr.io/mairie-creusot/ferrite:latest
-          ghcr.io/mairie-creusot/ferrite:sha-${GITHUB_SHA::12}"
+          tags="ghcr.io/${{ github.repository_owner }}/ferrite:latest
+          ghcr.io/${{ github.repository_owner }}/ferrite:sha-${GITHUB_SHA::12}"
           if [ -n "${{ inputs.tag }}" ]; then
             tags="$tags
-          ghcr.io/mairie-creusot/ferrite:${{ inputs.tag }}"
+          ghcr.io/${{ github.repository_owner }}/ferrite:${{ inputs.tag }}"
           fi
           {
             echo "list<<EOF"
@@ -67,7 +67,7 @@ jobs:
       # scaffold, aucune raison de le publier publiquement pour l'instant
       # (contrairement a chronotopedb). A rappeler explicitement plutot que
       # de compter sur le defaut GitHub, deja source d'un piege documente
-      # dans mairie-creusot/SpacetimeDB PAWCHAT.md.
+      # dans yannbanas/SpacetimeDB PAWCHAT.md.
       - name: Rappel visibilite du package
         run: |
           echo "::notice::Package prive par defaut. Ne pas le rendre public sans decision explicite."
@@ -86,8 +86,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull et verifie la taille de l'image
         run: |
-          docker pull ghcr.io/mairie-creusot/ferrite:sha-${GITHUB_SHA::12}
-          size_bytes=$(docker inspect ghcr.io/mairie-creusot/ferrite:sha-${GITHUB_SHA::12} --format='{{.Size}}')
+          docker pull ghcr.io/${{ github.repository_owner }}/ferrite:sha-${GITHUB_SHA::12}
+          size_bytes=$(docker inspect ghcr.io/${{ github.repository_owner }}/ferrite:sha-${GITHUB_SHA::12} --format='{{.Size}}')
           size_mb=$((size_bytes / 1024 / 1024))
           echo "Taille de l'image : ${size_mb} Mo"
           if [ "$size_mb" -gt 40 ]; then
